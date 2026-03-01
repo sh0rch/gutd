@@ -7,9 +7,10 @@
 <!-- INTEGRATION_TEST_RESULTS_START -->
 | Proto | Bandwidth | Packet Loss |
 |---|---|---|
-| **TCP** | 1000 Mbits/sec | - |
+| **TCP** | 1.06 Gbits/sec | - |
 | **UDP** | 1.19 Gbits/sec | 0% |
 <!-- INTEGRATION_TEST_RESULTS_END -->
+
 
 
 
