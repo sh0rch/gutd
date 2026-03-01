@@ -5,7 +5,12 @@
 [![Release](https://github.com/sh0rch/gutd/actions/workflows/release.yml/badge.svg)](https://github.com/sh0rch/gutd/actions/workflows/release.yml)
 
 <!-- INTEGRATION_TEST_RESULTS_START -->
+| Proto | Bandwidth | Packet Loss |
+|---|---|---|
+| **TCP** | 1.01 Gbits/sec | - |
+| **UDP** | 1.13 Gbits/sec | 0% |
 <!-- INTEGRATION_TEST_RESULTS_END -->
+
 
 gutd obfuscates WireGuard UDP traffic in-place using a Linux TC/XDP eBPF datapath.
 It sits transparently between a WireGuard peer and the network: on egress the TC
