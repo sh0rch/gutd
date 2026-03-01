@@ -83,11 +83,12 @@ jobs:
         else
           strip target/${{ matrix.target }}/release/gutd || true
         fi
-        ls -lh target/${{ matrix.target }}/release/gutd
+        mv target/${{ matrix.target }}/release/gutd target/${{ matrix.target }}/release/gutd-${{ matrix.label }}
+        ls -lh target/${{ matrix.target }}/release/gutd-${{ matrix.label }}
         
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: gutd-${{ matrix.label }}
-        path: target/${{ matrix.target }}/release/gutd
+        path: target/${{ matrix.target }}/release/gutd-${{ matrix.label }}
         retention-days: 1
