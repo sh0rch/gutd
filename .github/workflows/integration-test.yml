@@ -6,6 +6,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+
 jobs:
   test:
     name: TC/XDP Tunnel Integration Test
