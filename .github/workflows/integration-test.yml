@@ -193,6 +193,8 @@ jobs:
           |---|---|---|
           | **TCP** | ${{ env.TUNNEL_TCP }} | - |
           | **UDP** | ${{ env.TUNNEL_UDP }} | ${{ env.TUNNEL_UDP_LOSS }} |
+          
+          <sub><i>* Automatically updated from the latest Release CI run</i></sub>
           <!-- INTEGRATION_TEST_RESULTS_END -->
       run: |
         awk -v snippet="$TABLE_SNIPPET" '
