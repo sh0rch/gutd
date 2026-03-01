@@ -169,3 +169,38 @@ jobs:
         echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
         echo "| **TCP** | $TUNNEL_TCP | - |" >> $GITHUB_STEP_SUMMARY
         echo "| **UDP** | $TUNNEL_UDP | $TUNNEL_UDP_LOSS |" >> $GITHUB_STEP_SUMMARY
+
+        # Export for next steps
+        echo "TUNNEL_TCP=$TUNNEL_TCP" >> $GITHUB_ENV
+        echo "TUNNEL_UDP=$TUNNEL_UDP" >> $GITHUB_ENV
+        echo "TUNNEL_UDP_LOSS=$TUNNEL_UDP_LOSS" >> $GITHUB_ENV
+
+    - name: Update README with metrics
+      if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+      run: |
+        TABLE_SNIPPET=$(cat <<EOF
+<!-- INTEGRATION_TEST_RESULTS_START -->
+| Proto | Bandwidth | Packet Loss |
+|---|---|---|
+| **TCP** | ${{ env.TUNNEL_TCP }} | - |
+| **UDP** | ${{ env.TUNNEL_UDP }} | ${{ env.TUNNEL_UDP_LOSS }} |
+<!-- INTEGRATION_TEST_RESULTS_END -->
+EOF
+)
+
+        awk -v snippet="$TABLE_SNIPPET" '
+        BEGIN { p = 1 }
+        /<!-- INTEGRATION_TEST_RESULTS_START -->/ { print snippet; p = 0; next }
+        /<!-- INTEGRATION_TEST_RESULTS_END -->/ { p = 1; next }
+        p { print }
+        ' README.md > README.md.tmp && mv README.md.tmp README.md
+
+        if ! git diff --quiet README.md; then
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs: auto-update integration test throughput table [skip ci]"
+          git push origin HEAD:main || echo "Push failed (maybe already updated)"
+        else
+          echo "README.md is up to date"
+        fi
