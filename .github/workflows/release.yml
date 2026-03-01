@@ -19,8 +19,12 @@ jobs:
     with:
       build_all: true
 
-  verify_and_prepare:
+  integration-test:
     needs: build
+    uses: ./.github/workflows/integration-test.yml
+
+  verify_and_prepare:
+    needs: [build, integration-test]
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4

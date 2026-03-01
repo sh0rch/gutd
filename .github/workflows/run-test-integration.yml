@@ -1,0 +1,19 @@
+name: Standalone Integration Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, develop]
+    paths-ignore:
+      - '**/*.md'
+      - '**/*.txt'
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      build_all: false
+
+  integration-test:
+    needs: build
+    uses: ./.github/workflows/integration-test.yml
