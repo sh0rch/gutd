@@ -1,0 +1,30 @@
+/target
+Cargo.lock
+*.swp
+*.swo
+*~
+.DS_Store
+*.o
+/tmp
+/.cargo
+/.vscode
+
+# Build artifacts
+*.tar.gz
+*.zip
+SHA256SUMS
+build.log
+
+# Docker
+.dockerignore
+
+# Test artifacts (integration tests write these to /tmp but also possibly cwd)
+*.pcap
+*.log
+
+# Local binary if built/copied to project root
+/gutd
+
+# Generated WireGuard test configs
+wg-*.conf
+/wg-*.conf

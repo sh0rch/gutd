@@ -1,0 +1,13 @@
+on:
+  workflow_call:
+    inputs:
+      build_all:
+        type: boolean
+        required: false
+        default: false
+  workflow_dispatch:
+    inputs:
+      build_all:
+        type: boolean
+        required: false
+        default: false

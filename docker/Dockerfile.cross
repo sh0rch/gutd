@@ -1,0 +1,145 @@
+# Custom cross-compilation image for gutd
+# Extends a ghcr.io/cross-rs/<target> base image with:
+#   - musl-compiled libelf.a / libzstd.a extracted from Alpine (arch-matched)
+#   - clang + lld  : Rust linker for aarch64/armv7 (no GCC LTO plugin conflict)
+#   - autopoint/flex/bison/gawk  : vendored-libelf build deps (mips only)
+#
+# Used via Cross.toml — built automatically by `cross` on first run.
+
+ARG BASE_IMAGE
+ARG SYSROOT_PLATFORM=linux/amd64
+ARG IS_MIPS=false
+
+# ── Stage 1: extract musl-compiled static libs from Alpine ───────
+FROM --platform=${SYSROOT_PLATFORM} alpine:3.21 AS sysroot
+
+RUN apk add --no-cache \
+    elfutils-dev \
+    zstd-dev zstd-static \
+    zlib-dev zlib-static \
+    linux-headers \
+    musl-dev && \
+    mkdir -p /sysroot/lib /sysroot/include /sysroot/usr/include && \
+    cp /usr/lib/libelf.a  /sysroot/lib/ && \
+    cp /usr/lib/libzstd.a /sysroot/lib/ 2>/dev/null || true && \
+    cp /usr/lib/libz.a    /sysroot/lib/ 2>/dev/null || true && \
+    cp /usr/include/libelf.h /usr/include/gelf.h \
+    /usr/include/nlist.h  /usr/include/elf.h   /sysroot/include/ && \
+    cp /usr/include/zstd.h /sysroot/include/ 2>/dev/null || true && \
+    cp -r /usr/include/asm /usr/include/asm-generic \
+    /usr/include/linux /sysroot/include/ && \
+    cp -r /usr/include/* /sysroot/usr/include/
+
+# ── Stage 2: cross-compilation image based on cross-rs toolchain ─
+FROM ${BASE_IMAGE}
+
+ARG IS_MIPS=false
+
+# Musl-compiled static libs from Alpine (used by aarch64/armv7 for libelf/zstd)
+COPY --from=sysroot /sysroot /sysroot
+
+# clang + lld : Rust linker for arm targets (avoids GCC LTO plugin issue)
+# BPF compilation in build.rs also needs clang
+# mips: add elfutils build deps for vendored-libelf
+RUN export DEBIAN_FRONTEND=noninteractive && \
+    export TZ=Etc/UTC && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends tzdata && \
+    apt-get install -y --no-install-recommends \
+    clang llvm lld pkg-config libelf-dev zlib1g-dev gettext autopoint flex bison gawk make && \
+    if [ "$IS_MIPS" = "true" ]; then \
+    apt-get install -y --no-install-recommends \
+    autoconf automake libtool wget ca-certificates; \
+    fi && \
+    # Install libelf headers into target compiler sysroot so libbpf-sys make can include <libelf.h>/<gelf.h>
+    target_cc="" && \
+    for cc in aarch64-linux-musl-gcc armv7-unknown-linux-musleabihf-gcc arm-linux-musleabihf-gcc mipsel-linux-muslsf-gcc mips-linux-muslsf-gcc mipsel-linux-musl-gcc mips-linux-musl-gcc; do \
+    if command -v "$cc" >/dev/null 2>&1; then target_cc="$cc"; break; fi; \
+    done && \
+    if [ -n "$target_cc" ]; then \
+    target_sysroot="$($target_cc -print-sysroot)" && \
+    gcc_eh="$($target_cc -print-file-name=libgcc_eh.a)" && \
+    unwind_path="$(echo $gcc_eh | sed s/libgcc_eh/libunwind/)" && \
+    cp "$gcc_eh" "$unwind_path" 2>/dev/null || true && \
+    mkdir -p "$target_sysroot/include" "$target_sysroot/lib" && \
+    cp /sysroot/include/libelf.h /sysroot/include/gelf.h /sysroot/include/elf.h /sysroot/include/nlist.h "$target_sysroot/include/" && \
+    if [ "$IS_MIPS" != "true" ]; then \
+    cp /sysroot/lib/libelf.a "$target_sysroot/lib/" && \
+    cp /sysroot/lib/libzstd.a "$target_sysroot/lib/" 2>/dev/null || true; \
+    fi; \
+    if [ "$IS_MIPS" = "true" ]; then \
+    target_triplet="$(basename "$target_cc" | sed 's/-gcc$//')" && \
+    workdir="/tmp/argp-build" && \
+    argp_tgz="$workdir/argp-standalone-1.4.1.tar.gz" && \
+    rm -rf "$workdir" && mkdir -p "$workdir" && \
+    download_ok=0 && \
+    for url in \
+    https://github.com/ericonr/argp-standalone/archive/refs/tags/1.4.1.tar.gz; do \
+    if wget -q --tries=5 --timeout=30 --waitretry=2 -O "$argp_tgz" "$url" && tar tzf "$argp_tgz" >/dev/null 2>&1; then \
+    download_ok=1; \
+    break; \
+    fi; \
+    done && \
+    [ "$download_ok" = "1" ] && \
+    tar xzf "$argp_tgz" -C "$workdir" && \
+    cd "$workdir/argp-standalone-1.4.1" && \
+    autoreconf -vfi && \
+    CC="$target_cc" AR="${target_triplet}-ar" RANLIB="${target_triplet}-ranlib" \
+    ./configure --host="$target_triplet" --prefix=/usr && \
+    make -j"$(nproc)" && \
+    cp libargp.a "$target_sysroot/lib/" && \
+    cp argp.h "$target_sysroot/include/" && \
+    cd / && rm -rf "$workdir" && \
+    workdir="/tmp/fts-build" && \
+    fts_tgz="$workdir/musl-fts-1.2.7.tar.gz" && \
+    mkdir -p "$workdir" && \
+    wget -qO "$fts_tgz" "https://github.com/pullmoll/musl-fts/archive/refs/tags/v1.2.7.tar.gz" && \
+    tar xzf "$fts_tgz" -C "$workdir" && \
+    cd "$workdir/musl-fts-1.2.7" && \
+    ./bootstrap.sh && \
+    CC="$target_cc" AR="${target_triplet}-ar" RANLIB="${target_triplet}-ranlib" \
+    ./configure --host="$target_triplet" --prefix=/usr && \
+    make -j"$(nproc)" && \
+    cp .libs/libfts.a "$target_sysroot/lib/" && \
+    cp fts.h "$target_sysroot/include/" && \
+    cd / && rm -rf "$workdir" && \
+    workdir="/tmp/obstack-build" && \
+    obstack_tgz="$workdir/musl-obstack-1.1.tar.gz" && \
+    mkdir -p "$workdir" && \
+    wget -qO "$obstack_tgz" "https://github.com/pullmoll/musl-obstack/archive/refs/tags/v1.1.tar.gz" && \
+    tar xzf "$obstack_tgz" -C "$workdir" && \
+    cd "$workdir/musl-obstack-1.1" && \
+    ./bootstrap.sh && \
+    CC="$target_cc" AR="${target_triplet}-ar" RANLIB="${target_triplet}-ranlib" \
+    ./configure --host="$target_triplet" --prefix=/usr && \
+    make -j"$(nproc)" && \
+    cp .libs/libobstack.a "$target_sysroot/lib/" && \
+    cp obstack.h obstack_printf.h "$target_sysroot/include/" 2>/dev/null || true && \
+    cd / && rm -rf "$workdir"; \
+    fi; \
+    fi && \
+    # clang -target bpf needs /usr/include/asm/
+    ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/asm && \
+    rm -rf /var/lib/apt/lists/*
+
+# ── Environment configuration for rust linker ──────────────────────
+# aarch64
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="clang"
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=--target=aarch64-linux-musl -C link-arg=-fuse-ld=lld -C link-arg=-Wl,--gc-sections -C link-arg=-Wl,-s -L /sysroot/lib -l static=elf -l static=zstd"
+ENV CFLAGS_aarch64_unknown_linux_musl=" -fno-asynchronous-unwind-tables -Os"
+
+# armv7
+ENV CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER="clang"
+ENV CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=--target=armv7-linux-musleabihf -C link-arg=-fuse-ld=lld -C link-arg=-Wl,--gc-sections -C link-arg=-Wl,-s -L /sysroot/lib -l static=elf -l static=zstd"
+ENV CFLAGS_armv7_unknown_linux_musleabihf=" -fno-asynchronous-unwind-tables -Os"
+
+# mips/mipsel
+ENV CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-fno-lto -C link-arg=-Wl,--gc-sections -C link-arg=-Wl,-s -Lnative=/usr/local/mipsel-linux-muslsf/lib -Lnative=/usr/local/lib/gcc/mipsel-linux-muslsf/9.2.0 "
+ENV CFLAGS_mipsel_unknown_linux_musl="-fno-asynchronous-unwind-tables -Os "
+
+ENV CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-fno-lto -C link-arg=-Wl,--gc-sections -C link-arg=-Wl,-s -Lnative=/usr/local/mips-linux-muslsf/lib -Lnative=/usr/local/lib/gcc/mips-linux-muslsf/9.2.0 "
+ENV CFLAGS_mips_unknown_linux_musl="-fno-asynchronous-unwind-tables -Os "
+
+# libbpf-sys
+# removed global LIBBPF_SYS_EXTRA_CFLAGS
+# removed global LIBBPF_SYS

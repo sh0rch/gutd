@@ -1,0 +1,93 @@
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      build_all:
+        type: boolean
+        required: false
+        default: false
+        description: "Build all architectures"
+  workflow_dispatch:
+    inputs:
+      build_all:
+        type: boolean
+        required: false
+        default: false
+        description: "Build all architectures"
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          if [ "${{ inputs.build_all == true }}" = "true" ]; then
+            echo 'matrix={"include": [{"target": "x86_64-unknown-linux-musl", "label": "x86_64", "uses_cross": false, "qemu": ""}, {"target": "aarch64-unknown-linux-musl", "label": "aarch64", "uses_cross": true, "nightly": false, "extra_args": "", "qemu": "qemu-aarch64-static"}, {"target": "armv7-unknown-linux-musleabihf", "label": "armv7", "uses_cross": true, "nightly": false, "extra_args": "", "qemu": "qemu-arm-static"}, {"target": "mips-unknown-linux-musl", "label": "mips", "uses_cross": true, "nightly": true, "extra_args": "-Z build-std=std,panic_abort", "qemu": "qemu-mips-static"}, {"target": "mipsel-unknown-linux-musl", "label": "mipsel", "uses_cross": true, "nightly": true, "extra_args": "-Z build-std=std,panic_abort", "qemu": "qemu-mipsel-static"}]}' >> "$GITHUB_OUTPUT"
+          else
+            echo 'matrix={"include": [{"target": "x86_64-unknown-linux-musl", "label": "x86_64", "uses_cross": false, "qemu": ""}]}' >> "$GITHUB_OUTPUT"
+          fi
+
+  cross-build:
+    needs: prepare-matrix
+    name: Build ${{ matrix.label }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Ensure target directory exists
+      run: mkdir -p target/${{ matrix.target }}/release
+
+    - name: Install QEMU for multi-arch Docker builds
+      if: matrix.uses_cross
+      run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+
+    - name: Build (Uses Cross)
+      if: matrix.uses_cross
+      run: |
+        cargo binstall cross -y || cargo install cross
+        
+        EXTRA_ARGS="${{ matrix.extra_args }}"
+        if [[ "${{ matrix.target }}" == mips* ]]; then
+          EXTRA_ARGS="--features vendored-libelf $EXTRA_ARGS"
+        fi
+        
+        if [ "${{ matrix.nightly }}" = "true" ]; then
+          rustup toolchain install nightly
+          cross +nightly build --release --target ${{ matrix.target }} $EXTRA_ARGS
+        else
+          cross build --release --target ${{ matrix.target }} $EXTRA_ARGS
+        fi
+
+    - name: Build (Native Docker / x86_64)
+      if: '!matrix.uses_cross'
+      run: |
+        docker build --target toolchain -t builder-x86_64 -f docker/Dockerfile .
+        # Local compile doesn't need vendored-libelf, the sysroot provides it
+        docker run --rm -w /usr/src/app -v $(pwd):/usr/src/app builder-x86_64 bash -c "\
+          cargo build --release --target ${{ matrix.target }} && \
+          chown -R $(id -u):$(id -g) target"
+
+    - name: Strip binary
+      run: |
+        if [ -n "${{ matrix.qemu }}" ]; then
+          docker run --rm \
+            -v $(pwd)/target/${{ matrix.target }}/release:/mnt \
+            ghcr.io/cross-rs/${{ matrix.target }}:${{ matrix.nightly && 'edge' || 'main' }} \
+            bash -c "STRIP_CMD=\$(find /usr/local/bin -maxdepth 1 -name '*-strip' | head -n 1); if [ -n \"\$STRIP_CMD\" ]; then \$STRIP_CMD /mnt/gutd; else strip /mnt/gutd || true; fi"
+        else
+          strip target/${{ matrix.target }}/release/gutd || true
+        fi
+        ls -lh target/${{ matrix.target }}/release/gutd
+        
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: gutd-${{ matrix.label }}
+        path: target/${{ matrix.target }}/release/gutd
+        retention-days: 1

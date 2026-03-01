@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version'
+        required: true
+
+jobs:
+  test:
+    uses: ./.github/workflows/unit-tests.yml
+
+  build:
+    needs: test
+    uses: ./.github/workflows/build.yml
+    with:
+      build_all: true
+
+  verify_and_prepare:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+        merge-multiple: true
+
+    - name: Rename and verify
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          VERSION="${{ github.event.inputs.version }}"
+        else
+          VERSION="${GITHUB_REF#refs/tags/}"
+        fi
+        
+        mkdir -p release-out
+        cd artifacts
+        for f in gutd-*; do
+          # Only process files that look like compiled binaries
+          if [ -f "$f" ]; then
+            chmod +x "$f"
+            
+            # Simple smoke test
+            if [ "$f" = "gutd-x86_64" ]; then
+                ./"$f" --version
+            fi
+            
+            # Form final name like gutd-x86_64-v1.0.0
+            NEW_NAME="${f}-${VERSION}"
+            cp "$f" "../release-out/$NEW_NAME"
+            cd ../release-out
+            sha256sum "$NEW_NAME" >> checksums.txt
+            cd ../artifacts
+          fi
+        done
+        
+        echo "Prepared files:"
+        ls -la ../release-out/
+
+    - name: Upload valid release artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: final-release
+        path: release-out/*
+        retention-days: 1
+
+  release:
+    needs: verify_and_prepare
+    if: github.event_name == 'push' || github.event.inputs.version != ''
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download prepared artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: final-release
+        path: release
+
+    - name: Determine version
+      id: version
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          VERSION="${{ github.event.inputs.version }}"
+        else
+          VERSION="${GITHUB_REF#refs/tags/}"
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Create release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.version.outputs.version }}
+        name: gutd ${{ steps.version.outputs.version }}
+        body: |
+          ## gutd ${{ steps.version.outputs.version }}
+
+          TC/XDP eBPF tunnel static musl binaries.
+          
+          Supported architectures: `x86_64`, `aarch64`, `armv7`, `mips`, `mipsel`
+
+          **SHA256:**
+          ```
+          $(cat release/checksums.txt)
+          ```
+        files: release/*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

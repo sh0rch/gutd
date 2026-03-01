@@ -1,0 +1,31 @@
+# Cross.toml — configuration for the `cross` cross-compilation tool
+#
+# Used for: aarch64, armv7, mipsel, mips targets (x86_64 builds natively via Dockerfile)
+# Custom images extend ghcr.io/cross-rs/<target> with:
+#   - clang + lld  (Rust linker — avoids GCC LTO plugin / LLVM bitcode version mismatch)
+#   - Alpine sysroot  (musl-compiled libelf.a, libzstd.a, headers)
+#   - autopoint/flex/bison/gawk  (vendored-libelf deps, mips only)
+
+# ── aarch64 ──────────────────────────────────────────────────────
+[target.aarch64-unknown-linux-musl]
+dockerfile.file    = "docker/Dockerfile.cross"
+dockerfile.context = "."
+dockerfile.build-args = { BASE_IMAGE = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main", SYSROOT_PLATFORM = "linux/arm64" }
+
+# ── armv7 ────────────────────────────────────────────────────────
+[target.armv7-unknown-linux-musleabihf]
+dockerfile.file    = "docker/Dockerfile.cross"
+dockerfile.context = "."
+dockerfile.build-args = { BASE_IMAGE = "ghcr.io/cross-rs/armv7-unknown-linux-musleabihf:main", SYSROOT_PLATFORM = "linux/arm/v7" }
+
+# ── mipsel ───────────────────────────────────────────────────────
+[target.mipsel-unknown-linux-musl]
+dockerfile.file    = "docker/Dockerfile.cross"
+dockerfile.context = "."
+dockerfile.build-args = { BASE_IMAGE = "ghcr.io/cross-rs/mipsel-unknown-linux-musl:edge", SYSROOT_PLATFORM = "linux/amd64", IS_MIPS = "true" }
+
+# ── mips ─────────────────────────────────────────────────────────
+[target.mips-unknown-linux-musl]
+dockerfile.file    = "docker/Dockerfile.cross"
+dockerfile.context = "."
+dockerfile.build-args = { BASE_IMAGE = "ghcr.io/cross-rs/mips-unknown-linux-musl:edge", SYSROOT_PLATFORM = "linux/amd64", IS_MIPS = "true" }

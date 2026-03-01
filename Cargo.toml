@@ -1,0 +1,54 @@
+[package]
+name = "gutd"
+version = "1.1.0"
+edition = "2021"
+authors = ["GUT Project"]
+description = "WireGuard traffic obfuscator using TC/XDP eBPF"
+license = "MIT"
+
+[lib]
+name = "gutd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gutd"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+anyhow = "1.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["uio"] }
+# libbpf-rs for TC eBPF support (optional, compiled only on Linux)
+libbpf-rs = { version = "0.24", optional = true }
+# vendored-zlib: build zlib from source for musl cross-compile
+libbpf-sys = { version = "1.6", features = ["vendored-zlib"], optional = true }
+
+[build-dependencies]
+# libbpf-cargo for TC eBPF compilation (skeleton generation)
+libbpf-cargo = { version = "0.24", optional = true }
+
+[features]
+default = ["tc_ebpf"]
+# tc_ebpf feature enables TC eBPF fast path support
+tc_ebpf = ["libbpf-rs", "libbpf-sys", "libbpf-cargo"]
+# Compatibility alias for older scripts/commands
+bpf = ["tc_ebpf"]
+# Build libelf from source (mips cross-compile; requires glibc argp)
+vendored-libelf = ["libbpf-sys/vendored-libelf"]
+
+[profile.release]
+opt-level = "z"
+# lto intentionally omitted here — enabled per-target in Dockerfile via --config
+# (GCC cross-linkers cannot handle LLVM LTO bitcode in rlibs)
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release.package."*"]
+opt-level = "z"
+
+[profile.dev]
+opt-level = 0
+debug = true

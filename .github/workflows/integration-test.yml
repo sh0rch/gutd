@@ -1,0 +1,165 @@
+name: Integration Test
+
+on:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: TC/XDP Tunnel Integration Test
+    runs-on: ubuntu-22.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download binary
+      uses: actions/download-artifact@v4
+      with:
+        name: gutd-x86_64
+        path: /tmp/bin
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y iperf3 iproute2 iputils-ping wireguard-tools
+        chmod +x /tmp/bin/gutd
+        mv /tmp/bin/gutd /tmp/bin/gutd-x86_64
+        /tmp/bin/gutd-x86_64 --version
+
+    - name: Setup namespaces & run tunnel test
+      run: |
+        set -e
+        GUTD=/tmp/bin/gutd-x86_64
+        KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        PORTS="41000"
+
+        # Mount bpffs if needed
+        sudo mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
+
+        # Cleanup any leftovers
+        sudo pkill -9 gutd 2>/dev/null || true
+        sudo ip netns del ns1 2>/dev/null || true
+        sudo ip netns del ns2 2>/dev/null || true
+        sleep 0.2
+
+        # --- Namespaces and transport veth ---
+        sudo ip netns add ns1
+        sudo ip netns add ns2
+        sudo ip link add veth1 type veth peer name veth2
+        sudo ip link set veth1 netns ns1
+        sudo ip link set veth2 netns ns2
+        sudo ip netns exec ns1 bash -c 'ip link set lo up; ip link set veth1 up; ip addr add 10.0.0.1/24 dev veth1'
+        sudo ip netns exec ns2 bash -c 'ip link set lo up; ip link set veth2 up; ip addr add 10.0.0.2/24 dev veth2'
+        
+        # Limit GSO (TC BPF runs before segmentation)
+        sudo ip netns exec ns1 ip link set dev veth1 gso_max_size 1492 2>/dev/null || true
+        sudo ip netns exec ns2 ip link set dev veth2 gso_max_size 1492 2>/dev/null || true
+        
+        # Verify transport connectivity
+        echo "=== TRANSPORT PING ==="
+        sudo ip netns exec ns1 ping -c1 -W2 10.0.0.2
+
+        # --- WireGuard keys ---
+        WG_CLIENT_PRIV=$(wg genkey)
+        WG_CLIENT_PUB=$(echo "$WG_CLIENT_PRIV" | wg pubkey)
+        WG_SERVER_PRIV=$(wg genkey)
+        WG_SERVER_PUB=$(echo "$WG_SERVER_PRIV" | wg pubkey)
+
+        # WG server config written to /tmp (shared filesystem across netns)
+        printf '[Interface]\nPrivateKey = %s\nListenPort = 51820\n\n[Peer]\nPublicKey = %s\nAllowedIPs = 10.200.0.1/32\n' \
+          "$WG_SERVER_PRIV" "$WG_CLIENT_PUB" > /tmp/wg-server.conf
+
+        # ============================================================
+        # WireGuard through gutd tunnel
+        # ============================================================
+        echo ""
+        echo "========================================"
+        echo " WireGuard through gutd tunnel          "
+        echo "========================================"
+
+        printf '[global]\n[peer]\nname = gut1\nmtu = 1500\nnic = veth1\naddress = 192.168.99.1/30\nbind_ip = 10.0.0.1\npeer_ip = 10.0.0.2\nports = %s\nkey = %s\n' \
+          "$PORTS" "$KEY" > /tmp/g1.conf
+
+        printf '[global]\n[peer]\nname = gut2\nmtu = 1500\nnic = veth2\naddress = 192.168.99.2/30\nbind_ip = 10.0.0.2\npeer_ip = 10.0.0.1\nports = %s\nkey = %s\n' \
+          "$PORTS" "$KEY" > /tmp/g2.conf
+
+        sudo ip netns exec ns1 $GUTD --config /tmp/g1.conf > /tmp/gutd-ns1.log 2>&1 &
+        G1PID=$!
+        sleep 1
+        sudo ip netns exec ns2 $GUTD --config /tmp/g2.conf > /tmp/gutd-ns2.log 2>&1 &
+        G2PID=$!
+        sleep 2
+
+        if ! kill -0 $G1PID 2>/dev/null; then
+          echo "FAIL: gutd ns1 died"; cat /tmp/gutd-ns1.log; exit 1
+        fi
+        if ! kill -0 $G2PID 2>/dev/null; then
+          echo "FAIL: gutd ns2 died"; cat /tmp/gutd-ns2.log; exit 1
+        fi
+        echo "OK: gutd running in both namespaces"
+
+        # WG server in ns2 (same config — listens on 0.0.0.0:51820)
+        sudo ip netns exec ns2 ip link add wg0 type wireguard
+        sudo ip netns exec ns2 ip addr add 10.200.0.2/24 dev wg0
+        sudo ip netns exec ns2 wg setconf wg0 /tmp/wg-server.conf
+        sudo ip netns exec ns2 ip link set wg0 mtu 1420 up
+
+        # WG client in ns1 — endpoint is gutd tunnel IP of ns2 (192.168.99.2).
+        # gutd does in-place obfuscation with no encapsulation overhead,
+        # so wg0 MTU = standard 1420 (1500 - 80 WireGuard overhead).
+        printf '[Interface]\nPrivateKey = %s\n\n[Peer]\nPublicKey = %s\nEndpoint = 192.168.99.2:51820\nAllowedIPs = 10.200.0.0/24\nPersistentKeepalive = 5\n' \
+          "$WG_CLIENT_PRIV" "$WG_SERVER_PUB" > /tmp/wg-client-tunnel.conf
+        sudo ip netns exec ns1 ip link add wg0 type wireguard
+        sudo ip netns exec ns1 ip addr add 10.200.0.1/24 dev wg0
+        sudo ip netns exec ns1 wg setconf wg0 /tmp/wg-client-tunnel.conf
+        sudo ip netns exec ns1 ip link set wg0 mtu 1420 up
+
+        sleep 4
+        echo "--- WireGuard handshake ---"
+        sudo ip netns exec ns1 wg show wg0
+        sudo ip netns exec ns2 wg show wg0
+
+        echo "=== Ping through gutd ==="
+        sudo ip netns exec ns1 ping -c5 -i0.2 -W3 10.200.0.2
+        echo "PING: SUCCESS"
+
+        set +e
+        echo "=== iperf3 TCP (5s, via gutd) ==="
+        timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5201 &
+        sleep 0.5
+        timeout 15 sudo ip netns exec ns1 iperf3 -c 10.200.0.2 -p 5201 -P 4 -t 5 2>&1 | tee /tmp/iperf_tunnel_tcp.txt || true
+        TUNNEL_TCP=$(grep "SUM.*sender" /tmp/iperf_tunnel_tcp.txt | awk '{print $6, $7}') || true
+        [ -z "$TUNNEL_TCP" ] && TUNNEL_TCP=$(grep "sender" /tmp/iperf_tunnel_tcp.txt | tail -1 | awk '{print $7, $8}') || true
+        echo "TCP: $TUNNEL_TCP"
+
+        echo "=== iperf3 UDP (5s, via gutd) ==="
+        timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5202 &
+        sleep 0.5
+        timeout 15 sudo ip netns exec ns1 iperf3 -c 10.200.0.2 -p 5202 -u -b 2G -t 5 2>&1 | tee /tmp/iperf_tunnel_udp.txt || true
+        TUNNEL_UDP=$(grep "sender" /tmp/iperf_tunnel_udp.txt | awk '{print $7, $8}') || true
+        TUNNEL_UDP_LOSS=$(grep "sender" /tmp/iperf_tunnel_udp.txt | grep -oP '\(\K[^)]+' || echo "?")
+        echo "UDP: $TUNNEL_UDP  loss: $TUNNEL_UDP_LOSS"
+        set -e
+
+        # --- Cleanup ---
+        sudo kill $G1PID $G2PID 2>/dev/null || true
+        sleep 0.3
+        sudo kill -9 $G1PID $G2PID 2>/dev/null || true
+        wait $G1PID $G2PID 2>/dev/null || true
+        sudo ip netns del ns1 2>/dev/null || true
+        sudo ip netns del ns2 2>/dev/null || true
+
+        # ============================================================
+        # RESULTS SUMMARY
+        # ============================================================
+        echo ""
+        echo "========================================"
+        echo " RESULTS SUMMARY                        "
+        echo "========================================"
+        echo "  TCP (WireGuard via gutd):  $TUNNEL_TCP"
+        echo "  UDP (WireGuard via gutd):  $TUNNEL_UDP  loss: $TUNNEL_UDP_LOSS"
+        echo "========================================"
+
+        echo "=== ALL TESTS PASSED ==="

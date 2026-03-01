@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+    paths-ignore:
+      - '**/*.md'
+      - '**/*.txt'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - '**/*.txt'
+
+jobs:
+  test:
+    uses: ./.github/workflows/unit-tests.yml
+
+  build:
+    uses: ./.github/workflows/build.yml
+
+  verify:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download binary
+      uses: actions/download-artifact@v4
+      with:
+        name: gutd-x86_64
+        path: .
+
+    - name: Verify binary runs
+      run: |
+        chmod +x gutd
+        mv gutd gutd-x86_64
+        ./gutd-x86_64 --version
+
+    - name: Verify config parsing
+      run: |
+        cat > test.conf <<CONF
+        [global]
+        [peer]
+        name = gut0
+        mtu = 1400
+        nic = lo
+        address = 192.168.99.1/30
+        bind_ip = 127.0.0.1
+        peer_ip = 127.0.0.1
+        ports = 6000
+        key = 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        CONF
+
+        timeout 2 sudo ./gutd-x86_64 --config test.conf 2>&1 | tee log.txt || true
+        if grep -iq "panic\|parse error\|unknown section\|missing required" log.txt; then
+          echo "FAIL Config parsing failed"
+          cat log.txt
+          exit 1
+        fi
+        echo "ok Config parsing OK"
+
+  integration-test:
+    needs: build
+    uses: ./.github/workflows/integration-test.yml

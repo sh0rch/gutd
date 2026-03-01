@@ -1,0 +1,19 @@
+name: Unit Tests
+
+on:
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install eBPF build dependencies
+      run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev linux-libc-dev
+
+    - name: Run tests
+      run: cargo test --release --verbose
