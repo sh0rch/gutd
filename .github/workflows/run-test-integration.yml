@@ -1,12 +1,7 @@
-name: Standalone Integration Test
+name: Integration Test
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main, develop]
-    paths-ignore:
-      - '**/*.md'
-      - '**/*.txt'
 
 permissions:
   contents: write

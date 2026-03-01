@@ -1,14 +1,7 @@
-name: Build
+name: Build (CI only)
 
 on:
   workflow_call:
-    inputs:
-      build_all:
-        type: boolean
-        required: false
-        default: false
-        description: "Build all architectures"
-  workflow_dispatch:
     inputs:
       build_all:
         type: boolean

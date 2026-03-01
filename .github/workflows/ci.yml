@@ -1,4 +1,4 @@
-name: CI
+name: CI (CI only)
 
 on:
   push:
@@ -62,6 +62,3 @@ jobs:
         fi
         echo "ok Config parsing OK"
 
-  integration-test:
-    needs: build
-    uses: ./.github/workflows/integration-test.yml

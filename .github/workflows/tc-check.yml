@@ -1,4 +1,4 @@
-name: TC/XDP eBPF Module Verification
+name: TC/XDP eBPF Module Verification (CI only)
 
 on:
   push:

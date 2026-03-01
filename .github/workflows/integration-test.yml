@@ -1,7 +1,13 @@
-name: Integration Test
+name: TC/XDP Integration Test (CI only)
 
 on:
   workflow_call:
+    inputs:
+      update_readme:
+        description: 'Should update README?'
+        required: false
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -179,10 +185,7 @@ jobs:
         echo "TUNNEL_UDP_LOSS=$TUNNEL_UDP_LOSS" >> $GITHUB_ENV
 
     - name: Update README with metrics
-      if: |
-        github.event_name != 'workflow_dispatch' &&
-        github.event_name != 'pull_request' &&
-        (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+      if: ${{ inputs.update_readme }}
       env:
         TABLE_SNIPPET: |
           <!-- INTEGRATION_TEST_RESULTS_START -->
