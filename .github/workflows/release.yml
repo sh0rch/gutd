@@ -113,6 +113,22 @@ jobs:
           TC/XDP eBPF tunnel static musl binaries.
           
           Supported architectures: `x86_64`, `aarch64`, `armv7`, `mips`, `mipsel`
+          
+          ### Installation
+          
+          **x86_64**
+          ```bash
+          wget https://github.com/sh0rch/gutd/releases/download/${{ steps.version.outputs.version }}/gutd-x86_64-${{ steps.version.outputs.version }} -O gutd
+          chmod +x ./gutd
+          sudo ./gutd install
+          ```
+          
+          **aarch64 / ARM64**
+          ```bash
+          wget https://github.com/sh0rch/gutd/releases/download/${{ steps.version.outputs.version }}/gutd-aarch64-${{ steps.version.outputs.version }} -O gutd
+          chmod +x ./gutd
+          sudo ./gutd install
+          ```
 
           **SHA256:**
           ```
