@@ -12,6 +12,9 @@ on:
       - '**/*.md'
       - '**/*.txt'
 
+permissions:
+  contents: write
+
 jobs:
   test:
     uses: ./.github/workflows/unit-tests.yml

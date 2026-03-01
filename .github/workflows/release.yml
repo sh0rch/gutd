@@ -9,6 +9,9 @@ on:
         description: 'Release version'
         required: true
 
+permissions:
+  contents: write
+
 jobs:
   test:
     uses: ./.github/workflows/unit-tests.yml
