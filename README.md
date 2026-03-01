@@ -7,9 +7,10 @@
 <!-- INTEGRATION_TEST_RESULTS_START -->
 | Proto | Bandwidth | Packet Loss |
 |---|---|---|
-| **TCP** | 1.01 Gbits/sec | - |
-| **UDP** | 1.13 Gbits/sec | 0% |
+| **TCP** | 1000 Mbits/sec | - |
+| **UDP** | 1.19 Gbits/sec | 0% |
 <!-- INTEGRATION_TEST_RESULTS_END -->
+
 
 
 gutd obfuscates WireGuard UDP traffic in-place using a Linux TC/XDP eBPF datapath.
