@@ -179,7 +179,10 @@ jobs:
         echo "TUNNEL_UDP_LOSS=$TUNNEL_UDP_LOSS" >> $GITHUB_ENV
 
     - name: Update README with metrics
-      if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+      if: |
+        github.event_name != 'workflow_dispatch' &&
+        github.event_name != 'pull_request' &&
+        (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
       env:
         TABLE_SNIPPET: |
           <!-- INTEGRATION_TEST_RESULTS_START -->

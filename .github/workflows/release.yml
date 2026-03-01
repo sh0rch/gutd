@@ -130,6 +130,27 @@ jobs:
           sudo ./gutd install
           ```
 
+          **armv7 / ARM32**
+          ```bash
+          wget https://github.com/sh0rch/gutd/releases/download/${{ steps.version.outputs.version }}/gutd-armv7-${{ steps.version.outputs.version }} -O gutd
+          chmod +x ./gutd
+          sudo ./gutd install
+          ```
+
+          **mips (OpenWRT)**
+          ```bash
+          wget https://github.com/sh0rch/gutd/releases/download/${{ steps.version.outputs.version }}/gutd-mips-${{ steps.version.outputs.version }} -O gutd
+          chmod +x ./gutd
+          ./gutd install
+          ```
+
+          **mipsel (OpenWRT)**
+          ```bash
+          wget https://github.com/sh0rch/gutd/releases/download/${{ steps.version.outputs.version }}/gutd-mipsel-${{ steps.version.outputs.version }} -O gutd
+          chmod +x ./gutd
+          ./gutd install
+          ```
+
           **SHA256:**
           ```
           $(cat release/checksums.txt)
