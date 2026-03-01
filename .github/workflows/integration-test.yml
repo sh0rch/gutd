@@ -2,6 +2,9 @@ name: Integration Test
 
 on:
   workflow_call:
+  workflow_dispatch:
+  push:
+    tags: ['v*.*.*']
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,8 +27,7 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y iperf3 iproute2 iputils-ping wireguard-tools
-        chmod +x /tmp/bin/gutd
-        mv /tmp/bin/gutd /tmp/bin/gutd-x86_64
+        chmod +x /tmp/bin/gutd-x86_64
         /tmp/bin/gutd-x86_64 --version
 
     - name: Setup namespaces & run tunnel test
@@ -163,3 +165,10 @@ jobs:
         echo "========================================"
 
         echo "=== ALL TESTS PASSED ==="
+
+        # Write to step summary
+        echo "## Integration Test Results" >> $GITHUB_STEP_SUMMARY
+        echo "| Proto | Bandwidth | Packet Loss |" >> $GITHUB_STEP_SUMMARY
+        echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+        echo "| **TCP** | $TUNNEL_TCP | - |" >> $GITHUB_STEP_SUMMARY
+        echo "| **UDP** | $TUNNEL_UDP | $TUNNEL_UDP_LOSS |" >> $GITHUB_STEP_SUMMARY

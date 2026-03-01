@@ -33,8 +33,7 @@ jobs:
 
     - name: Verify binary runs
       run: |
-        chmod +x gutd
-        mv gutd gutd-x86_64
+        chmod +x gutd-x86_64
         ./gutd-x86_64 --version
 
     - name: Verify config parsing

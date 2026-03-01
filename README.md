@@ -1,5 +1,9 @@
 # gutd - WireGuard Traffic Obfuscator (TC/XDP eBPF)
 
+[![CI](https://github.com/sh0rch/gutd/actions/workflows/ci.yml/badge.svg)](https://github.com/sh0rch/gutd/actions/workflows/ci.yml)
+[![Integration Test](https://github.com/sh0rch/gutd/actions/workflows/integration-test.yml/badge.svg)](https://github.com/sh0rch/gutd/actions/workflows/integration-test.yml)
+[![Release](https://github.com/sh0rch/gutd/actions/workflows/release.yml/badge.svg)](https://github.com/sh0rch/gutd/actions/workflows/release.yml)
+
 gutd obfuscates WireGuard UDP traffic in-place using a Linux TC/XDP eBPF datapath.
 It sits transparently between a WireGuard peer and the network: on egress the TC
 program masks each packet with a ChaCha keystream; on ingress the XDP program
