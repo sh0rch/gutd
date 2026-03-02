@@ -2,21 +2,29 @@ name: Benchmark Compare Releases
 
 on:
   workflow_dispatch:
+    inputs:
+      update_readme:
+        description: 'Update README with results?'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 jobs:
-  benchmark:
-    name: Benchmark gutd vs wg-obfuscator
+  benchmark-wgobfs:
+    name: Benchmark wg-obfuscator
     runs-on: ubuntu-22.04
-
+    outputs:
+      tcp: ${{ steps.run-test.outputs.WGOBFS_TCP }}
+      udp: ${{ steps.run-test.outputs.WGOBFS_UDP }}
+      loss: ${{ steps.run-test.outputs.WGOBFS_UDP_LOSS }}
     steps:
     - name: Install dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y iperf3 iproute2 iputils-ping wireguard-tools jq curl
-
     - name: Download latest wg-obfuscator release
       run: |
         echo "Fetching latest ClusterM/wg-obfuscator..."
@@ -25,20 +33,14 @@ jobs:
         tar xf wg-obfuscator-*-linux-x64.tar.gz
         sudo mv wg-obfuscator/wg-obfuscator /usr/local/bin/wg-obfuscator
         chmod +x /usr/local/bin/wg-obfuscator
-        echo "wg-obfuscator --help output:"
-        /usr/local/bin/wg-obfuscator --help | head -n 5 || true
 
     - name: Run wg-obfuscator Test
+      id: run-test
       run: |
         set -ex
         KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         PORTS="41000"
         WG_OBFS="/usr/local/bin/wg-obfuscator"
-
-        # Cleanup
-        sudo pkill -9 wg-obfuscator 2>/dev/null || true
-        sudo ip netns del ns1 2>/dev/null || true
-        sudo ip netns del ns2 2>/dev/null || true
 
         # Namespaces
         sudo ip netns add ns1
@@ -49,6 +51,10 @@ jobs:
         sudo ip netns exec ns1 bash -c 'ip link set lo up; ip link set veth1 up; ip addr add 10.0.0.1/24 dev veth1'
         sudo ip netns exec ns2 bash -c 'ip link set lo up; ip link set veth2 up; ip addr add 10.0.0.2/24 dev veth2'
         
+        # Limit GSO to maintain parity with gutd test
+        sudo ip netns exec ns1 ip link set dev veth1 gso_max_size 1492 2>/dev/null || true
+        sudo ip netns exec ns2 ip link set dev veth2 gso_max_size 1492 2>/dev/null || true
+
         WG_CLIENT_PRIV=$(wg genkey)
         WG_CLIENT_PUB=$(echo "$WG_CLIENT_PRIV" | wg pubkey)
         WG_SERVER_PRIV=$(wg genkey)
@@ -94,13 +100,25 @@ jobs:
         set -e
 
         sudo kill -9 $G1PID $G2PID 2>/dev/null || true
-        sudo ip netns del ns1
-        sudo ip netns del ns2
 
-        echo "WGOBFS_TCP=$WGOBFS_TCP" >> $GITHUB_ENV
-        echo "WGOBFS_UDP=$WGOBFS_UDP" >> $GITHUB_ENV
-        echo "WGOBFS_UDP_LOSS=$WGOBFS_UDP_LOSS" >> $GITHUB_ENV
+        echo "WGOBFS_TCP=$WGOBFS_TCP" >> $GITHUB_OUTPUT
+        echo "WGOBFS_UDP=$WGOBFS_UDP" >> $GITHUB_OUTPUT
+        echo "WGOBFS_UDP_LOSS=$WGOBFS_UDP_LOSS" >> $GITHUB_OUTPUT
 
+  benchmark-gutd:
+    name: Benchmark gutd
+    runs-on: ubuntu-22.04
+    outputs:
+      tcp: ${{ steps.run-test.outputs.GUTD_TCP }}
+      udp: ${{ steps.run-test.outputs.GUTD_UDP }}
+      loss: ${{ steps.run-test.outputs.GUTD_UDP_LOSS }}
+      tag: ${{ steps.run-test.outputs.GUTD_LATEST_TAG }}
+    steps:
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y iperf3 iproute2 iputils-ping wireguard-tools jq curl
+    
     - name: Download latest gutd release
       run: |
         echo "Fetching latest sh0rch/gutd..."
@@ -109,11 +127,10 @@ jobs:
         curl -LO $LATEST_URL
         chmod +x gutd-x86_64-*
         sudo mv gutd-x86_64-* /usr/local/bin/gutd
-        echo "gutd version:"
-        /usr/local/bin/gutd --version
-        echo "GUTD_LATEST_TAG=$RELEASE_TAG" >> $GITHUB_ENV
+        echo "TAG=$RELEASE_TAG" >> $GITHUB_ENV
 
     - name: Run gutd Test
+      id: run-test
       run: |
         set -ex
         KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -122,11 +139,6 @@ jobs:
 
         # Mount bpffs
         sudo mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
-        
-        sudo pkill -9 gutd 2>/dev/null || true
-        sudo ip netns del ns1 2>/dev/null || true
-        sudo ip netns del ns2 2>/dev/null || true
-        sleep 0.2
 
         sudo ip netns add ns1
         sudo ip netns add ns2
@@ -189,33 +201,55 @@ jobs:
         set -e
 
         sudo kill -9 $G1PID $G2PID 2>/dev/null || true
-        sudo ip netns del ns1
-        sudo ip netns del ns2
 
-        echo "GUTD_TCP=$GUTD_TCP" >> $GITHUB_ENV
-        echo "GUTD_UDP=$GUTD_UDP" >> $GITHUB_ENV
-        echo "GUTD_UDP_LOSS=$GUTD_UDP_LOSS" >> $GITHUB_ENV
+        echo "GUTD_TCP=$GUTD_TCP" >> $GITHUB_OUTPUT
+        echo "GUTD_UDP=$GUTD_UDP" >> $GITHUB_OUTPUT
+        echo "GUTD_UDP_LOSS=$GUTD_UDP_LOSS" >> $GITHUB_OUTPUT
+        echo "GUTD_LATEST_TAG=$TAG" >> $GITHUB_OUTPUT
 
+  publish-results:
+    name: Compare & Publish
+    needs: [benchmark-wgobfs, benchmark-gutd]
+    runs-on: ubuntu-22.04
+    steps:
     - name: Publish Comparative Summary
+      env:
+        WGOBFS_TCP: ${{ needs.benchmark-wgobfs.outputs.tcp }}
+        WGOBFS_UDP: ${{ needs.benchmark-wgobfs.outputs.udp }}
+        WGOBFS_UDP_LOSS: ${{ needs.benchmark-wgobfs.outputs.loss }}
+        GUTD_TCP: ${{ needs.benchmark-gutd.outputs.tcp }}
+        GUTD_UDP: ${{ needs.benchmark-gutd.outputs.udp }}
+        GUTD_UDP_LOSS: ${{ needs.benchmark-gutd.outputs.loss }}
+        GUTD_LATEST_TAG: ${{ needs.benchmark-gutd.outputs.tag }}
       run: |
         echo "## 📊 Benchmark: wg-obfuscator vs gutd" >> $GITHUB_STEP_SUMMARY
         echo "| Tool | TCP Bandwidth | UDP Bandwidth | UDP Loss |" >> $GITHUB_STEP_SUMMARY
         echo "|---|---|---|---|" >> $GITHUB_STEP_SUMMARY
-        echo "| **wg-obfuscator** (latest) | ${{ env.WGOBFS_TCP }} | ${{ env.WGOBFS_UDP }} | ${{ env.WGOBFS_UDP_LOSS }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| **gutd** ([${{ env.GUTD_LATEST_TAG }}](https://github.com/${{ github.repository }}/releases/tag/${{ env.GUTD_LATEST_TAG }})) | ${{ env.GUTD_TCP }} | ${{ env.GUTD_UDP }} | ${{ env.GUTD_UDP_LOSS }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **wg-obfuscator** (latest) | $WGOBFS_TCP | $WGOBFS_UDP | $WGOBFS_UDP_LOSS |" >> $GITHUB_STEP_SUMMARY
+        echo "| **gutd** ([$GUTD_LATEST_TAG](https://github.com/${{ github.repository }}/releases/tag/$GUTD_LATEST_TAG)) | $GUTD_TCP | $GUTD_UDP | $GUTD_UDP_LOSS |" >> $GITHUB_STEP_SUMMARY
 
     - name: Checkout repository
       uses: actions/checkout@v4
+      if: inputs.update_readme
 
     - name: Update README with metrics
+      if: inputs.update_readme
+      env:
+        WGOBFS_TCP: ${{ needs.benchmark-wgobfs.outputs.tcp }}
+        WGOBFS_UDP: ${{ needs.benchmark-wgobfs.outputs.udp }}
+        WGOBFS_UDP_LOSS: ${{ needs.benchmark-wgobfs.outputs.loss }}
+        GUTD_TCP: ${{ needs.benchmark-gutd.outputs.tcp }}
+        GUTD_UDP: ${{ needs.benchmark-gutd.outputs.udp }}
+        GUTD_UDP_LOSS: ${{ needs.benchmark-gutd.outputs.loss }}
+        GUTD_LATEST_TAG: ${{ needs.benchmark-gutd.outputs.tag }}
       run: |
         DATE_STR=$(date +'%Y-%m-%d %H:%M')
         TABLE_SNIPPET="<!-- INTEGRATION_TEST_RESULTS_START -->
         ### 📊 Benchmark: gutd vs wg-obfuscator
         | Tool | TCP Bandwidth | UDP Bandwidth | UDP Loss |
         |---|---|---|---|
-        | **gutd** ([${{ env.GUTD_LATEST_TAG }}](https://github.com/${{ github.repository }}/releases/tag/${{ env.GUTD_LATEST_TAG }})) | ${{ env.GUTD_TCP }} | ${{ env.GUTD_UDP }} | ${{ env.GUTD_UDP_LOSS }} |
-        | **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | ${{ env.WGOBFS_TCP }} | ${{ env.WGOBFS_UDP }} | ${{ env.WGOBFS_UDP_LOSS }} |
+        | **gutd** ([$GUTD_LATEST_TAG](https://github.com/${{ github.repository }}/releases/tag/$GUTD_LATEST_TAG)) | $GUTD_TCP | $GUTD_UDP | $GUTD_UDP_LOSS |
+        | **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | $WGOBFS_TCP | $WGOBFS_UDP | $WGOBFS_UDP_LOSS |
         
         <sub><i>* Performance measured using \`iperf3\` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. Unmodified default parameters unless configured otherwise. [See test logic and full logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). Last updated: $DATE_STR</i></sub>
         <!-- INTEGRATION_TEST_RESULTS_END -->"
