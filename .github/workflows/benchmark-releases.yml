@@ -105,11 +105,13 @@ jobs:
       run: |
         echo "Fetching latest sh0rch/gutd..."
         LATEST_URL=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r '.assets[] | select(.name|test("^gutd-x86_64-.*$")) | .browser_download_url')
+        RELEASE_TAG=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r '.tag_name')
         curl -LO $LATEST_URL
         chmod +x gutd-x86_64-*
         sudo mv gutd-x86_64-* /usr/local/bin/gutd
         echo "gutd version:"
         /usr/local/bin/gutd --version
+        echo "GUTD_LATEST_TAG=$RELEASE_TAG" >> $GITHUB_ENV
 
     - name: Run gutd Test
       run: |
@@ -200,24 +202,24 @@ jobs:
         echo "| Tool | TCP Bandwidth | UDP Bandwidth | UDP Loss |" >> $GITHUB_STEP_SUMMARY
         echo "|---|---|---|---|" >> $GITHUB_STEP_SUMMARY
         echo "| **wg-obfuscator** (latest) | ${{ env.WGOBFS_TCP }} | ${{ env.WGOBFS_UDP }} | ${{ env.WGOBFS_UDP_LOSS }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| **gutd** (latest) | ${{ env.GUTD_TCP }} | ${{ env.GUTD_UDP }} | ${{ env.GUTD_UDP_LOSS }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **gutd** ([${{ env.GUTD_LATEST_TAG }}](https://github.com/${{ github.repository }}/releases/tag/${{ env.GUTD_LATEST_TAG }})) | ${{ env.GUTD_TCP }} | ${{ env.GUTD_UDP }} | ${{ env.GUTD_UDP_LOSS }} |" >> $GITHUB_STEP_SUMMARY
 
     - name: Checkout repository
       uses: actions/checkout@v4
 
     - name: Update README with metrics
-      env:
-        TABLE_SNIPPET: |
-          <!-- INTEGRATION_TEST_RESULTS_START -->
-          ### 📊 Benchmark: gutd vs wg-obfuscator
-          | Tool | TCP Bandwidth | UDP Bandwidth | UDP Loss |
-          |---|---|---|---|
-          | **gutd** (latest) | ${{ env.GUTD_TCP }} | ${{ env.GUTD_UDP }} | ${{ env.GUTD_UDP_LOSS }} |
-          | **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | ${{ env.WGOBFS_TCP }} | ${{ env.WGOBFS_UDP }} | ${{ env.WGOBFS_UDP_LOSS }} |
-          
-          <sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. Unmodified default parameters unless configured otherwise. Last updated: $(date +'%Y-%m-%d')</i></sub>
-          <!-- INTEGRATION_TEST_RESULTS_END -->
       run: |
+        DATE_STR=$(date +'%Y-%m-%d %H:%M')
+        TABLE_SNIPPET="<!-- INTEGRATION_TEST_RESULTS_START -->
+        ### 📊 Benchmark: gutd vs wg-obfuscator
+        | Tool | TCP Bandwidth | UDP Bandwidth | UDP Loss |
+        |---|---|---|---|
+        | **gutd** ([${{ env.GUTD_LATEST_TAG }}](https://github.com/${{ github.repository }}/releases/tag/${{ env.GUTD_LATEST_TAG }})) | ${{ env.GUTD_TCP }} | ${{ env.GUTD_UDP }} | ${{ env.GUTD_UDP_LOSS }} |
+        | **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | ${{ env.WGOBFS_TCP }} | ${{ env.WGOBFS_UDP }} | ${{ env.WGOBFS_UDP_LOSS }} |
+        
+        <sub><i>* Performance measured using \`iperf3\` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. Unmodified default parameters unless configured otherwise. [See test logic and full logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). Last updated: $DATE_STR</i></sub>
+        <!-- INTEGRATION_TEST_RESULTS_END -->"
+        
         awk -v snippet="$TABLE_SNIPPET" '
           /<!-- INTEGRATION_TEST_RESULTS_START -->/ {
             print snippet
