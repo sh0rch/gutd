@@ -4,12 +4,13 @@
 [![Release](https://github.com/sh0rch/gutd/actions/workflows/release.yml/badge.svg)](https://github.com/sh0rch/gutd/actions/workflows/release.yml)
 
 <!-- INTEGRATION_TEST_RESULTS_START -->
-| Proto | Bandwidth | Packet Loss |
-|---|---|---|
-| **TCP** | 974 Mbits/sec | - |
-| **UDP** | 1.09 Gbits/sec | 0% |
+### 📊 Benchmark: gutd vs wg-obfuscator
+| Tool | TCP Bandwidth | UDP Bandwidth | UDP Loss |
+|---|---|---|---|
+| **gutd** (latest) | *pending* | *pending* | *pending* |
+| **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | *pending* | *pending* | *pending* |
 
-<sub><i>* Automatically updated from the latest Release CI run</i></sub>
+<sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. Unmodified default parameters unless configured otherwise. Last updated: 2026-03-02</i></sub>
 <!-- INTEGRATION_TEST_RESULTS_END -->
 
 
