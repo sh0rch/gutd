@@ -55,6 +55,11 @@ jobs:
         sudo ip netns exec ns1 ip link set dev veth1 gso_max_size 1492 2>/dev/null || true
         sudo ip netns exec ns2 ip link set dev veth2 gso_max_size 1492 2>/dev/null || true
 
+        # Simulate real-world network between ns1 and ns2
+        # Adding 50ms latency (100ms round-trip) and 0.5% packet loss
+        sudo ip netns exec ns1 tc qdisc add dev veth1 root netem delay 50ms loss 0.5%
+        sudo ip netns exec ns2 tc qdisc add dev veth2 root netem delay 50ms loss 0.5%
+
         WG_CLIENT_PRIV=$(wg genkey)
         WG_CLIENT_PUB=$(echo "$WG_CLIENT_PRIV" | wg pubkey)
         WG_SERVER_PRIV=$(wg genkey)
@@ -95,8 +100,8 @@ jobs:
         timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5202 &
         sleep 0.5
         timeout 15 sudo ip netns exec ns1 iperf3 -c 10.200.0.2 -p 5202 -u -b 2G -t 5 2>&1 | tee /tmp/iperf_udp.txt || true
-        WGOBFS_UDP=$(grep "sender" /tmp/iperf_udp.txt | awk '{print $7, $8}') || true
-        WGOBFS_UDP_LOSS=$(grep "sender" /tmp/iperf_udp.txt | grep -oP '\(\K[^)]+' || echo "?")
+        WGOBFS_UDP=$(grep "receiver" /tmp/iperf_udp.txt | awk '{print $7, $8}') || true
+        WGOBFS_UDP_LOSS=$(grep "receiver" /tmp/iperf_udp.txt | grep -oP '\(\K[^)]+' || echo "?")
         set -e
 
         sudo kill -9 $G1PID $G2PID 2>/dev/null || true
@@ -151,6 +156,11 @@ jobs:
         sudo ip netns exec ns1 ip link set dev veth1 gso_max_size 1492 2>/dev/null || true
         sudo ip netns exec ns2 ip link set dev veth2 gso_max_size 1492 2>/dev/null || true
 
+        # Simulate real-world network between ns1 and ns2
+        # Adding 50ms latency (100ms round-trip) and 0.5% packet loss
+        sudo ip netns exec ns1 tc qdisc add dev veth1 root netem delay 50ms loss 0.5%
+        sudo ip netns exec ns2 tc qdisc add dev veth2 root netem delay 50ms loss 0.5%
+
         WG_CLIENT_PRIV=$(wg genkey)
         WG_CLIENT_PUB=$(echo "$WG_CLIENT_PRIV" | wg pubkey)
         WG_SERVER_PRIV=$(wg genkey)
@@ -196,8 +206,8 @@ jobs:
         timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5202 &
         sleep 0.5
         timeout 15 sudo ip netns exec ns1 iperf3 -c 10.200.0.2 -p 5202 -u -b 2G -t 5 2>&1 | tee /tmp/iperf_udp.txt || true
-        GUTD_UDP=$(grep "sender" /tmp/iperf_udp.txt | awk '{print $7, $8}') || true
-        GUTD_UDP_LOSS=$(grep "sender" /tmp/iperf_udp.txt | grep -oP '\(\K[^)]+' || echo "?")
+        GUTD_UDP=$(grep "receiver" /tmp/iperf_udp.txt | awk '{print $7, $8}') || true
+        GUTD_UDP_LOSS=$(grep "receiver" /tmp/iperf_udp.txt | grep -oP '\(\K[^)]+' || echo "?")
         set -e
 
         sudo kill -9 $G1PID $G2PID 2>/dev/null || true
@@ -251,9 +261,7 @@ jobs:
         | **gutd** ([$GUTD_LATEST_TAG](https://github.com/${{ github.repository }}/releases/tag/$GUTD_LATEST_TAG)) | $GUTD_TCP | $GUTD_UDP | $GUTD_UDP_LOSS |
         | **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | $WGOBFS_TCP | $WGOBFS_UDP | $WGOBFS_UDP_LOSS |
         
-        <sub><i>* Performance measured using \`iperf3\` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. Unmodified default parameters unless configured otherwise. [See test logic and full logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). Last updated: $DATE_STR</i></sub>
-        <!-- INTEGRATION_TEST_RESULTS_END -->"
-        
+        <sub><i>* Performance measured using \`iperf3\` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. A delay of 50ms (100ms RTT) and 0.5% packet loss is injected into the simulated network to evaluate performance in real-world constraints. [See test logic and full logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). Last updated: $DATE_STR</i></sub>
         awk -v snippet="$TABLE_SNIPPET" '
           /<!-- INTEGRATION_TEST_RESULTS_START -->/ {
             print snippet
