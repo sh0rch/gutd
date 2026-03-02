@@ -7,11 +7,12 @@
 ### 📊 Benchmark: gutd vs wg-obfuscator
 | Tool | TCP Bandwidth | UDP Bandwidth | UDP Loss |
 |---|---|---|---|
-| **gutd** (latest) | *pending* | *pending* | *pending* |
-| **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | *pending* | *pending* | *pending* |
+| **gutd** (latest) | 967 Mbits/sec | 1.14 Gbits/sec | 0% |
+| **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | 331 Mbits/sec | 958 Mbits/sec | 0% |
 
-<sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. Unmodified default parameters unless configured otherwise. Last updated: 2026-03-02</i></sub>
+<sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. Unmodified default parameters unless configured otherwise. Last updated: $(date +'%Y-%m-%d')</i></sub>
 <!-- INTEGRATION_TEST_RESULTS_END -->
+
 
 
 
