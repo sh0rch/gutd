@@ -32,6 +32,9 @@ jobs:
       matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        fetch-tags: true
 
     - name: Ensure target directory exists
       run: mkdir -p target/${{ matrix.target }}/release
