@@ -102,6 +102,7 @@ jobs:
     - name: Create release
       uses: softprops/action-gh-release@v1
       with:
+        generate_release_notes: true
         tag_name: ${{ steps.version.outputs.version }}
         name: gutd ${{ steps.version.outputs.version }}
         body: |
