@@ -1,0 +1,203 @@
+name: Benchmark Compare Releases
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: Benchmark gutd vs wg-obfuscator
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y iperf3 iproute2 iputils-ping wireguard-tools jq curl
+
+    - name: Download latest wg-obfuscator release
+      run: |
+        echo "Fetching latest ClusterM/wg-obfuscator..."
+        LATEST_URL=$(curl -s https://api.github.com/repos/ClusterM/wg-obfuscator/releases/latest | jq -r '.assets[] | select(.name|test("linux-x64.tar.gz$")) | .browser_download_url')
+        curl -LO $LATEST_URL
+        tar xf wg-obfuscator-*-linux-x64.tar.gz
+        sudo mv wg-obfuscator/wg-obfuscator /usr/local/bin/wg-obfuscator
+        chmod +x /usr/local/bin/wg-obfuscator
+        echo "wg-obfuscator --help output:"
+        /usr/local/bin/wg-obfuscator --help | head -n 5 || true
+
+    - name: Run wg-obfuscator Test
+      run: |
+        set -ex
+        KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        PORTS="41000"
+        WG_OBFS="/usr/local/bin/wg-obfuscator"
+
+        # Cleanup
+        sudo pkill -9 wg-obfuscator 2>/dev/null || true
+        sudo ip netns del ns1 2>/dev/null || true
+        sudo ip netns del ns2 2>/dev/null || true
+
+        # Namespaces
+        sudo ip netns add ns1
+        sudo ip netns add ns2
+        sudo ip link add veth1 type veth peer name veth2
+        sudo ip link set veth1 netns ns1
+        sudo ip link set veth2 netns ns2
+        sudo ip netns exec ns1 bash -c 'ip link set lo up; ip link set veth1 up; ip addr add 10.0.0.1/24 dev veth1'
+        sudo ip netns exec ns2 bash -c 'ip link set lo up; ip link set veth2 up; ip addr add 10.0.0.2/24 dev veth2'
+        
+        WG_CLIENT_PRIV=$(wg genkey)
+        WG_CLIENT_PUB=$(echo "$WG_CLIENT_PRIV" | wg pubkey)
+        WG_SERVER_PRIV=$(wg genkey)
+        WG_SERVER_PUB=$(echo "$WG_SERVER_PRIV" | wg pubkey)
+
+        printf '[Interface]\nPrivateKey = %s\nListenPort = 51820\n\n[Peer]\nPublicKey = %s\nAllowedIPs = 10.200.0.1/32\n' \
+          "$WG_SERVER_PRIV" "$WG_CLIENT_PUB" > /tmp/wg-server.conf
+
+        sudo ip netns exec ns2 $WG_OBFS -i 10.0.0.2 -p $PORTS -t 127.0.0.1:51820 -k "$KEY" > /tmp/wg-obfs-server.log 2>&1 &
+        G2PID=$!
+        sleep 1
+        sudo ip netns exec ns1 $WG_OBFS -i 127.0.0.1 -p $PORTS -t 10.0.0.2:$PORTS -k "$KEY" > /tmp/wg-obfs-client.log 2>&1 &
+        G1PID=$!
+        sleep 2
+
+        sudo ip netns exec ns2 ip link add wg0 type wireguard
+        sudo ip netns exec ns2 ip addr add 10.200.0.2/24 dev wg0
+        sudo ip netns exec ns2 wg setconf wg0 /tmp/wg-server.conf
+        sudo ip netns exec ns2 ip link set wg0 mtu 1420 up
+
+        printf '[Interface]\nPrivateKey = %s\n\n[Peer]\nPublicKey = %s\nEndpoint = 127.0.0.1:%s\nAllowedIPs = 10.200.0.0/24\nPersistentKeepalive = 5\n' \
+          "$WG_CLIENT_PRIV" "$WG_SERVER_PUB" "$PORTS" > /tmp/wg-client-tunnel.conf
+        sudo ip netns exec ns1 ip link add wg0 type wireguard
+        sudo ip netns exec ns1 ip addr add 10.200.0.1/24 dev wg0
+        sudo ip netns exec ns1 wg setconf wg0 /tmp/wg-client-tunnel.conf
+        sudo ip netns exec ns1 ip link set wg0 mtu 1420 up
+
+        sleep 4
+        sudo ip netns exec ns1 ping -c2 -i0.2 -W2 10.200.0.2
+
+        set +e
+        timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5201 &
+        sleep 0.5
+        timeout 15 sudo ip netns exec ns1 iperf3 -c 10.200.0.2 -p 5201 -P 4 -t 5 2>&1 | tee /tmp/iperf_tcp.txt || true
+        WGOBFS_TCP=$(grep "SUM.*sender" /tmp/iperf_tcp.txt | awk '{print $6, $7}') || true
+        [ -z "$WGOBFS_TCP" ] && WGOBFS_TCP=$(grep "sender" /tmp/iperf_tcp.txt | tail -1 | awk '{print $7, $8}') || true
+
+        timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5202 &
+        sleep 0.5
+        timeout 15 sudo ip netns exec ns1 iperf3 -c 10.200.0.2 -p 5202 -u -b 2G -t 5 2>&1 | tee /tmp/iperf_udp.txt || true
+        WGOBFS_UDP=$(grep "sender" /tmp/iperf_udp.txt | awk '{print $7, $8}') || true
+        WGOBFS_UDP_LOSS=$(grep "sender" /tmp/iperf_udp.txt | grep -oP '\(\K[^)]+' || echo "?")
+        set -e
+
+        sudo kill -9 $G1PID $G2PID 2>/dev/null || true
+        sudo ip netns del ns1
+        sudo ip netns del ns2
+
+        echo "WGOBFS_TCP=$WGOBFS_TCP" >> $GITHUB_ENV
+        echo "WGOBFS_UDP=$WGOBFS_UDP" >> $GITHUB_ENV
+        echo "WGOBFS_UDP_LOSS=$WGOBFS_UDP_LOSS" >> $GITHUB_ENV
+
+    - name: Download latest gutd release
+      run: |
+        echo "Fetching latest sh0rch/gutd..."
+        LATEST_URL=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r '.assets[] | select(.name=="gutd-x86_64") | .browser_download_url')
+        curl -LO $LATEST_URL
+        chmod +x gutd-x86_64
+        sudo mv gutd-x86_64 /usr/local/bin/gutd
+        echo "gutd version:"
+        /usr/local/bin/gutd --version
+
+    - name: Run gutd Test
+      run: |
+        set -ex
+        KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        PORTS="41000"
+        GUTD="/usr/local/bin/gutd"
+
+        # Mount bpffs
+        sudo mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
+        
+        sudo pkill -9 gutd 2>/dev/null || true
+        sudo ip netns del ns1 2>/dev/null || true
+        sudo ip netns del ns2 2>/dev/null || true
+        sleep 0.2
+
+        sudo ip netns add ns1
+        sudo ip netns add ns2
+        sudo ip link add veth1 type veth peer name veth2
+        sudo ip link set veth1 netns ns1
+        sudo ip link set veth2 netns ns2
+        sudo ip netns exec ns1 bash -c 'ip link set lo up; ip link set veth1 up; ip addr add 10.0.0.1/24 dev veth1'
+        sudo ip netns exec ns2 bash -c 'ip link set lo up; ip link set veth2 up; ip addr add 10.0.0.2/24 dev veth2'
+        
+        sudo ip netns exec ns1 ip link set dev veth1 gso_max_size 1492 2>/dev/null || true
+        sudo ip netns exec ns2 ip link set dev veth2 gso_max_size 1492 2>/dev/null || true
+
+        WG_CLIENT_PRIV=$(wg genkey)
+        WG_CLIENT_PUB=$(echo "$WG_CLIENT_PRIV" | wg pubkey)
+        WG_SERVER_PRIV=$(wg genkey)
+        WG_SERVER_PUB=$(echo "$WG_SERVER_PRIV" | wg pubkey)
+
+        printf '[Interface]\nPrivateKey = %s\nListenPort = 51820\n\n[Peer]\nPublicKey = %s\nAllowedIPs = 10.200.0.1/32\n' \
+          "$WG_SERVER_PRIV" "$WG_CLIENT_PUB" > /tmp/wg-server.conf
+
+        printf '[global]\n[peer]\nname = gut1\nmtu = 1500\nnic = veth1\naddress = 192.168.99.1/30\nbind_ip = 10.0.0.1\npeer_ip = 10.0.0.2\nports = %s\nkey = %s\n' \
+          "$PORTS" "$KEY" > /tmp/g1.conf
+        printf '[global]\n[peer]\nname = gut2\nmtu = 1500\nnic = veth2\naddress = 192.168.99.2/30\nbind_ip = 10.0.0.2\npeer_ip = 10.0.0.1\nports = %s\nkey = %s\n' \
+          "$PORTS" "$KEY" > /tmp/g2.conf
+
+        sudo ip netns exec ns1 $GUTD --config /tmp/g1.conf > /tmp/gutd-ns1.log 2>&1 &
+        G1PID=$!
+        sleep 1
+        sudo ip netns exec ns2 $GUTD --config /tmp/g2.conf > /tmp/gutd-ns2.log 2>&1 &
+        G2PID=$!
+        sleep 2
+
+        sudo ip netns exec ns2 ip link add wg0 type wireguard
+        sudo ip netns exec ns2 ip addr add 10.200.0.2/24 dev wg0
+        sudo ip netns exec ns2 wg setconf wg0 /tmp/wg-server.conf
+        sudo ip netns exec ns2 ip link set wg0 mtu 1420 up
+
+        printf '[Interface]\nPrivateKey = %s\n\n[Peer]\nPublicKey = %s\nEndpoint = 192.168.99.2:51820\nAllowedIPs = 10.200.0.0/24\nPersistentKeepalive = 5\n' \
+          "$WG_CLIENT_PRIV" "$WG_SERVER_PUB" > /tmp/wg-client-tunnel.conf
+        sudo ip netns exec ns1 ip link add wg0 type wireguard
+        sudo ip netns exec ns1 ip addr add 10.200.0.1/24 dev wg0
+        sudo ip netns exec ns1 wg setconf wg0 /tmp/wg-client-tunnel.conf
+        sudo ip netns exec ns1 ip link set wg0 mtu 1420 up
+
+        sleep 4
+        sudo ip netns exec ns1 ping -c2 -i0.2 -W2 10.200.0.2
+
+        set +e
+        timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5201 &
+        sleep 0.5
+        timeout 15 sudo ip netns exec ns1 iperf3 -c 10.200.0.2 -p 5201 -P 4 -t 5 2>&1 | tee /tmp/iperf_tcp.txt || true
+        GUTD_TCP=$(grep "SUM.*sender" /tmp/iperf_tcp.txt | awk '{print $6, $7}') || true
+        [ -z "$GUTD_TCP" ] && GUTD_TCP=$(grep "sender" /tmp/iperf_tcp.txt | tail -1 | awk '{print $7, $8}') || true
+
+        timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5202 &
+        sleep 0.5
+        timeout 15 sudo ip netns exec ns1 iperf3 -c 10.200.0.2 -p 5202 -u -b 2G -t 5 2>&1 | tee /tmp/iperf_udp.txt || true
+        GUTD_UDP=$(grep "sender" /tmp/iperf_udp.txt | awk '{print $7, $8}') || true
+        GUTD_UDP_LOSS=$(grep "sender" /tmp/iperf_udp.txt | grep -oP '\(\K[^)]+' || echo "?")
+        set -e
+
+        sudo kill -9 $G1PID $G2PID 2>/dev/null || true
+        sudo ip netns del ns1
+        sudo ip netns del ns2
+
+        echo "GUTD_TCP=$GUTD_TCP" >> $GITHUB_ENV
+        echo "GUTD_UDP=$GUTD_UDP" >> $GITHUB_ENV
+        echo "GUTD_UDP_LOSS=$GUTD_UDP_LOSS" >> $GITHUB_ENV
+
+    - name: Publish Comparative Summary
+      run: |
+        echo "## 📊 Benchmark: wg-obfuscator vs gutd" >> $GITHUB_STEP_SUMMARY
+        echo "| Tool | TCP Bandwidth | UDP Bandwidth | UDP Loss |" >> $GITHUB_STEP_SUMMARY
+        echo "|---|---|---|---|" >> $GITHUB_STEP_SUMMARY
+        echo "| **wg-obfuscator** (latest) | ${{ env.WGOBFS_TCP }} | ${{ env.WGOBFS_UDP }} | ${{ env.WGOBFS_UDP_LOSS }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **gutd** (latest) | ${{ env.GUTD_TCP }} | ${{ env.GUTD_UDP }} | ${{ env.GUTD_UDP_LOSS }} |" >> $GITHUB_STEP_SUMMARY
