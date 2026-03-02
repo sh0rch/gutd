@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   benchmark:
@@ -201,3 +201,35 @@ jobs:
         echo "|---|---|---|---|" >> $GITHUB_STEP_SUMMARY
         echo "| **wg-obfuscator** (latest) | ${{ env.WGOBFS_TCP }} | ${{ env.WGOBFS_UDP }} | ${{ env.WGOBFS_UDP_LOSS }} |" >> $GITHUB_STEP_SUMMARY
         echo "| **gutd** (latest) | ${{ env.GUTD_TCP }} | ${{ env.GUTD_UDP }} | ${{ env.GUTD_UDP_LOSS }} |" >> $GITHUB_STEP_SUMMARY
+
+    - name: Update README with metrics
+      env:
+        TABLE_SNIPPET: |
+          <!-- INTEGRATION_TEST_RESULTS_START -->
+          ### 📊 Benchmark: gutd vs wg-obfuscator
+          | Tool | TCP Bandwidth | UDP Bandwidth | UDP Loss |
+          |---|---|---|---|
+          | **gutd** (latest) | ${{ env.GUTD_TCP }} | ${{ env.GUTD_UDP }} | ${{ env.GUTD_UDP_LOSS }} |
+          | **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | ${{ env.WGOBFS_TCP }} | ${{ env.WGOBFS_UDP }} | ${{ env.WGOBFS_UDP_LOSS }} |
+          
+          <sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. Unmodified default parameters unless configured otherwise. Last updated: $(date +'%Y-%m-%d')</i></sub>
+          <!-- INTEGRATION_TEST_RESULTS_END -->
+      run: |
+        awk -v snippet="$TABLE_SNIPPET" '
+          /<!-- INTEGRATION_TEST_RESULTS_START -->/ {
+            print snippet
+            skip = 1
+            next
+          }
+          /<!-- INTEGRATION_TEST_RESULTS_END -->/ {
+            skip = 0
+            next
+          }
+          !skip { print }
+        ' README.md > README.md.tmp && mv README.md.tmp README.md
+
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        git add README.md
+        git diff --staged --quiet || git commit -m "docs: Update benchmark results in README"
+        git push

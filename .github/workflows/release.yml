@@ -21,7 +21,7 @@ jobs:
     needs: build
     uses: ./.github/workflows/integration-test.yml
     with:
-      update_readme: true
+      update_readme: false
 
   verify_and_prepare:
     needs: [build, integration-test]
