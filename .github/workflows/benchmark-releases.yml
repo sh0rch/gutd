@@ -202,6 +202,9 @@ jobs:
         echo "| **wg-obfuscator** (latest) | ${{ env.WGOBFS_TCP }} | ${{ env.WGOBFS_UDP }} | ${{ env.WGOBFS_UDP_LOSS }} |" >> $GITHUB_STEP_SUMMARY
         echo "| **gutd** (latest) | ${{ env.GUTD_TCP }} | ${{ env.GUTD_UDP }} | ${{ env.GUTD_UDP_LOSS }} |" >> $GITHUB_STEP_SUMMARY
 
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
     - name: Update README with metrics
       env:
         TABLE_SNIPPET: |
