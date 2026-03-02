@@ -104,10 +104,10 @@ jobs:
     - name: Download latest gutd release
       run: |
         echo "Fetching latest sh0rch/gutd..."
-        LATEST_URL=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r '.assets[] | select(.name=="gutd-x86_64") | .browser_download_url')
+        LATEST_URL=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r '.assets[] | select(.name|test("^gutd-x86_64-.*$")) | .browser_download_url')
         curl -LO $LATEST_URL
-        chmod +x gutd-x86_64
-        sudo mv gutd-x86_64 /usr/local/bin/gutd
+        chmod +x gutd-x86_64-*
+        sudo mv gutd-x86_64-* /usr/local/bin/gutd
         echo "gutd version:"
         /usr/local/bin/gutd --version
 
