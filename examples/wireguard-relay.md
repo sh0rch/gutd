@@ -249,8 +249,7 @@ Do **not** add INPUT rules for GUT ports 6000-6003 on the server. The XDP progra
 processes incoming GUT packets before they reach the iptables/nftables INPUT chain --
 GUT traffic never gets to INPUT, it is redirected into `gut0` at the XDP layer.
 
-**Ports**: `ports = 6000,6001,6002,6003` distributes GUT traffic across 4 UDP flows,
-improving RSS/NIC queue balancing. Use a single port for simpler setups.
+**Ports**: `ports = 6000,6001,6002,6003` distributes GUT traffic across 4 UDP flows, improving RSS/NIC queue balancing. Use a single port for simpler setups.
 
 **GUT ports vs WireGuard ports**: in payload-only mode the `ports` list must match
 the WireGuard UDP endpoint ports on wire. The relay DNAT redirects WireGuard UDP

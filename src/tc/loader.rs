@@ -336,7 +336,7 @@ impl TcBpfManager {
 
         egress_skel.update_config_map(&gut_config)?;
 
-        // Initialize seq counter (starts at 1 to keep nonce non-zero via Feistel)
+        // Initialize seq counter
         egress_skel.update_counters_map(1)?;
 
         // Attach TC egress on veth user-side
@@ -790,6 +790,7 @@ impl TcBpfManager {
             crate::config::XdpDefaultPolicy::Drop => 1,  // XDP_DROP
         };
         gut_config.keepalive_drop_percent = config.peer().keepalive_drop_percent;
+        gut_config.own_http3 = if config.peer().own_http3 { 1 } else { 0 };
 
         if gut_config.default_xdp_action == 1 {
             if let Some(default_ifname) = Self::default_route_ifname() {
@@ -1054,6 +1055,6 @@ mod tests {
     #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
     fn test_gut_v1_protocol() {
         eprintln!("GUT v1 Protocol - TC eBPF fast path enabled");
-        eprintln!("Wire format: UDP payload = nonce(u32) || masked_body || cookie(u8)");
+        eprintln!("Wire format: QUIC Wrapper");
     }
 }
