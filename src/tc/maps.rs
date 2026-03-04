@@ -6,7 +6,7 @@ use std::net::IpAddr;
 
 pub const MAX_PORTS: usize = 16;
 pub const GUT_KEY_SIZE: usize = 32;
-pub const GUT_WIRE_HEADER_SIZE: u16 = 0; // payload-only mode: no extra GUT wire header
+pub const GUT_WIRE_HEADER_SIZE: u16 = 100 + 63; // QUIC Long Header + max Chacha padding
 pub const PMTU_RESERVE_BYTES: u16 = 20;
 pub const OUTER_OVERHEAD_IPV4: u16 = GUT_WIRE_HEADER_SIZE + 8 + 20 + PMTU_RESERVE_BYTES;
 pub const OUTER_OVERHEAD_IPV6: u16 = GUT_WIRE_HEADER_SIZE + 8 + 40 + PMTU_RESERVE_BYTES;
@@ -45,6 +45,7 @@ pub struct GutConfig {
     pub tun_peer_ip4: u32,      // Remote veth peer IP — XDP ingress rewrites src to this
     pub tun_local_ip6: [u8; 16], // Local veth IPv6 (zero if v4 only)
     pub tun_peer_ip6: [u8; 16], // Remote veth peer IPv6 (zero if v4 only)
+    pub own_http3: u8,          // Whether to respond to active DPI probes via XDP_TX
 }
 
 impl GutConfig {
@@ -61,7 +62,6 @@ impl GutConfig {
             IpAddr::V4(ip) => (u32::from_ne_bytes(ip.octets()), [0u8; 16]),
             IpAddr::V6(ip) => (0u32, ip.octets()),
         };
-
         let mut cfg = Self {
             key: *key,
             ports: [0u16; MAX_PORTS],
@@ -89,6 +89,7 @@ impl GutConfig {
             tun_peer_ip4: 0,
             tun_local_ip6: [0u8; 16],
             tun_peer_ip6: [0u8; 16],
+            own_http3: 1,
         };
 
         for (i, &port) in ports.iter().enumerate().take(MAX_PORTS) {
@@ -126,7 +127,6 @@ pub struct GutStats {
     pub bytes_processed: u64,
     pub _reserved_stat: u64, // was mask_fast_count
     pub mask_count: u64,     // was mask_balanced_count; all masking is ChaCha now
-    pub cookie_validation_failed: u64,
     pub packets_fragmented: u64,
     pub inner_tcp_seen: u64,
 }
@@ -155,8 +155,8 @@ fn compute_chacha_init(key: &[u8; 32]) -> [u32; 12] {
     init
 }
 
-const _: [(); 253] = [(); std::mem::size_of::<GutConfig>()];
-const _: [(); 64] = [(); std::mem::size_of::<GutStats>()];
+const _: [(); 254] = [(); std::mem::size_of::<GutConfig>()];
+const _: [(); 56] = [(); std::mem::size_of::<GutStats>()];
 
 impl GutStats {
     #[must_use]
@@ -168,7 +168,6 @@ impl GutStats {
             total.bytes_processed += stat.bytes_processed;
             total._reserved_stat += stat._reserved_stat;
             total.mask_count += stat.mask_count;
-            total.cookie_validation_failed += stat.cookie_validation_failed;
             total.packets_fragmented += stat.packets_fragmented;
             total.inner_tcp_seen += stat.inner_tcp_seen;
         }

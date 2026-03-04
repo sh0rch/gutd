@@ -1,4 +1,4 @@
-# GUT v1 Implementation Snapshot (Current)
+# GUT v2 Implementation Snapshot
 
 This file summarizes what is currently implemented in this repository.
 
@@ -15,28 +15,24 @@ Key files:
 - `src/tc/bpf/gut_common.h`
 - `src/tc/loader.rs`
 
-## 2. Current Wire Layout
+## 2. Current Wire Layout (gutd v2)
 
 Outer UDP payload:
 
-`WireGuard payload with in-place transform (no added protocol header)`
+`QUIC Long Header (40 bytes with SNI) + Original WireGuard payload (ChaCha masked) + Variable Padding`
 
 Constants:
 
-- `GUT_WIRE_HDR_SIZE = 0`
-- `GUT_MIN_OVERHEAD = 0`
+- `GUT_WIRE_HDR_SIZE = 103` (QUIC header + maximum padding)
+- `GUT_QUIC_LONG_HEADER_SIZE = 40`
 
 Current transform:
 
-- ballast length is stored in `reserved[0]` (byte 1)
-- first 16 bytes are transformed
-- for types 1/2 an extra 16-byte tail block is transformed at fixed offsets
+- payloads are masked and dynamically padded to resist length-based heuristics
 
-## 3. Keepalive/Ballast Model
+## 3. Keepalive Model
 
 - Config parameter `keepalive_drop_percent` controls probabilistic dropping of WG keepalive packets.
-- Short payloads may receive ballast (`3..63` bytes).
-- Ingress reads ballast length from byte 1 and trims appended tail.
 
 ## 4. Checksum and Reliability Strategy
 
@@ -81,5 +77,5 @@ sudo tcpdump -ni <iface> -vv -n 'udp port <gut_port>'
 
 ## 8. Compatibility Warning
 
-The current 4-byte cookie wire format is not interoperable with historical 1-byte-cookie peers.
+The current wire format (fake QUIC) is not interoperable with historical v1 peers.
 Both sides must run compatible versions/config.

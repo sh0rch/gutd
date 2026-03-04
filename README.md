@@ -19,18 +19,24 @@
 
 
 
-gutd obfuscates WireGuard UDP traffic in-place using a Linux TC/XDP eBPF datapath.
-It sits transparently between a WireGuard peer and the network: on egress the TC
-program masks each packet with a ChaCha keystream; on ingress the XDP program
-unmasks it before passing it up. The WireGuard process is unaware of gutd.
+gutd v2 obfuscates WireGuard UDP traffic using a Linux TC/XDP eBPF datapath.
+It sits transparently between a WireGuard peer and the network. On egress, the TC
+program encapsulates each packet in a fake QUIC Long Header containing a fake SNI,
+adds variable padding, and masks the payload with a ChaCha keystream.
+On ingress, the XDP program removes the QUIC emulation and unmasks the packet
+before passing it up. The XDP program can also optionally mock an HTTP/3 server by
+answering DPI UDP probes directly from the kernel ring buffer.
+The WireGuard process is unaware of gutd.
 
 ## Features
 
-- In-place WireGuard payload masking with ChaCha (4 rounds by default)
+- Fake QUIC Long Header encapsulation to mimic typical HTTPS/QUIC traffic (gutd v2)
+- Built-in lightweight HTTP/3 (QUIC) responder at the XDP layer to mock DPI active probes transparently
+- WireGuard payload masking with ChaCha (4 rounds by default)
 - TC egress hook on a veth pair, XDP ingress hook on the physical NIC
 - Port striping: multiple fixed UDP ports per peer
 - keepalive probabilistic drop to suppress WireGuard timing patterns
-- ballast padding for short payloads
+- Variable padding to obscure packet sizes
 - Hot reload via SIGHUP (BPF map update, no restart)
 - Multi-peer support (one veth pair + BPF program per peer)
 - Static musl build supported
@@ -57,14 +63,6 @@ Counters include per-peer egress/ingress packet counts, drops, bytes, and mask o
 ```
 UDP payload = WireGuard payload (in-place transformed)
 ```
-
-### Payload Transform (current)
-
-- Keepalive packets (`type=4`, 32 bytes) may be probabilistically dropped using `keepalive_drop_percent`.
-- For short packets, ballast `3..63` bytes may be appended; ballast length is stored in `reserved[0]` (`byte 1`).
-- First 16 bytes are XOR-masked with ChaCha block 0.
-- For `type=1`, bytes `[132..147]` are additionally XOR-masked with ChaCha block 1.
-- For `type=2`, bytes `[76..91]` are additionally XOR-masked with ChaCha block 1.
 
 ## Build Instructions
 
@@ -118,6 +116,7 @@ bind_ip = 0.0.0.0        # local bind IP (0.0.0.0 = auto from route src)
 peer_ip = 203.0.113.10
 ports = 41000,41001       # UDP ports (must match WG listen/endpoint ports)
 keepalive_drop_percent = 75
+# own_http3 = true        # eBPF XDP responder for active DPI probes on UDP ports
 key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 # passphrase = my-secret  # alternative to key (HKDF-SHA256 derived)
 ```
@@ -198,11 +197,10 @@ maps without detaching hooks or recreating the veth pair.
 
 ## MTU
 
-gutd operates on WireGuard's outer UDP packets in-place. It always appends
-4 bytes of metadata (`GUT_L4_META_SIZE`) to every processed packet.
-Short packets (WireGuard handshake and keepalive, payload < 220 bytes) also
-receive 0–63 bytes of ChaCha-derived ballast to obscure their size; these are
-small enough that ballast does not affect MTU.
+gutd v2 encapsulates WireGuard UDP packets inside a fake QUIC wrapper.
+It prepends a QUIC Long Header (including SNI) to every packet and appends
+variable padding to obfuscate packet length. These additions increase the
+packet size.
 
 ### gutd config `mtu`
 
@@ -244,6 +242,9 @@ ever reaching the INPUT chain. Adding an iptables or ufw rule for gutd ports
 has no effect.
 
 ### Relay mode
+
+**IMPORTANT**: To correctly spoof QUIC roles and avoid DPI detection, gutd must know if it's acting as a Server or Client. It determines this automatically by checking the last bit of its internal `address` (the `gut0` interface IP).
+**The SERVER's `gut0` IP MUST be odd (e.g. `10.254.0.1`), and the CLIENT's IP MUST be even (e.g. `10.254.0.2`).**
 
 In relay mode a separate machine accepts WireGuard connections from clients and
 forwards them through a gutd tunnel to the final server. This requires standard
@@ -362,9 +363,9 @@ WireGuard
   | sends UDP to peer via gut0 (e.g. wg endpoint = 10.8.0.2:41000)
   v
 gut0  [TC egress BPF]
-  - select port from striping table (rotates per packet)
+  - select port from striping table
   - XOR-mask WireGuard payload bytes with ChaCha keystream
-  - append 4-byte metadata + 0..63 byte ballast for short packets
+  - append fake QUIC header and variable padding
   - rewrite outer UDP src/dst port
   v
 gut0_xdp  (veth peer, devmap redirect target)
@@ -381,9 +382,9 @@ wire  - opaque UDP arrives on one of the configured ports
   v
 physical NIC  [XDP ingress BPF]
   - check dst port is in gutd port table; pass-through everything else
-  - derive ChaCha keystream from masked nonce
-  - XOR-unmask WireGuard payload bytes
-  - strip metadata + ballast, restore original port numbers
+  - verify and strip fake QUIC header and padding
+  - derive ChaCha keystream and XOR-unmask WireGuard payload bytes
+  - restore original port numbers
   - rewrite IP/UDP lengths and checksums
   - bpf_redirect_map → gut0_xdp  (bypasses kernel stack entirely)
   v

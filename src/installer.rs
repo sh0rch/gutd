@@ -128,20 +128,24 @@ fn example_config() -> &'static str {
 # From passphrase: gutd genkey --passphrase "my secret"
 
 [global]
-outer_mtu = 1500
+# outer_mtu = 1500          # Managed automatically
 # stats_interval = 5        # stats dump interval, seconds (0 = off)
 # stat_file = /run/gutd.stat
 
 [peer]
 name = gut0                 # veth pair name (gut0 ↔ gut0_xdp)
-mtu = 1492
+# mtu = 1492                # Managed automatically
 # nic = eth0                # physical NIC for XDP (auto-detected if omitted)
-address = 10.0.0.1/30       # IP address on veth (CIDR, /30 for p2p)
+address = 10.0.0.1/30       # IP address on veth. SERVER MUST HAVE ODD IP (e.g. .1), CLIENT EVEN (e.g. .2)
 
 bind_ip = 0.0.0.0
 peer_ip = 203.0.113.10
 ports = 41000
 keepalive_drop_percent = 75
+
+# Responds to UDP probes pretending to be a pure QUIC server (fast XDP path, no OS routing required).
+# Active by default to fool DPIs. Set to `false` if you have your own real UDP service on these ports.
+# own_http3 = true
 
 # Key — choose ONE:
 # passphrase = change-me-to-a-strong-passphrase

@@ -19,15 +19,15 @@
 #include <bpf/bpf_endian.h>
 
 #define MAX_PORTS 16
+#define GUT_QUIC_SHORT_HEADER_SIZE 10
+#define GUT_QUIC_LONG_HEADER_SIZE 100
 #define GUT_KEY_SIZE 32
 #define MAX_PACKET_SIZE 1500
-#define SCRATCH_SIZE 4096 /* scratch buffer: power-of-2.  Must be > MAX_PACKET_SIZE + 1 \
-                           * so BPF_BOUND_LEN ([1,2048]) with scratch+1 stays within    \
-                           * map value bounds (off=1 + 2048 ≤ 4096).                  \
-                           * mask_data_fast uses (i &= 0x7FF) → max 2047+7 < 4096.       */
-#define GUT_COOKIE_SIZE 4
-#define GUT_BODY_HDR_SIZE (1 + GUT_COOKIE_SIZE)                    /* flags(1)+cookie(4) in masked body */
-#define MAX_INNER_TECH_LIMIT (MAX_PACKET_SIZE - GUT_BODY_HDR_SIZE) /* technical verifier/scratch cap, runtime MTU comes from config_map */
+#define SCRATCH_SIZE 4096                    /* scratch buffer: power-of-2.  Must be > MAX_PACKET_SIZE + 1 \
+                                              * so BPF_BOUND_LEN ([1,2048]) with scratch+1 stays within    \
+                                              * map value bounds (off=1 + 2048 ≤ 4096).                  \
+                                              * mask_data_fast uses (i &= 0x7FF) → max 2047+7 < 4096.       */
+#define MAX_INNER_TECH_LIMIT MAX_PACKET_SIZE /* technical verifier/scratch cap, runtime MTU comes from config_map */
 
 /* Masking: always ChaCha (rounds configured at compile time) */
 
@@ -37,7 +37,6 @@
 /* Payload-only mode: no extra protocol bytes above UDP payload */
 #define GUT_WIRE_HDR_SIZE 0
 #define GUT_MIN_OVERHEAD 0
-#define GUT_L4_META_SIZE 4
 
 /* Variable-length ballast: ChaCha-derived 0..63 bytes appended inside masked body
  * for packets with inner_len < BALLAST_THRESHOLD.  Receiver determines
@@ -92,6 +91,7 @@ struct gut_config
     __u32 tun_peer_ip4;          /* Remote veth peer IP — XDP ingress rewrites src to this */
     __u8 tun_local_ip6[16];      /* Local veth IPv6 (zero if v4 only) */
     __u8 tun_peer_ip6[16];       /* Remote veth peer IPv6 (zero if v4 only) */
+    __u8 own_http3;              /* Respond to DPI probes via XDP_TX (1=yes) */
 } __attribute__((packed));
 
 /* Per-CPU statistics */
@@ -102,17 +102,11 @@ struct gut_stats
     __u64 bytes_processed;
     __u64 _reserved_stat;
     __u64 mask_count;
-    __u64 cookie_validation_failed;
     __u64 packets_fragmented;
     __u64 inner_tcp_seen;
 };
 
-/* Monotonic sequence counter for Feistel32-based nonce/pkt_id generation.
- * Egress increments seq, then:
- *   wire_nonce  = feistel32(seq, rk)
- *   wire_pkt_id = feistel32(seq ^ FEISTEL_SALT_PKT_ID, rk)
- * Bijection guarantees uniqueness up to 2^32 packets.
- * TC programs run per-CPU to completion, so simple increment is safe. */
+/* Monotonic sequence counter for packets */
 struct gut_counters
 {
     __u32 seq;
@@ -416,7 +410,7 @@ static __always_inline __u32 chacha_ballast(
 
     const __u8 *kb = (const __u8 *)ks;
     __u32 bl = kb[63] & 0x3F; /* 0..63 */
-    __u32 body_used = GUT_BODY_HDR_SIZE + inner_len;
+    __u32 body_used = inner_len;
     if (body_used + bl > max_body)
         bl = max_body - body_used;
 
@@ -530,14 +524,16 @@ static __always_inline int gut_skb_store_bounded(struct __sk_buff *skb, __u32 of
  * Shared by TC egress (bpf_csum_diff) and XDP ingress (bpf_csum_diff). */
 static __always_inline __u16 csum_fold(__u64 csum)
 {
-    while (csum >> 16)
-        csum = (csum & 0xFFFF) + (csum >> 16);
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+        if (csum >> 16)
+            csum = (csum & 0xFFFF) + (csum >> 16);
     return (__u16)(~csum);
 }
 
 static __always_inline void fix_ipv4_header_checksum(__u8 *scratch, __u32 inner_len)
 {
-    const __u32 B = GUT_BODY_HDR_SIZE;
+    const __u32 B = 0;
 
     if (inner_len < 20)
         return;
@@ -569,8 +565,10 @@ static __always_inline void fix_ipv4_header_checksum(__u8 *scratch, __u32 inner_
         sum += ((__u32)scratch[p] << 8) | (__u32)scratch[p + 1];
     }
 
-    while (sum >> 16)
-        sum = (sum & 0xFFFF) + (sum >> 16);
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+        if (sum >> 16)
+            sum = (sum & 0xFFFF) + (sum >> 16);
 
     __u16 hc = ~((__u16)sum);
     scratch[check_off] = (__u8)(hc >> 8);
@@ -624,7 +622,7 @@ static long __l4_csum_word_cb(__u32 idx, void *ctx_ptr)
 
 static __always_inline void fix_l4_checksum(__u8 *scratch, __u32 inner_len)
 {
-    const __u32 B = GUT_BODY_HDR_SIZE;
+    const __u32 B = 0;
 
     if (inner_len < 28)
         return;
@@ -721,9 +719,11 @@ static __always_inline void fix_l4_checksum(__u8 *scratch, __u32 inner_len)
         sum += (__u32)scratch[tail] << 8;
     }
 
-    /* Fold */
-    while (sum >> 16)
-        sum = (sum & 0xFFFF) + (sum >> 16);
+/* Fold */
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+        if (sum >> 16)
+            sum = (sum & 0xFFFF) + (sum >> 16);
 
     __u16 fc = ~((__u16)sum);
     if (fc == 0 && proto == IPPROTO_UDP)
@@ -742,7 +742,7 @@ static __always_inline void fix_l4_checksum(__u8 *scratch, __u32 inner_len)
  */
 static __always_inline void fix_l4_checksum_v6(__u8 *scratch, __u32 inner_len)
 {
-    const __u32 B = GUT_BODY_HDR_SIZE;
+    const __u32 B = 0;
 
     if (inner_len < 48)
         return;
@@ -842,9 +842,11 @@ static __always_inline void fix_l4_checksum_v6(__u8 *scratch, __u32 inner_len)
         sum += (__u32)scratch[tail] << 8;
     }
 
-    /* Fold */
-    while (sum >> 16)
-        sum = (sum & 0xFFFF) + (sum >> 16);
+/* Fold */
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+        if (sum >> 16)
+            sum = (sum & 0xFFFF) + (sum >> 16);
 
     __u16 fc = ~((__u16)sum);
     /* IPv6 UDP/ICMPv6: 0x0000 checksum is invalid → use 0xFFFF */
@@ -853,6 +855,67 @@ static __always_inline void fix_l4_checksum_v6(__u8 *scratch, __u32 inner_len)
 
     scratch[zpos] = (__u8)(fc >> 8);
     scratch[zpos + 1] = (__u8)(fc & 0xFF);
+}
+
+static __always_inline __u32 calc_payload_csum(void *data, void *data_end, __u32 len, __u64 seed)
+{
+    __u64 csum = seed;
+
+#pragma unroll
+    for (int i = 0; i < 24; i++)
+    { // 24 * 64 = 1536
+        if (len >= 64)
+        {
+            if ((__u8 *)data + 64 > (__u8 *)data_end)
+                break;
+            csum = bpf_csum_diff(NULL, 0, data, 64, csum);
+            data = (__u8 *)data + 64;
+            len -= 64;
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < 15; i++)
+    { // 15 * 4 = 60
+        if (len >= 4)
+        {
+            if ((__u8 *)data + 4 > (__u8 *)data_end)
+                break;
+            csum = bpf_csum_diff(NULL, 0, data, 4, csum);
+            data = (__u8 *)data + 4;
+            len -= 4;
+        }
+    }
+
+    if (len > 0 && len <= 3)
+    {
+        __u32 tail = 0;
+        __u8 *tail_bytes = (__u8 *)data;
+        if (len == 1)
+        {
+            if (tail_bytes + 1 > (__u8 *)data_end)
+                return csum;
+            tail = tail_bytes[0];
+        }
+        else if (len == 2)
+        {
+            if (tail_bytes + 2 > (__u8 *)data_end)
+                return csum;
+            tail = (tail_bytes[1] << 8) | tail_bytes[0];
+        }
+        else if (len == 3)
+        {
+            if (tail_bytes + 3 > (__u8 *)data_end)
+                return csum;
+            tail = (tail_bytes[2] << 16) | (tail_bytes[1] << 8) | tail_bytes[0];
+        }
+
+        csum += tail;
+        if (csum < tail)
+            csum++;
+    }
+
+    return csum;
 }
 
 #ifdef BPF_DEBUG
@@ -865,3 +928,15 @@ static __always_inline void fix_l4_checksum_v6(__u8 *scratch, __u32 inner_len)
 #endif
 
 #endif /* __GUT_COMMON_H__ */
+
+static __always_inline __u8 is_quic_server(const struct gut_config *cfg)
+{
+    if (cfg->tun_local_ip4 != 0)
+    {
+        return ((const __u8 *)&cfg->tun_local_ip4)[3] & 1;
+    }
+    else
+    {
+        return cfg->tun_local_ip6[15] & 1;
+    }
+}

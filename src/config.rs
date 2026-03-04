@@ -45,6 +45,7 @@ pub struct PeerConfig {
     pub key: [u8; 32],
     pub keepalive_drop_percent: u8,
     pub outer_mtu: u16,
+    pub own_http3: bool,
 }
 
 /// Global runtime settings (from config file [global] section or CLI).
@@ -73,6 +74,7 @@ struct PeerBuilder {
     key: Option<[u8; 32]>,
     passphrase: Option<String>,
     keepalive_drop_percent: u8,
+    own_http3: bool,
 }
 
 impl Default for PeerBuilder {
@@ -89,6 +91,7 @@ impl Default for PeerBuilder {
             key: None,
             passphrase: None,
             keepalive_drop_percent: 75,
+            own_http3: true,
         }
     }
 }
@@ -131,6 +134,7 @@ impl PeerBuilder {
             key,
             keepalive_drop_percent: self.keepalive_drop_percent,
             outer_mtu,
+            own_http3: self.own_http3,
         })
     }
 }
@@ -256,6 +260,9 @@ fn parse_config(content: &str) -> Result<Config> {
                                 return Err("keepalive_drop_percent must be in range 0..100".into());
                             }
                             b.keepalive_drop_percent = parsed;
+                        }
+                        "own_http3" => {
+                            b.own_http3 = value == "true" || value == "1";
                         }
                         _ => {}
                     }

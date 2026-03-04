@@ -44,21 +44,19 @@ fn print_bpf_stats(managers: &[gutd::tc::TcBpfManager]) {
             Ok(stats) => {
                 eprintln!("  [{}]", manager.interface());
                 eprintln!(
-                    "    Egress:  pkts={} drop={} bytes={} mask={} cookie_fail={} frag={}",
+                    "    Egress:  pkts={} drop={} bytes={} mask={} frag={}",
                     stats.egress.packets_processed,
                     stats.egress.packets_dropped,
                     stats.egress.bytes_processed,
                     stats.egress.mask_count,
-                    stats.egress.cookie_validation_failed,
                     stats.egress.packets_fragmented
                 );
                 eprintln!(
-                    "    Ingress: pkts={} drop={} bytes={} mask={} cookie_fail={} frag={}",
+                    "    Ingress: pkts={} drop={} bytes={} mask={} frag={}",
                     stats.ingress.packets_processed,
                     stats.ingress.packets_dropped,
                     stats.ingress.bytes_processed,
                     stats.ingress.mask_count,
-                    stats.ingress.cookie_validation_failed,
                     stats.ingress.packets_fragmented
                 );
             }
@@ -104,11 +102,6 @@ fn dump_counters_file(
                 let _ = writeln!(buf, "{peer}_egress_mask_ops={}", stats.egress.mask_count);
                 let _ = writeln!(
                     buf,
-                    "{peer}_egress_cookie_validation_failed={}",
-                    stats.egress.cookie_validation_failed
-                );
-                let _ = writeln!(
-                    buf,
                     "{peer}_egress_fragmented={}",
                     stats.egress.packets_fragmented
                 );
@@ -133,11 +126,6 @@ fn dump_counters_file(
                     stats.ingress.bytes_processed
                 );
                 let _ = writeln!(buf, "{peer}_ingress_mask_ops={}", stats.ingress.mask_count);
-                let _ = writeln!(
-                    buf,
-                    "{peer}_ingress_cookie_validation_failed={}",
-                    stats.ingress.cookie_validation_failed
-                );
                 let _ = writeln!(
                     buf,
                     "{peer}_ingress_fragmented={}",
