@@ -206,7 +206,7 @@ struct
  * counter = block index (0, 1, 2, ...).
  * nonce   = per-packet nonce (u32 LE).
  * Rounds = compile-time CHACHA_ROUNDS.  NO LOOPS — #if-chain only. */
-static __always_inline void chacha_block(__u32 ks[16],
+static __attribute__((noinline)) void chacha_block(__u32 ks[16],
                                          const __u32 chacha_init[12],
                                          __u32 counter, __u32 nonce)
 {
@@ -490,7 +490,9 @@ static __always_inline __u32 feistel32(__u32 x, const __u32 rk[4])
 }
 
 /* Compiler barriers for BPF verifier (technique from libbpf_wgobfs) */
+#ifndef barrier_var
 #define barrier_var(var) asm volatile("" : "=r"(var) : "0"(var))
+#endif
 
 /* Force verifier to see bounds check */
 #define FORCE_BOUNDS_CHECK(val, max) \
