@@ -24,7 +24,7 @@ static __always_inline __u32 wg_nonce32(const __u8 *wg)
 SEC("tc")
 int gut_egress(struct __sk_buff *skb)
 {
-    bpf_printk("TC egress: processing packet len=%d", skb->len);
+    bpf_debug("TC egress: processing packet len=%d", skb->len);
     __u32 zero = 0;
     struct gut_config *cfg = bpf_map_lookup_elem(&config_map, &zero);
     if (!cfg)
@@ -304,7 +304,7 @@ int gut_egress(struct __sk_buff *skb)
     __builtin_memcpy(eth->h_dest, cfg->dst_mac, 6);
     __builtin_memcpy(eth->h_source, cfg->src_mac, 6);
 
-    bpf_printk("TC egress: wg_type=%d quic_len=%d pad=%d port=%d", wg_type, quic_hdr_len, pad_len, tunnel_port);
+    bpf_debug("TC egress: wg_type=%d quic_len=%d pad=%d port=%d", wg_type, quic_hdr_len, pad_len, tunnel_port);
     return bpf_redirect(cfg->egress_ifindex, 0);
 }
 

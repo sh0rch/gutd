@@ -443,7 +443,7 @@ static __always_inline int handle_quic_probe(struct xdp_md *ctx)
     csum = calc_payload_csum(udph, data_end, new_udp_len, csum);
     udph->check = csum_fold(csum);
 
-    bpf_printk("XDP_TX QUIC VerNeg, new_len=%d", new_pkt_len);
+    bpf_debug("XDP_TX QUIC VerNeg, new_len=%d", new_pkt_len);
     return XDP_TX;
 }
 
@@ -451,7 +451,7 @@ static __always_inline int handle_quic_probe(struct xdp_md *ctx)
 SEC("xdp")
 int xdp_gut_ingress(struct xdp_md *ctx)
 {
-    bpf_printk("XDP ingress: pkt size=%d", ctx->data_end - ctx->data);
+    bpf_debug("XDP ingress: pkt size=%d", ctx->data_end - ctx->data);
     __u32 zero = 0;
     struct gut_config *cfg = bpf_map_lookup_elem(&config_map, &zero);
     if (!cfg)
