@@ -4,13 +4,13 @@
 [![Release](https://github.com/sh0rch/gutd/actions/workflows/release.yml/badge.svg)](https://github.com/sh0rch/gutd/actions/workflows/release.yml)
 
 <!-- INTEGRATION_TEST_RESULTS_START -->
-### 📊 Benchmark: gutd vs wg-obfuscator
+### Benchmark: gutd vs wg-obfuscator
 | Tool | TCP Bandwidth | UDP Bandwidth | UDP Loss |
 |---|---|---|---|
-| **gutd** ([v1.2.0](https://github.com/sh0rch/gutd/releases/tag/v1.2.0)) | 1.03 Gbits/sec | 1.01 Gbits/sec | 0% |
-| **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | 331 Mbits/sec | 1.01 Gbits/sec | 0% |
+| **gutd** ([v1.2.0](https://github.com/sh0rch/gutd/releases/tag/v1.2.0)) | 970 Mbits/sec | 1.09 Gbits/sec | 5.5% |
+| **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | 342 Mbits/sec | 254 Mbits/sec | 76% |
 
-<sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. Unmodified default parameters unless configured otherwise. [See test logic and full logs](https://github.com/sh0rch/gutd/actions/runs/22572339548). Last updated: 2026-03-02 10:42</i></sub>
+<sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. [See test logic and full logs](https://github.com/sh0rch/gutd/actions/runs/22669775894). Last updated: 2026-03-04 12:41</i></sub>
 <!-- INTEGRATION_TEST_RESULTS_END -->
 
 
