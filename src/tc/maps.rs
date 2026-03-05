@@ -6,7 +6,14 @@ use std::net::IpAddr;
 
 pub const MAX_PORTS: usize = 16;
 pub const GUT_KEY_SIZE: usize = 32;
-pub const GUT_WIRE_HEADER_SIZE: u16 = 100 + 63; // QUIC Long Header + max Chacha padding
+// GUT wire overhead per *large* payload (the MTU-relevant case):
+// - Large packets (wg_type=4, wg_len >= BALLAST_THRESHOLD) always use QUIC Short Header (14 B)
+//   and get zero ballast, so only 14 bytes of GUT header are added.
+// - wg_type=1 Handshake Initiation uses Long Header (100 B) but is only 148 bytes total,
+//   so it always fits even with Long Header + full ballast — it never drives fragmentation.
+// Using Long-Header size here was wrong: it caused inner_mtu to be 149 bytes too small,
+// making WireGuard fragment every large data packet unnecessarily.
+pub const GUT_WIRE_HEADER_SIZE: u16 = 14; // QUIC Short Header only (data pkts, no ballast)
 pub const PMTU_RESERVE_BYTES: u16 = 20;
 pub const OUTER_OVERHEAD_IPV4: u16 = GUT_WIRE_HEADER_SIZE + 8 + 20 + PMTU_RESERVE_BYTES;
 pub const OUTER_OVERHEAD_IPV6: u16 = GUT_WIRE_HEADER_SIZE + 8 + 40 + PMTU_RESERVE_BYTES;

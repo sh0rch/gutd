@@ -19,7 +19,15 @@
 #include <bpf/bpf_endian.h>
 
 #define MAX_PORTS 16
-#define GUT_QUIC_SHORT_HEADER_SIZE 10
+/* Short header layout (14 bytes):
+ * [0]=0x40 [1-4]=DCID [5-8]=PPN [9-10]=inner_sport_be [11-12]=inner_dport_be [13]=pad_len
+ * Long header layout (100 bytes):
+ * [0]=0xC0 [1-4]=version [5]=dcid_len [6-13]=dcid [14]=scid_len [15-22]=scid
+ * [23]=token_len [24-25]=length [26-29]=PPN [30-31]=inner_sport_be [32-33]=inner_dport_be
+ * [34-98]=PRNG noise [99]=pad_len
+ * TC egress stores the original WG UDP src/dst ports so XDP can restore them
+ * after decapsulation, preserving the conntrack/WG port numbers end-to-end. */
+#define GUT_QUIC_SHORT_HEADER_SIZE 14
 #define GUT_QUIC_LONG_HEADER_SIZE 100
 #define GUT_KEY_SIZE 32
 #define MAX_PACKET_SIZE 1500
@@ -207,8 +215,8 @@ struct
  * nonce   = per-packet nonce (u32 LE).
  * Rounds = compile-time CHACHA_ROUNDS.  NO LOOPS — #if-chain only. */
 static __attribute__((noinline)) void chacha_block(__u32 ks[16],
-                                         const __u32 chacha_init[12],
-                                         __u32 counter, __u32 nonce)
+                                                   const __u32 chacha_init[12],
+                                                   __u32 counter, __u32 nonce)
 {
     /* Init working state */
     __u32 s0 = chacha_init[0], s1 = chacha_init[1];
@@ -471,6 +479,7 @@ static __always_inline __u16 select_port(__u32 pkt_id, const struct gut_config *
  * independent permutations from the same round keys. */
 #define FEISTEL_SALT_PKT_ID 0x9E3779B9u  /* golden ratio × 2^32 */
 #define FEISTEL_SALT_BALLAST 0x517CC1B7u /* sqrt(3) × 2^32 */
+#define FEISTEL_SALT_PORTS 0xB7E15163u   /* 2π × 2^31 — domain for port encryption */
 
 static __always_inline __u32 feistel32(__u32 x, const __u32 rk[4])
 {
@@ -484,6 +493,30 @@ static __always_inline __u32 feistel32(__u32 x, const __u32 rk[4])
         __u16 new_lo = hi ^ (__u16)(f & 0xFFFF);
         hi = lo;
         lo = new_lo;
+    }
+
+    return ((__u32)hi << 16) | (__u32)lo;
+}
+
+/* ── feistel32_inv: exact inverse of feistel32 ────────────────────────
+ *
+ * Forward round: {lo, hi} → {hi ^ F(lo), lo}
+ * Inverse round: given {lo', hi'} = {hi^F(lo_old), lo_old}
+ *   lo_old = hi'   →   hi_old = lo' ^ F(hi')
+ * Decrypt: run rounds in reverse order with same round-function. */
+static __always_inline __u32 feistel32_inv(__u32 x, const __u32 rk[4])
+{
+    __u16 lo = (__u16)(x & 0xFFFF);
+    __u16 hi = (__u16)(x >> 16);
+
+#pragma unroll
+    for (int i = 3; i >= 0; i--)
+    {
+        __u16 lo_old = hi;
+        __u32 f = ((__u32)hi * 0x9E37 + rk[i]) ^ ((__u32)hi << 3) ^ ((__u32)hi >> 5);
+        __u16 hi_old = lo ^ (__u16)(f & 0xFFFF);
+        lo = lo_old;
+        hi = hi_old;
     }
 
     return ((__u32)hi << 16) | (__u32)lo;
@@ -929,8 +962,6 @@ static __always_inline __u32 calc_payload_csum(void *data, void *data_end, __u32
     } while (0)
 #endif
 
-#endif /* __GUT_COMMON_H__ */
-
 static __always_inline __u8 is_quic_server(const struct gut_config *cfg)
 {
     if (cfg->tun_local_ip4 != 0)
@@ -942,3 +973,5 @@ static __always_inline __u8 is_quic_server(const struct gut_config *cfg)
         return cfg->tun_local_ip6[15] & 1;
     }
 }
+
+#endif /* __GUT_COMMON_H__ */
