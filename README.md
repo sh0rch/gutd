@@ -14,21 +14,7 @@
 <!-- INTEGRATION_TEST_RESULTS_END -->
 
 
-
-
-
-
-
-gutd v2 obfuscates WireGuard UDP traffic using a Linux TC/XDP eBPF datapath.
-It sits transparently between a WireGuard peer and the network. On egress, the TC
-program encapsulates each packet in a fake QUIC Long Header containing a fake SNI,
-adds variable padding, and masks the payload with a ChaCha keystream.
-On ingress, the XDP program removes the QUIC emulation and unmasks the packet
-before passing it up. The XDP program can also optionally mock an HTTP/3 server by
-answering DPI UDP probes directly from the kernel ring buffer.
-The WireGuard process is unaware of gutd.
-
-gutd v2 obfuscates WireGuard UDP traffic using a Linux TC/XDP eBPF datapath.
+**gutd v2** obfuscates WireGuard UDP traffic using a Linux TC/XDP eBPF datapath.
 It sits transparently between a WireGuard peer and the network. On egress,
 the TC program encapsulates each packet in a fake QUIC Long Header containing
 a fake SNI, adds variable padding, and masks the payload with a ChaCha keystream.
