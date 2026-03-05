@@ -87,13 +87,21 @@ int gut_egress(struct __sk_buff *skb)
     if (wg_off + wg_len > skb->len || wg_len < WG_MIN_PACKET)
         return TC_ACT_OK;
 
-    __u8 wg_head[WG_MIN_PACKET] = {};
+    __u8 *wg_head = scratch + 0;
     if (bpf_skb_load_bytes(skb, wg_off, wg_head, WG_MIN_PACKET) < 0)
         return TC_ACT_OK;
 
     __u8 wg_type = wg_head[0] & 0x1F;
     if (wg_type < 1 || wg_type > 4 || wg_head[1] != 0 || wg_head[2] != 0)
         return TC_ACT_OK;
+
+    /* Save inner UDP ports BEFORE bpf_skb_adjust_room invalidates SKB pointers.
+     * Pack sport:dport into a u32, XOR with FEISTEL_SALT_PORTS for domain separation,
+     * then encrypt with feistel32 using the shared round keys.  XDP ingress decrypts
+     * with feistel32_inv to recover the original WireGuard port numbers. */
+    __u32 plain_ports = (((__u32)bpf_ntohs(udph->source)) << 16) |
+                         ((__u32)bpf_ntohs(udph->dest));
+    __u32 enc_ports = feistel32(plain_ports ^ FEISTEL_SALT_PORTS, cfg->feistel_rk);
 
     __u32 nonce = wg_nonce32(wg_head);
 
@@ -117,26 +125,32 @@ int gut_egress(struct __sk_buff *skb)
         quic_hdr_len = (wg_type == 1) ? GUT_QUIC_LONG_HEADER_SIZE : GUT_QUIC_SHORT_HEADER_SIZE;
     }
 
-    __u32 ks69[16];
+    __u32 *ks69 = (__u32 *)(scratch + 64);
     chacha_block(ks69, cfg->chacha_init, 69, nonce);
     __u8 *pad_block = (__u8 *)ks69;
-    __u32 pad_len = pad_block[63] & 0x3F;
 
-    pad_len |= 1; // fix pad_len to non-zero
-
-    if (pad_len <= 63)
+    /* Ballast for small packets: uniform [1..64] bytes.
+     * Wire encoding: last QUIC header byte = 0x40 | (raw & 0x3F)
+     *   bit6 (0x40) = "has ballast" flag
+     *   bits[0:5]   = raw ∈ [0..63], actual ballast = raw+1 → [1..64]
+     * Large packets (no ballast): the byte stays 0x00 — bit6 clear = no trim.
+     * Verifier note: after bpf_skb_change_tail spills pad_len to stack the
+     * tnum loses umin; explicit re-check restores [1,64] before the store. */
+    __u32 pad_len = 0;
+    if (wg_len < BALLAST_THRESHOLD)
     {
+        __u32 raw = pad_block[63] & 0x3F; /* [0..63] uniform */
+        pad_len = raw + 1;                 /* [1..64] */
         if (bpf_skb_change_tail(skb, skb->len + pad_len, 0) < 0)
             return TC_ACT_OK;
-
-        pad_len &= 0x3F;
-        pad_len |= 1;
-
+        /* Re-establish [1,64] for verifier after potential stack reload. */
+        if (pad_len == 0 || pad_len > 64)
+            return TC_ACT_OK;
         if (bpf_skb_store_bytes(skb, skb->len - pad_len, pad_block, pad_len, 0) < 0)
             return TC_ACT_OK;
     }
 
-    __u32 ks47[16];
+    __u32 *ks47 = (__u32 *)(scratch + 128);
     chacha_block(ks47, cfg->chacha_init, 47, nonce);
     __u8 *ks47_b = (__u8 *)ks47;
 
@@ -156,7 +170,7 @@ int gut_egress(struct __sk_buff *skb)
 
     if (wg_type == 1 && wg_len >= 148)
     {
-        __u8 mac2[16];
+        __u8 *mac2 = scratch + 192;
         if (bpf_skb_load_bytes(skb, wg_off + 132, mac2, 16) == 0)
         {
             for (int i = 0; i < 16; i++)
@@ -166,7 +180,7 @@ int gut_egress(struct __sk_buff *skb)
     }
     else if (wg_type == 2 && wg_len >= 92)
     {
-        __u8 mac2[16];
+        __u8 *mac2 = scratch + 192;
         if (bpf_skb_load_bytes(skb, wg_off + 76, mac2, 16) == 0)
         {
             for (int i = 0; i < 16; i++)
@@ -196,14 +210,14 @@ int gut_egress(struct __sk_buff *skb)
     {
         if (i >= shift_len)
             break;
-        scratch[i] = ((__u8 *)data)[14 + quic_hdr_len + i];
+        scratch[256 + i] = ((__u8 *)data)[14 + quic_hdr_len + i];
     }
 #pragma unroll
     for (int i = 0; i < 60; i++)
     {
         if (i >= shift_len)
             break;
-        ((__u8 *)data)[14 + i] = scratch[i];
+        ((__u8 *)data)[14 + i] = scratch[256 + i];
     }
 
     __u32 new_quic_off = 14 + shift_len;
@@ -221,6 +235,9 @@ int gut_egress(struct __sk_buff *skb)
 
         // Inject 4-byte PPN
         __builtin_memcpy((__u8 *)quic + 5, &ppn, 4);
+
+        // Bytes 9-12: feistel-encrypted ports (sport<<16|dport); XDP decrypts with feistel32_inv
+        __builtin_memcpy((__u8 *)quic + 9, &enc_ports, 4);
     }
     else
     {
@@ -262,9 +279,15 @@ int gut_egress(struct __sk_buff *skb)
         // 4-byte PPN
         __builtin_memcpy((__u8 *)quic + 26, &ppn, 4);
 
+        // Bytes 30-33: feistel-encrypted ports (sport<<16|dport); XDP decrypts with feistel32_inv
+        __builtin_memcpy((__u8 *)quic + 30, &enc_ports, 4);
+
         // Keep the rest filled with the PRNG noise generated above. No open text SNI!
     }
-    quic[quic_hdr_len - 1] = pad_len;
+    /* Encode ballast info in the last QUIC header byte:
+     *   0x00           = no ballast (large packet path, pad_len==0)
+     *   0x40 | raw     = has ballast; actual len = (raw & 0x3F) + 1 → [1..64] */
+    quic[quic_hdr_len - 1] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
 
     if (ipver == 4)
     {
@@ -297,7 +320,8 @@ int gut_egress(struct __sk_buff *skb)
         __u32 payload_len = bpf_ntohs(udph->len); // length of UDP header + payload
         csum = calc_payload_csum(udp_start, data_end, payload_len, csum);
 
-        udph->check = csum_fold(csum); // apply pseudo header and payload csum
+        __u16 final_csum = csum_fold(csum);
+        udph->check = final_csum ? final_csum : 0xFFFF; // apply pseudo header and payload csum
     }
 
     eth = data;

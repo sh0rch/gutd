@@ -50,10 +50,14 @@ xdp_gut_ingress.o: xdp_gut_ingress.bpf.c gut_common.h
 clean:
 	rm -f $(TARGETS)
 
-# Verification target - use bpftool to verify loaded programs
+# Verification target - load programs into kernel verifier via bpftool
+# Usage: make verify   (requires sudo / CAP_BPF)
 verify: $(TARGETS)
-	@echo "BPF object files compiled successfully"
-	@for obj in $(TARGETS); do \
-		echo "=== $$obj ==="; \
-		llvm-objdump -d $$obj | head -20; \
-	done
+	@echo "=== Verifying XDP ingress ==="
+	sudo bpftool prog load xdp_gut_ingress.o /sys/fs/bpf/gut_verify_xdp type xdp \
+		&& echo "xdp_gut_ingress: PASS" || { echo "xdp_gut_ingress: FAIL"; exit 1; }
+	sudo rm -f /sys/fs/bpf/gut_verify_xdp
+	@echo "=== Verifying TC egress ==="
+	sudo bpftool prog load tc_gut_egress.o /sys/fs/bpf/gut_verify_tc \
+		&& echo "tc_gut_egress: PASS" || { echo "tc_gut_egress: FAIL"; exit 1; }
+	sudo rm -f /sys/fs/bpf/gut_verify_tc
