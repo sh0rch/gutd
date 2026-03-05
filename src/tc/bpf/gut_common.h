@@ -180,6 +180,7 @@ struct
  * Must match src/proto/mask_balanced.rs (FastChaCha20 with 2 double-rounds).
  */
 
+/* ChaCha quarter-round on named variables (kept for reference / external use). */
 #define CHACHA_QR(a, b, c, d)      \
     do                             \
     {                              \
@@ -197,103 +198,121 @@ struct
         b = (b << 7) | (b >> 25);  \
     } while (0)
 
-/* One ChaCha double-round: column + diagonal (8 quarter-rounds).
- * Requires s0..s15 in scope. */
-#define CHACHA_DOUBLE_ROUND()    \
-    CHACHA_QR(s0, s4, s8, s12);  \
-    CHACHA_QR(s1, s5, s9, s13);  \
-    CHACHA_QR(s2, s6, s10, s14); \
-    CHACHA_QR(s3, s7, s11, s15); \
-    CHACHA_QR(s0, s5, s10, s15); \
-    CHACHA_QR(s1, s6, s11, s12); \
-    CHACHA_QR(s2, s7, s8, s13);  \
-    CHACHA_QR(s3, s4, s9, s14)
+/* ChaCha quarter-round on a __u32 state array at compile-time-constant indices.
+ * All index arguments must be integer literals so the BPF verifier sees fixed offsets. */
+#define CHACHA_QR_IDX(st, ai, bi, ci, di)            \
+    do                                               \
+    {                                                \
+        st[ai] += st[bi];                            \
+        st[di] ^= st[ai];                            \
+        st[di] = (st[di] << 16) | (st[di] >> 16);   \
+        st[ci] += st[di];                            \
+        st[bi] ^= st[ci];                            \
+        st[bi] = (st[bi] << 12) | (st[bi] >> 20);   \
+        st[ai] += st[bi];                            \
+        st[di] ^= st[ai];                            \
+        st[di] = (st[di] << 8) | (st[di] >> 24);    \
+        st[ci] += st[di];                            \
+        st[bi] ^= st[ci];                            \
+        st[bi] = (st[bi] << 7) | (st[bi] >> 25);    \
+    } while (0)
+
+/* One ChaCha double-round (column + diagonal) operating in-place on st[16].
+ * Uses CHACHA_QR_IDX so all indices are compile-time constants — no stack needed. */
+#define CHACHA_DOUBLE_ROUND_IDX(st)       \
+    CHACHA_QR_IDX(st, 0,  4,  8, 12);    \
+    CHACHA_QR_IDX(st, 1,  5,  9, 13);    \
+    CHACHA_QR_IDX(st, 2,  6, 10, 14);    \
+    CHACHA_QR_IDX(st, 3,  7, 11, 15);    \
+    CHACHA_QR_IDX(st, 0,  5, 10, 15);    \
+    CHACHA_QR_IDX(st, 1,  6, 11, 12);    \
+    CHACHA_QR_IDX(st, 2,  7,  8, 13);    \
+    CHACHA_QR_IDX(st, 3,  4,  9, 14)
 
 /* Generate 64 bytes of ChaCha keystream into ks[16].
  * chacha_init[12] = loader-precomputed constants+key.
  * counter = block index (0, 1, 2, ...).
  * nonce   = per-packet nonce (u32 LE).
- * Rounds = compile-time CHACHA_ROUNDS.  NO LOOPS — #if-chain only. */
+ * Rounds = compile-time CHACHA_ROUNDS.  NO LOOPS — #if-chain only.
+ *
+ * Working state is kept entirely in ks[] (the caller-provided buffer, which
+ * lives in the scratch per-CPU map) so that chacha_block itself has zero
+ * u32 local variables on the BPF 512-byte stack.  The initial state is
+ * re-read from the chacha_init pointer for the final addition. */
 static __attribute__((noinline)) void chacha_block(__u32 ks[16],
                                                    const __u32 chacha_init[12],
                                                    __u32 counter, __u32 nonce)
 {
-    /* Init working state */
-    __u32 s0 = chacha_init[0], s1 = chacha_init[1];
-    __u32 s2 = chacha_init[2], s3 = chacha_init[3];
-    __u32 s4 = chacha_init[4], s5 = chacha_init[5];
-    __u32 s6 = chacha_init[6], s7 = chacha_init[7];
-    __u32 s8 = chacha_init[8], s9 = chacha_init[9];
-    __u32 s10 = chacha_init[10], s11 = chacha_init[11];
-    __u32 s12 = counter;
-    __u32 s13 = nonce;
-    __u32 s14 = 0, s15 = 0;
+    /* Load initial state into ks[] — no s0..s15 locals, no stack pressure. */
+    ks[0]  = chacha_init[0];  ks[1]  = chacha_init[1];
+    ks[2]  = chacha_init[2];  ks[3]  = chacha_init[3];
+    ks[4]  = chacha_init[4];  ks[5]  = chacha_init[5];
+    ks[6]  = chacha_init[6];  ks[7]  = chacha_init[7];
+    ks[8]  = chacha_init[8];  ks[9]  = chacha_init[9];
+    ks[10] = chacha_init[10]; ks[11] = chacha_init[11];
+    ks[12] = counter;
+    ks[13] = nonce;
+    ks[14] = 0;
+    ks[15] = 0;
 
     /* Double-round 1 — ChaCha2 (always, minimum) */
-    CHACHA_DOUBLE_ROUND();
+    CHACHA_DOUBLE_ROUND_IDX(ks);
 
     /* Double-round 2 — ChaCha4 */
 #if (CHACHA_ROUNDS >= 4)
-    CHACHA_DOUBLE_ROUND();
+    CHACHA_DOUBLE_ROUND_IDX(ks);
 #endif
 
     /* Double-round 3 — ChaCha6 */
 #if (CHACHA_ROUNDS >= 6)
-    CHACHA_DOUBLE_ROUND();
+    CHACHA_DOUBLE_ROUND_IDX(ks);
 #endif
 
     /* Double-round 4 — ChaCha8 */
 #if (CHACHA_ROUNDS >= 8)
-    CHACHA_DOUBLE_ROUND();
+    CHACHA_DOUBLE_ROUND_IDX(ks);
 #endif
 
     /* Double-round 5 — ChaCha10 */
 #if (CHACHA_ROUNDS >= 10)
-    CHACHA_DOUBLE_ROUND();
+    CHACHA_DOUBLE_ROUND_IDX(ks);
 #endif
 
     /* Double-round 6 — ChaCha12 */
 #if (CHACHA_ROUNDS >= 12)
-    CHACHA_DOUBLE_ROUND();
+    CHACHA_DOUBLE_ROUND_IDX(ks);
 #endif
 
     /* Double-round 7 — ChaCha14 */
 #if (CHACHA_ROUNDS >= 14)
-    CHACHA_DOUBLE_ROUND();
+    CHACHA_DOUBLE_ROUND_IDX(ks);
 #endif
 
     /* Double-round 8 — ChaCha16 */
 #if (CHACHA_ROUNDS >= 16)
-    CHACHA_DOUBLE_ROUND();
+    CHACHA_DOUBLE_ROUND_IDX(ks);
 #endif
 
     /* Double-round 9 — ChaCha18 */
 #if (CHACHA_ROUNDS >= 18)
-    CHACHA_DOUBLE_ROUND();
+    CHACHA_DOUBLE_ROUND_IDX(ks);
 #endif
 
     /* Double-round 10 — ChaCha20 */
 #if (CHACHA_ROUNDS >= 20)
-    CHACHA_DOUBLE_ROUND();
+    CHACHA_DOUBLE_ROUND_IDX(ks);
 #endif
 
-    /* Add initial state back */
-    ks[0] = s0 + chacha_init[0];
-    ks[1] = s1 + chacha_init[1];
-    ks[2] = s2 + chacha_init[2];
-    ks[3] = s3 + chacha_init[3];
-    ks[4] = s4 + chacha_init[4];
-    ks[5] = s5 + chacha_init[5];
-    ks[6] = s6 + chacha_init[6];
-    ks[7] = s7 + chacha_init[7];
-    ks[8] = s8 + chacha_init[8];
-    ks[9] = s9 + chacha_init[9];
-    ks[10] = s10 + chacha_init[10];
-    ks[11] = s11 + chacha_init[11];
-    ks[12] = s12 + counter;
-    ks[13] = s13 + nonce;
-    ks[14] = s14;
-    ks[15] = s15;
+    /* Add initial state back (re-read chacha_init instead of keeping copies). */
+    ks[0]  += chacha_init[0];  ks[1]  += chacha_init[1];
+    ks[2]  += chacha_init[2];  ks[3]  += chacha_init[3];
+    ks[4]  += chacha_init[4];  ks[5]  += chacha_init[5];
+    ks[6]  += chacha_init[6];  ks[7]  += chacha_init[7];
+    ks[8]  += chacha_init[8];  ks[9]  += chacha_init[9];
+    ks[10] += chacha_init[10]; ks[11] += chacha_init[11];
+    ks[12] += counter;
+    ks[13] += nonce;
+    /* ks[14] += 0 and ks[15] += 0 are no-ops; values stay correct. */
 }
 
 /* XOR up to 64 bytes of data[] (at offset `off`) with keystream ks[16].
