@@ -313,7 +313,7 @@ table inet gut_server {
 }
 ```
 
-WireGuard must listen on `0.0.0.0` (all interfaces, including `gut0`) on
+WireGuard listen on `0.0.0.0` (all interfaces, including `gut0`) on
 whatever port is used as the DNAT target on the relay.
 
 ## Testing
