@@ -455,17 +455,28 @@ EOF
     wg show wg_srv >&2
     log "======================="
     
-    # Test connectivity through WireGuard tunnel
-    log "Testing WireGuard tunnel connectivity..."
-    if ip netns exec relay_ns ping -c 3 -W 2 10.200.0.2 > /dev/null 2>&1; then
-        log "[ok] WireGuard tunnel working"
+    # Test connectivity through WireGuard tunnel and record RTT stats
+    log "Testing WireGuard tunnel connectivity (10 pings)..."
+    local ping_out
+    ping_out=$(ip netns exec relay_ns ping -c 10 -i 0.2 -W 2 10.200.0.2 2>&1) || true
+    log "${ping_out}"
+
+    # Parse summary line: "rtt min/avg/max/mdev = A/B/C/D ms"
+    local rtt_line loss_line
+    rtt_line=$(echo "$ping_out"  | grep -oP 'rtt min/avg/max/mdev = \S+')
+    loss_line=$(echo "$ping_out" | grep -oP '\d+% packet loss')
+
+    if echo "$ping_out" | grep -q ' 0% packet loss'; then
+        log "[ok] WireGuard tunnel working — ${rtt_line:-rtt n/a}  loss: ${loss_line:-n/a}"
     else
-        error "[FAIL] WireGuard tunnel NOT working"
-        echo "=== Ping test ===" >&2
-        ip netns exec relay_ns ping -c 3 10.200.0.2 >&2 || true
+        error "[FAIL] WireGuard tunnel NOT working (${loss_line:-100% packet loss})"
         return 1
     fi
-    
+
+    # Record for summary
+    echo "wg_gutd_ping_rtt=${rtt_line#*= }"  >> "$RESULTS_FILE"
+    echo "wg_gutd_ping_loss=${loss_line}"     >> "$RESULTS_FILE"
+
     log "WireGuard through gutd configured"
 }
 
@@ -562,6 +573,35 @@ test_wireguard_via_gutd() {
     log "============================="
 }
 
+# Test QUIC Version Negotiation anti-probing (own_http3)
+# Sends a QUIC Initial Long Header to the host GUT port from server_ns.
+# Traffic arrives at veth_host XDP ingress -> handle_quic_probe bounces a
+# Version Negotiation packet back via XDP_TX.
+test_quic_antiprobe() {
+    log "Testing QUIC anti-probing (own_http3)..."
+
+    if ! command -v python3 &>/dev/null; then
+        warn "python3 not found — skipping QUIC probe test"
+        echo "quic_antiprobe=SKIP" >> "$RESULTS_FILE"
+        return
+    fi
+
+    # First port from the CSV list is what the XDP program listens on
+    local probe_port
+    probe_port=$(echo "$GUT_PORTS_CSV" | cut -d, -f1 | xargs)
+
+    log "Sending QUIC Initial probe from server_ns -> 10.100.2.1:$probe_port"
+
+    # Run from server_ns: packets enter veth_host from veth_srv, hitting XDP ingress
+    if ip netns exec server_ns python3 "$SCRIPT_DIR/probe_quic.py" 10.100.2.1 "$probe_port"; then
+        log "[ok] QUIC Version Negotiation anti-probing: PASS"
+        echo "quic_antiprobe=PASS" >> "$RESULTS_FILE"
+    else
+        warn "[FAIL] QUIC Version Negotiation anti-probing: FAIL"
+        echo "quic_antiprobe=FAIL" >> "$RESULTS_FILE"
+    fi
+}
+
 # Cleanup
 cleanup() {
     if [ "${KEEP_RUNNING:-0}" = "1" ]; then
@@ -621,6 +661,23 @@ compare_results() {
             warn "Throughput overhead is high (>${overhead}%)"
         fi
     fi
+
+    local probe_result
+    probe_result=$(grep "quic_antiprobe=" "$RESULTS_FILE" | cut -d= -f2)
+    local ping_rtt ping_loss
+    ping_rtt=$(grep  "wg_gutd_ping_rtt="  "$RESULTS_FILE" | cut -d= -f2-)
+    ping_loss=$(grep "wg_gutd_ping_loss=" "$RESULTS_FILE" | cut -d= -f2-)
+    if [ -n "$ping_rtt" ]; then
+        log "WG-over-gutd ping RTT:         ${ping_rtt} ms"
+        log "WG-over-gutd packet loss:      ${ping_loss:-0% packet loss}"
+    fi
+
+    case "${probe_result:-}" in
+        PASS) log "QUIC anti-probing:             PASS" ;;
+        FAIL) warn "QUIC anti-probing:             FAIL" ;;
+        SKIP) warn "QUIC anti-probing:             SKIP (python3 missing)" ;;
+        *)    warn "QUIC anti-probing:             NOT RUN" ;;
+    esac
 }
 
 # Main execution
@@ -654,6 +711,10 @@ main() {
     setup_wireguard_via_gutd
     test_wireguard_via_gutd
     
+    # Test 3: QUIC anti-probing
+    log "=== Test 3: QUIC anti-probing ==="
+    test_quic_antiprobe
+
     # Compare
     compare_results
     

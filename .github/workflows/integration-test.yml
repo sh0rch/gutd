@@ -32,7 +32,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y iperf3 iproute2 iputils-ping wireguard-tools
+        sudo apt-get install -y iperf3 iproute2 iputils-ping wireguard-tools python3
         chmod +x /tmp/bin/gutd-x86_64
         /tmp/bin/gutd-x86_64 --version
 
@@ -130,8 +130,15 @@ jobs:
         sudo ip netns exec ns2 wg show wg0
 
         echo "=== Ping through gutd ==="
-        sudo ip netns exec ns1 ping -c5 -i0.2 -W3 10.200.0.2
-        echo "PING: SUCCESS"
+        PING_OUT=$(sudo ip netns exec ns1 ping -c5 -i0.2 -W3 10.200.0.2 2>&1) || true
+        echo "$PING_OUT"
+        PING_RTT=$(echo "$PING_OUT" | grep -oP 'rtt min/avg/max/mdev = \S+' | sed 's/rtt min\/avg\/max\/mdev = //') || true
+        PING_LOSS=$(echo "$PING_OUT" | grep -oP '\d+% packet loss') || true
+        if echo "$PING_OUT" | grep -q '0% packet loss'; then
+          echo "PING: SUCCESS  rtt=${PING_RTT:-n/a} ms  loss=${PING_LOSS:-n/a}"
+        else
+          echo "PING: FAIL (${PING_LOSS:-100% packet loss})"; exit 1
+        fi
 
         set +e
         echo "=== iperf3 TCP (5s, via gutd) ==="
@@ -151,6 +158,15 @@ jobs:
         echo "UDP: $TUNNEL_UDP  loss: $TUNNEL_UDP_LOSS"
         set -e
 
+        echo "=== QUIC anti-probing (own_http3) ==="
+        QUIC_PROBE_RESULT=FAIL
+        if sudo ip netns exec ns1 python3 tests/probe_quic.py 10.0.0.2 "$PORTS"; then
+          QUIC_PROBE_RESULT=PASS
+          echo "QUIC probe: PASS"
+        else
+          echo "QUIC probe: FAIL (own_http3 did not respond)"
+        fi
+
         # --- Cleanup ---
         sudo kill $G1PID $G2PID 2>/dev/null || true
         sleep 0.3
@@ -168,21 +184,31 @@ jobs:
         echo "========================================"
         echo "  TCP (WireGuard via gutd):  $TUNNEL_TCP"
         echo "  UDP (WireGuard via gutd):  $TUNNEL_UDP  loss: $TUNNEL_UDP_LOSS"
+        echo "  WG ping RTT (ms):          ${PING_RTT:-n/a}"
+        echo "  WG ping loss:              ${PING_LOSS:-n/a}"
+        echo "  QUIC anti-probing:         $QUIC_PROBE_RESULT"
         echo "========================================"
 
         echo "=== ALL TESTS PASSED ==="
 
         # Write to step summary
         echo "## Integration Test Results" >> $GITHUB_STEP_SUMMARY
-        echo "| Proto | Bandwidth | Packet Loss |" >> $GITHUB_STEP_SUMMARY
-        echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
-        echo "| **TCP** | $TUNNEL_TCP | - |" >> $GITHUB_STEP_SUMMARY
-        echo "| **UDP** | $TUNNEL_UDP | $TUNNEL_UDP_LOSS |" >> $GITHUB_STEP_SUMMARY
+        echo "| Metric | Result |" >> $GITHUB_STEP_SUMMARY
+        echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+        echo "| TCP bandwidth | $TUNNEL_TCP |" >> $GITHUB_STEP_SUMMARY
+        echo "| UDP bandwidth | $TUNNEL_UDP |" >> $GITHUB_STEP_SUMMARY
+        echo "| UDP packet loss | $TUNNEL_UDP_LOSS |" >> $GITHUB_STEP_SUMMARY
+        echo "| WG ping RTT (ms) | ${PING_RTT:-n/a} |" >> $GITHUB_STEP_SUMMARY
+        echo "| WG ping loss | ${PING_LOSS:-n/a} |" >> $GITHUB_STEP_SUMMARY
+        echo "| QUIC anti-probing | $QUIC_PROBE_RESULT |" >> $GITHUB_STEP_SUMMARY
 
         # Export for next steps
         echo "TUNNEL_TCP=$TUNNEL_TCP" >> $GITHUB_ENV
         echo "TUNNEL_UDP=$TUNNEL_UDP" >> $GITHUB_ENV
         echo "TUNNEL_UDP_LOSS=$TUNNEL_UDP_LOSS" >> $GITHUB_ENV
+        echo "PING_RTT=$PING_RTT" >> $GITHUB_ENV
+        echo "PING_LOSS=$PING_LOSS" >> $GITHUB_ENV
+        echo "QUIC_PROBE_RESULT=$QUIC_PROBE_RESULT" >> $GITHUB_ENV
 
     - name: Update README with metrics
       if: ${{ inputs.update_readme }}

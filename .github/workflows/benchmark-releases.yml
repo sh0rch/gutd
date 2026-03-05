@@ -16,6 +16,7 @@ jobs:
   benchmark-wgobfs:
     name: Benchmark wg-obfuscator
     runs-on: ubuntu-22.04
+    needs: [benchmark-gutd]
     outputs:
       tcp: ${{ steps.run-test.outputs.WGOBFS_TCP }}
       udp: ${{ steps.run-test.outputs.WGOBFS_UDP }}
@@ -87,13 +88,14 @@ jobs:
 
         set +e
         timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5201 &
-        sleep 0.5
+        sleep 1
         timeout 15 sudo ip netns exec ns1 iperf3 -c 10.200.0.2 -p 5201 -P 4 -t 5 2>&1 | tee /tmp/iperf_tcp.txt || true
         WGOBFS_TCP=$(grep "SUM.*sender" /tmp/iperf_tcp.txt | awk '{print $6, $7}') || true
         [ -z "$WGOBFS_TCP" ] && WGOBFS_TCP=$(grep "sender" /tmp/iperf_tcp.txt | tail -1 | awk '{print $7, $8}') || true
 
+        sleep 2
         timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5202 &
-        sleep 0.5
+        sleep 1
         timeout 15 sudo ip netns exec ns1 iperf3 -c 10.200.0.2 -p 5202 -u -b 2G -t 5 2>&1 | tee /tmp/iperf_udp.txt || true
         WGOBFS_UDP=$(grep "receiver" /tmp/iperf_udp.txt | awk '{print $7, $8}') || true
         WGOBFS_UDP_LOSS=$(grep "receiver" /tmp/iperf_udp.txt | grep -oP '\(\K[^)]+' || echo "?")
@@ -188,13 +190,14 @@ jobs:
 
         set +e
         timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5201 &
-        sleep 0.5
+        sleep 1
         timeout 15 sudo ip netns exec ns1 iperf3 -c 10.200.0.2 -p 5201 -P 4 -t 5 2>&1 | tee /tmp/iperf_tcp.txt || true
         GUTD_TCP=$(grep "SUM.*sender" /tmp/iperf_tcp.txt | awk '{print $6, $7}') || true
         [ -z "$GUTD_TCP" ] && GUTD_TCP=$(grep "sender" /tmp/iperf_tcp.txt | tail -1 | awk '{print $7, $8}') || true
 
+        sleep 2
         timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5202 &
-        sleep 0.5
+        sleep 1
         timeout 15 sudo ip netns exec ns1 iperf3 -c 10.200.0.2 -p 5202 -u -b 2G -t 5 2>&1 | tee /tmp/iperf_udp.txt || true
         GUTD_UDP=$(grep "receiver" /tmp/iperf_udp.txt | awk '{print $7, $8}') || true
         GUTD_UDP_LOSS=$(grep "receiver" /tmp/iperf_udp.txt | grep -oP '\(\K[^)]+' || echo "?")

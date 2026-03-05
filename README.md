@@ -1,16 +1,16 @@
-# gutd - WireGuard Traffic Obfuscator (TC/XDP eBPF)
+# gutd v2 - WireGuard Traffic Obfuscator (TC/XDP eBPF over QUIC)
 
 [![CI](https://github.com/sh0rch/gutd/actions/workflows/ci.yml/badge.svg)](https://github.com/sh0rch/gutd/actions/workflows/ci.yml)
-[![Release](https://github.com/sh0rch/gutd/actions/workflows/release.yml/badge.svg)](https://github.com/sh0rch/gutd/actions/workflows/release.yml)
+[![Release](https://github.com/sh0rch/gutd/actions/workflows/release.yml/badge.svg?event=push)](https://github.com/sh0rch/gutd/actions/workflows/release.yml)
 
 <!-- INTEGRATION_TEST_RESULTS_START -->
 ### Benchmark: gutd vs wg-obfuscator
 | Tool | TCP Bandwidth | UDP Bandwidth | UDP Loss |
 |---|---|---|---|
-| **gutd** ([v2.0.0](https://github.com/sh0rch/gutd/releases/tag/v2.0.0)) | 1.42 Gbits/sec | 1.39 Gbits/sec | 0% |
-| **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | 334 Mbits/sec | 254 Mbits/sec | 70% |
+| **gutd** ([v2.0.0](https://github.com/sh0rch/gutd/releases/tag/v2.0.0)) | 931 Mbits/sec | 900 Mbits/sec | 0% |
+| **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | 339 Mbits/sec | 240 Mbits/sec | 78% |
 
-<sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. [See test logic and full logs](https://github.com/sh0rch/gutd/actions/runs/22704517510). Last updated: 2026-03-05 05:56</i></sub>
+<sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. [See test logic and full logs](https://github.com/sh0rch/gutd/actions/runs/22722112887). Last updated: 2026-03-05 14:20</i></sub>
 <!-- INTEGRATION_TEST_RESULTS_END -->
 
 
