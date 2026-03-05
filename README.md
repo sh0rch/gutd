@@ -468,19 +468,19 @@ See [IMPLEMENTATION.md](IMPLEMENTATION.md) for architecture and implementation d
 This project is part of a lineage of WireGuard traffic obfuscation tools:
 
 ```
- xt_wgobfs  (iptables/netfilter, original concept)
+ xt_wgobfs  (iptables/netfilter, original concept by Wei Chen)
      |
  nf_wgobfs  (nftables/netfilter, userspace)
      |
   gutd       (TC/XDP eBPF, this project)
 ```
 
-- [xt_wgobfs](https://github.com/infinet/xt_wgobfs) - original iptables/xt_tables WireGuard
-  obfuscation module; the idea of in-place WireGuard payload masking originates here.
+**[xt_wgobfs](https://github.com/infinet/xt_wgobfs)** – original iptables/xtables WireGuard obfuscation module created by [Wei Chen](https://github.com/infinet).  
+The idea of in-place masking of WireGuard payloads originates from this project and inspired the work that eventually led to `nf_wgobfs` and later `gutd`.
 
-- [nf_wgobfs](https://github.com/sh0rch/nf_wgobfs) - nftables-based successor;
-  gutd is the natural continuation of that project, migrated to the TC/XDP eBPF
-  datapath for zero-copy kernel-side processing and multi-port striping.
+**[nf_wgobfs](https://github.com/sh0rch/nf_wgobfs)** – nftables-based successor implementing the same concept in userspace.
+
+**gutd** – TC/XDP eBPF implementation that moves packet processing into the kernel datapath and adds more advanced traffic shaping and obfuscation mechanisms.
 
 ## References
 
