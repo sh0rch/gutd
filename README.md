@@ -28,6 +28,23 @@ before passing it up. The XDP program can also optionally mock an HTTP/3 server 
 answering DPI UDP probes directly from the kernel ring buffer.
 The WireGuard process is unaware of gutd.
 
+gutd v2 obfuscates WireGuard UDP traffic using a Linux TC/XDP eBPF datapath.
+It sits transparently between a WireGuard peer and the network. On egress,
+the TC program encapsulates each packet in a fake QUIC Long Header containing
+a fake SNI, adds variable padding, and masks the payload with a ChaCha keystream.
+On ingress, the XDP program removes the QUIC emulation and unmasks the packet
+before passing it up. The XDP program can also optionally mock an HTTP/3 server
+by answering DPI UDP probes directly from the kernel ring buffer.
+The WireGuard process is unaware of gutd.
+
+If QUIC traffic mimicry is not desired and one prefers traffic that looks like
+random UDP garbage (valid packets with checksums but intentionally not matching
+any recognizable protocol, similar to the **GOST-style random-looking traffic**
+used in projects like [xt_wgobfs](https://github.com/infinet/xt_wgobfs)), the earlier implementation **gutd v1.2.0**
+may be more suitable. That version provides the same TC/XDP eBPF datapath but
+uses a simpler obfuscation format producing random-looking UDP noise instead
+of QUIC-style traffic shaping.
+
 ## Features
 
 - Fake QUIC Long Header encapsulation to mimic typical HTTPS/QUIC traffic (gutd v2)
