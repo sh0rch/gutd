@@ -3,6 +3,18 @@ use std::collections::HashSet;
 use std::fs;
 use std::net::IpAddr;
 
+fn parse_hex_key(s: &str) -> Result<[u8; 32]> {
+    if s.len() != 64 {
+        return Err(format!("key hex must be 64 chars, got {}", s.len()).into());
+    }
+    let mut k = [0u8; 32];
+    for i in 0..32 {
+        k[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+            .map_err(|e| format!("invalid hex at byte {i}: {e}"))?;
+    }
+    Ok(k)
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub global: GlobalConfig,
@@ -56,8 +68,141 @@ pub struct RuntimeConfig {
 }
 
 pub fn load_config(path: &str) -> Result<Config> {
-    let content = fs::read_to_string(path)?;
-    parse_config(&content)
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("Cannot read config file '{path}': {e}"))?;
+    parse_config(&content).map_err(|e| format!("Error in config file '{path}': {e}").into())
+}
+
+/// Build a [`Config`] entirely from environment variables — no file needed.
+///
+/// Required:
+/// - `GUTD_PEER_IP`   — remote peer IP address
+/// - `GUTD_BIND_IP`  — local bind IP (use `0.0.0.0` for auto-detect)
+/// - `GUTD_ADDRESS`  — WireGuard tunnel address with prefix (e.g. `10.0.0.1/30`)
+/// - `GUTD_PORTS`    — comma-separated port list (e.g. `41000,41001,41002,41003`)
+/// - `GUTD_KEY`      — 64-char hex key **or** `GUTD_PASSPHRASE` — plain-text passphrase
+///
+/// Optional (with defaults):
+/// - `GUTD_NAME`               — peer name              [default: `gut0`]
+/// - `GUTD_MTU`                — inner MTU               [default: `1492`]
+/// - `GUTD_OUTER_MTU`          — outer/physical MTU      [default: `1500`]
+/// - `GUTD_NIC`                — ingress NIC override    [default: auto-detect]
+/// - `GUTD_DEFAULT_POLICY`     — `allow` or `drop`       [default: `allow`]
+/// - `GUTD_KEEPALIVE_DROP_PCT` — keepalive drop %        [default: `75`]
+/// - `GUTD_OWN_HTTP3`          — `true`/`false`          [default: `true`]
+/// - `GUTD_STATS_INTERVAL`     — stats interval seconds  [default: `5`]
+/// - `GUTD_STAT_FILE`          — stat file path          [default: `/run/gutd.stat`]
+pub fn load_config_from_env() -> Result<Config> {
+    let getenv = |name: &str| -> Result<String> {
+        std::env::var(name).map_err(|_| format!("Required env var {name} is not set").into())
+    };
+
+    let peer_ip: IpAddr = getenv("GUTD_PEER_IP")?
+        .parse()
+        .map_err(|e| format!("GUTD_PEER_IP: invalid IP address: {e}"))?;
+
+    let bind_ip: IpAddr = getenv("GUTD_BIND_IP")?
+        .parse()
+        .map_err(|e| format!("GUTD_BIND_IP: invalid IP address: {e}"))?;
+
+    let address = getenv("GUTD_ADDRESS")?;
+
+    let ports_str = getenv("GUTD_PORTS")?;
+    let ports: Vec<u16> = ports_str
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<u16>()
+                .map_err(|e| format!("GUTD_PORTS: invalid port '{s}': {e}"))
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    if ports.is_empty() {
+        return Err("GUTD_PORTS must not be empty".into());
+    }
+    for p in &ports {
+        if *p == 0 {
+            return Err("GUTD_PORTS: port 0 is not allowed".into());
+        }
+    }
+
+    let key: [u8; 32] = if let Ok(hex) = std::env::var("GUTD_KEY")
+        .or_else(|_| std::env::var("GUTD_SECRET"))
+        .or_else(|_| std::env::var("GUTD_CIPHER"))
+    {
+        parse_hex_key(hex.trim()).map_err(|e| format!("GUTD_KEY: {e}"))?
+    } else if let Ok(phrase) =
+        std::env::var("GUTD_PASSPHRASE").or_else(|_| std::env::var("GUTD_PHRASE"))
+    {
+        let k = crate::crypto::derive_key(&phrase);
+        eprintln!("Key derived from passphrase via HKDF-SHA256");
+        k
+    } else {
+        return Err(
+            "Either GUTD_KEY/GUTD_CIPHER (64-char hex) or GUTD_PASSPHRASE/GUTD_PHRASE must be set"
+                .into(),
+        );
+    };
+
+    let name = std::env::var("GUTD_NAME").unwrap_or_else(|_| "gut0".to_string());
+    let mtu: u16 = std::env::var("GUTD_MTU")
+        .unwrap_or_else(|_| "1492".to_string())
+        .parse()
+        .map_err(|e| format!("GUTD_MTU: {e}"))?;
+    let outer_mtu: u16 = std::env::var("GUTD_OUTER_MTU")
+        .unwrap_or_else(|_| "1500".to_string())
+        .parse()
+        .map_err(|e| format!("GUTD_OUTER_MTU: {e}"))?;
+    let nic: Option<String> = std::env::var("GUTD_NIC")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let default_policy = match std::env::var("GUTD_DEFAULT_POLICY")
+        .unwrap_or_else(|_| "allow".to_string())
+        .as_str()
+    {
+        "allow" | "pass" => XdpDefaultPolicy::Allow,
+        "drop" => XdpDefaultPolicy::Drop,
+        other => {
+            return Err(format!(
+                "GUTD_DEFAULT_POLICY: unknown value '{other}', expected allow|drop"
+            )
+            .into())
+        }
+    };
+    let keepalive_drop_percent: u8 = std::env::var("GUTD_KEEPALIVE_DROP_PCT")
+        .unwrap_or_else(|_| "75".to_string())
+        .parse()
+        .map_err(|e| format!("GUTD_KEEPALIVE_DROP_PCT: {e}"))?;
+    let own_http3 = std::env::var("GUTD_OWN_HTTP3")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(true);
+    let stats_interval: u32 = std::env::var("GUTD_STATS_INTERVAL")
+        .unwrap_or_else(|_| "5".to_string())
+        .parse()
+        .map_err(|e| format!("GUTD_STATS_INTERVAL: {e}"))?;
+    let stat_file =
+        std::env::var("GUTD_STAT_FILE").unwrap_or_else(|_| "/run/gutd.stat".to_string());
+
+    Ok(Config {
+        global: GlobalConfig { outer_mtu },
+        runtime: RuntimeConfig {
+            stats_interval,
+            stat_file,
+        },
+        peers: vec![PeerConfig {
+            name,
+            mtu,
+            nic,
+            default_policy,
+            address,
+            bind_ip,
+            peer_ip,
+            ports,
+            key,
+            keepalive_drop_percent,
+            outer_mtu,
+            own_http3,
+        }],
+    })
 }
 
 // ── Per-peer accumulator used while parsing ───────────────────────────────────
@@ -237,19 +382,7 @@ fn parse_config(content: &str) -> Result<Config> {
                             b.ports = Some(parsed);
                         }
                         "key" => {
-                            let hex_str = value.trim();
-                            if hex_str.len() != 64 {
-                                return Err(format!(
-                                    "Key must be 64 hex chars, got {}",
-                                    hex_str.len()
-                                )
-                                .into());
-                            }
-                            let mut key_bytes = [0u8; 32];
-                            for i in 0..32 {
-                                key_bytes[i] = u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16)?;
-                            }
-                            b.key = Some(key_bytes);
+                            b.key = Some(parse_hex_key(value.trim())?);
                         }
                         "passphrase" => {
                             b.passphrase = Some(value.trim_matches('"').to_string());

@@ -70,14 +70,14 @@ echo "Building static musl binary in Docker (volume-mount, target=$TARGET)..."
 
 if [ "$FORCE_REBUILD" -eq 1 ] || ! docker_exec image inspect "$IMAGE" >/dev/null 2>&1; then
     LOG_FILE="$(mktemp)"
-    if ! docker_exec build --build-arg RUST_TARGET="$TARGET" --target toolchain -t "$IMAGE" -f docker/Dockerfile . 2>&1 | tee "$LOG_FILE"; then
+    if ! docker_exec build --build-arg RUST_TARGET="$TARGET" --target toolchain -t "$IMAGE" -f docker/Dockerfile.x86_64 . 2>&1 | tee "$LOG_FILE"; then
         if grep -Eiq 'error getting credentials|docker-credential|credstore|credhelpers|desktop\.exe|exec format error' "$LOG_FILE"; then
             echo ""
             echo "Detected broken Docker credential helper in current Docker config."
             echo "Retrying build with isolated DOCKER_CONFIG (anonymous pulls for public images)..."
             DOCKER_CONFIG_DIR="$(mktemp -d)"
             printf '{}\n' > "$DOCKER_CONFIG_DIR/config.json"
-            docker_exec build --build-arg RUST_TARGET="$TARGET" --target toolchain -t "$IMAGE" -f docker/Dockerfile .
+            docker_exec build --build-arg RUST_TARGET="$TARGET" --target toolchain -t "$IMAGE" -f docker/Dockerfile.x86_64 .
         else
             exit 1
         fi

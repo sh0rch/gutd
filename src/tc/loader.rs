@@ -26,6 +26,10 @@
 //! - Read statistics from BPF maps
 
 use crate::config::Config;
+use crate::netlink::{
+    get_ifindex, hex16, link_set_gso_max_size, lookup_arp_cache, lookup_ndp_cache,
+    probe_neighbor_udp, read_gso_max_size, read_mac, read_mtu,
+};
 use crate::tc::maps::{
     GutConfig, GutStats, DEFAULT_INNER_MTU, GUT_FLAG_NEED_L4_CSUM, OUTER_OVERHEAD_IPV4,
     OUTER_OVERHEAD_IPV6,
@@ -311,7 +315,12 @@ impl TcBpfManager {
         let tun_ifindex = Self::get_ifindex(ifname)?;
         let ingress_ifindex = Self::get_ifindex(&ingress_ifname)?;
         let gut_config = Self::build_gut_config(config, ifname, &ingress_ifname)?;
-        let gso_target = u32::from(config.peer().mtu);
+        // gso_max_size = max total WireGuard packet (IP+UDP+WG_data) through gut0.
+        // GUT TC BPF only *inserts* the 14-byte QUIC Short Header — the existing
+        // WireGuard IP+UDP headers are moved back in-place (same size, rewritten).
+        // So the net wire overhead is just +14 bytes, and gso_max_size must be:
+        //   inner_mtu_v4 (max WG UDP payload) + IP_HDR(20) + UDP_HDR(8) = 1466
+        let gso_target = u32::from(gut_config.inner_mtu_v4) + 20 + 8;
         Self::set_iface_gso_max_size(ifname, gso_target);
         Self::set_iface_gso_max_size(&veth_xdp_name, gso_target);
         eprintln!(
@@ -442,13 +451,7 @@ impl TcBpfManager {
 
     #[cfg(target_os = "linux")]
     fn get_ifindex(ifname: &str) -> Result<i32> {
-        use std::ffi::CString;
-        let c_ifname = CString::new(ifname)?;
-        let ifindex = unsafe { libc::if_nametoindex(c_ifname.as_ptr()) };
-        if ifindex == 0 {
-            return Err(format!("Interface {ifname} not found").into());
-        }
-        Ok(ifindex.cast_signed())
+        get_ifindex(ifname)
     }
 
     #[cfg(target_os = "linux")]
@@ -480,123 +483,94 @@ impl TcBpfManager {
     }
 
     #[cfg(target_os = "linux")]
-    fn parse_mac(mac: &str) -> Result<[u8; 6]> {
-        let mut out = [0u8; 6];
-        let parts: Vec<&str> = mac.split(':').collect();
-        if parts.len() != 6 {
-            return Err(format!("Invalid MAC format: {mac}").into());
-        }
-        for (idx, part) in parts.iter().enumerate() {
-            out[idx] = u8::from_str_radix(part, 16)?;
-        }
-        Ok(out)
-    }
-
-    #[cfg(target_os = "linux")]
     fn read_iface_mac(ifname: &str) -> Result<[u8; 6]> {
-        let path = format!("/sys/class/net/{ifname}/address");
-        let mac = std::fs::read_to_string(path)?;
-        Self::parse_mac(mac.trim())
+        read_mac(ifname)
     }
 
     #[cfg(target_os = "linux")]
     fn read_iface_mtu(ifname: &str) -> Result<u16> {
-        let path = format!("/sys/class/net/{ifname}/mtu");
-        let mtu = std::fs::read_to_string(path)?;
-        Ok(mtu.trim().parse::<u16>()?)
+        read_mtu(ifname)
     }
 
     #[cfg(target_os = "linux")]
     fn read_iface_gso_max_size(ifname: &str) -> Result<u32> {
-        let path = format!("/sys/class/net/{ifname}/gso_max_size");
-        let size = std::fs::read_to_string(path)?;
-        Ok(size.trim().parse::<u32>()?)
+        read_gso_max_size(ifname)
     }
 
     #[cfg(target_os = "linux")]
     fn set_iface_gso_max_size(ifname: &str, gso_max_size: u32) {
-        let _ = std::process::Command::new("ip")
-            .args([
-                "link",
-                "set",
-                "dev",
-                ifname,
-                "gso_max_size",
-                &gso_max_size.to_string(),
-            ])
-            .status();
+        link_set_gso_max_size(ifname, gso_max_size);
     }
 
     #[cfg(target_os = "linux")]
     fn default_route_ifname() -> Option<String> {
-        use std::process::Command;
-
-        let output = Command::new("ip")
-            .args(["route", "show", "default"])
-            .output()
-            .ok()?;
-
-        if !output.status.success() {
-            return None;
+        // Parse /proc/net/route — no subprocess needed.
+        // Fields: Iface Dest GW Flags RefCnt Use Metric Mask ...
+        // Default route: Dest=00000000, Mask=00000000, RTF_UP(0x1)|RTF_GATEWAY(0x2).
+        // IMPORTANT: use `let...else { continue }`, NOT `?`, inside the loop —
+        // `?` would return None from the *function* on any malformed line.
+        let content = std::fs::read_to_string("/proc/net/route").ok()?;
+        let mut best: Option<(u32, String)> = None; // (metric, ifname)
+        for line in content.lines().skip(1) {
+            let mut f = line.split_whitespace();
+            let Some(iface) = f.next() else { continue };
+            let Some(dest) = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else {
+                continue;
+            };
+            f.next(); // GW
+            let Some(flags) = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else {
+                continue;
+            };
+            f.next();
+            f.next(); // RefCnt, Use
+            let Some(metric) = f.next().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            let Some(mask) = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else {
+                continue;
+            };
+            if dest == 0 && mask == 0 && (flags & 0x0003) == 0x0003 {
+                if best.as_ref().map_or(true, |(m, _)| metric < *m) {
+                    best = Some((metric, iface.to_string()));
+                }
+            }
         }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let line = stdout.lines().next()?;
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        if let Some(dev_idx) = cols.iter().position(|&c| c == "dev") {
-            return cols.get(dev_idx + 1).map(|s| (*s).to_string());
-        }
-        None
+        best.map(|(_, iface)| iface)
     }
 
+    /// Resolve routing info for `peer_ip` without any external binaries.
+    ///
+    /// - **src**: UDP `connect()` + `getsockname()` — the kernel picks the right source IP.
+    /// - **dev**: parsed from `/proc/net/route` (IPv4) or `/proc/net/ipv6_route` (IPv6).
+    /// - **via**: parsed from `/proc/net/route` (IPv4 gateway) or `/proc/net/ipv6_route` (IPv6 nexthop).
+    /// - **mtu**: read from `/sys/class/net/<dev>/mtu` when dev is known.
     #[cfg(target_os = "linux")]
     fn route_get_info(peer_ip: std::net::IpAddr) -> Result<RouteGetInfo> {
-        use std::process::Command;
+        use std::net::{IpAddr, SocketAddr, UdpSocket};
 
-        let mut cmd = Command::new("ip");
-        match peer_ip {
-            std::net::IpAddr::V4(_) => {
-                cmd.args(["-4", "route", "get", &peer_ip.to_string()]);
-            }
-            std::net::IpAddr::V6(_) => {
-                cmd.args(["-6", "route", "get", &peer_ip.to_string()]);
-            }
-        }
+        // ── 1. Resolve source IP via UDP connect trick ──────────────────────
+        let src: Option<IpAddr> = (|| {
+            let bind_addr: SocketAddr = match peer_ip {
+                IpAddr::V4(_) => "0.0.0.0:0".parse().ok()?,
+                IpAddr::V6(_) => "[::]:0".parse().ok()?,
+            };
+            let sock = UdpSocket::bind(bind_addr).ok()?;
+            sock.connect(SocketAddr::new(peer_ip, 1)).ok()?;
+            Some(sock.local_addr().ok()?.ip())
+        })();
 
-        let output = cmd
-            .output()
-            .map_err(|e| format!("Failed to run 'ip route get': {e}"))?;
+        // ── 2. Look up dev + via from /proc ─────────────────────────────────
+        let (dev, via, mtu) = match peer_ip {
+            IpAddr::V4(target_v4) => Self::proc_route_lookup_v4(target_v4),
+            IpAddr::V6(target_v6) => Self::proc_route_lookup_v6(target_v6),
+        };
 
-        if !output.status.success() {
-            return Err(format!("'ip route get {}' failed", peer_ip).into());
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let first_line = stdout.lines().next().unwrap_or_default().trim().to_string();
-        if first_line.is_empty() {
-            return Err(format!("Empty output from 'ip route get {peer_ip}'").into());
-        }
-
-        let cols: Vec<&str> = first_line.split_whitespace().collect();
-        let dev = cols
-            .iter()
-            .position(|&c| c == "dev")
-            .and_then(|idx| cols.get(idx + 1).map(|s| (*s).to_string()));
-        let via = cols
-            .iter()
-            .position(|&c| c == "via")
-            .and_then(|idx| cols.get(idx + 1))
-            .and_then(|s| s.parse().ok());
-        let src = cols
-            .iter()
-            .position(|&c| c == "src")
-            .and_then(|idx| cols.get(idx + 1))
-            .and_then(|s| s.parse().ok());
-        let mtu = cols
-            .iter()
-            .position(|&c| c == "mtu")
-            .and_then(|idx| cols.get(idx + 1))
-            .and_then(|s| s.parse().ok());
+        let first_line = format!(
+            "{} dev {} src {}",
+            peer_ip,
+            dev.as_deref().unwrap_or("?"),
+            src.map_or_else(|| "?".to_string(), |s| s.to_string())
+        );
 
         Ok(RouteGetInfo {
             first_line,
@@ -605,6 +579,131 @@ impl TcBpfManager {
             src,
             mtu,
         })
+    }
+
+    /// Read `/proc/net/route` and find the best (longest-prefix) match for `target`.
+    /// Returns `(dev, via, mtu)`.
+    ///
+    /// `/proc/net/route` stores addresses as hex of the raw `__be32` kernel value.
+    /// On LE this prints as NE bytes; `u32::to_ne_bytes()` recovers the IP octets.
+    #[cfg(target_os = "linux")]
+    fn proc_route_lookup_v4(
+        target: std::net::Ipv4Addr,
+    ) -> (Option<String>, Option<std::net::IpAddr>, Option<u16>) {
+        let Ok(content) = std::fs::read_to_string("/proc/net/route") else {
+            return (None, None, None);
+        };
+        let nt = u32::from_ne_bytes(target.octets());
+        let mut best_plen = -1i32;
+        let mut best_dev: Option<String> = None;
+        let mut best_gw: Option<std::net::Ipv4Addr> = None;
+        for line in content.lines().skip(1) {
+            let mut f = line.split_whitespace();
+            let Some(dev) = f.next() else { continue };
+            let Some(dest) = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else {
+                continue;
+            };
+            let Some(gw) = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else {
+                continue;
+            };
+            let Some(flags) = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else {
+                continue;
+            };
+            for _ in 0..3 {
+                f.next();
+            } // RefCnt, Use, Metric
+            let Some(mask) = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else {
+                continue;
+            };
+            if flags & 1 == 0 || nt & mask != dest {
+                continue;
+            }
+            let plen = mask.count_ones() as i32;
+            if plen > best_plen {
+                best_plen = plen;
+                best_dev = Some(dev.to_string());
+                // gw is a NE-hex u32; to_ne_bytes() gives IP octets in the right order.
+                best_gw = if gw != 0 {
+                    Some(std::net::Ipv4Addr::from(gw.to_ne_bytes()))
+                } else {
+                    None
+                };
+            }
+        }
+        let mtu = best_dev.as_deref().and_then(|d| {
+            std::fs::read_to_string(format!("/sys/class/net/{d}/mtu"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        });
+        (best_dev, best_gw.map(std::net::IpAddr::V4), mtu)
+    }
+
+    /// Read `/proc/net/ipv6_route` and find the best prefix match for `target`.
+    /// Returns `(dev, via, mtu)`.
+    ///
+    /// Format (no header): dest_net/32hex prefix/2hex src_net src_prefix nexthop/32hex
+    ///                     metric refcnt use flags/8hex iface
+    #[cfg(target_os = "linux")]
+    fn proc_route_lookup_v6(
+        target: std::net::Ipv6Addr,
+    ) -> (Option<String>, Option<std::net::IpAddr>, Option<u16>) {
+        let Ok(content) = std::fs::read_to_string("/proc/net/ipv6_route") else {
+            return (None, None, None);
+        };
+        let to = target.octets();
+        let mut best_plen = -1i32;
+        let mut best_dev: Option<String> = None;
+        let mut best_nh: Option<std::net::Ipv6Addr> = None;
+        for line in content.lines() {
+            let c: Vec<&str> = line.split_whitespace().collect();
+            if c.len() < 10 {
+                continue;
+            }
+            let Some(dest_b) = hex16(c[0]) else { continue };
+            let Ok(plen) = u8::from_str_radix(c[1], 16) else {
+                continue;
+            };
+            let Ok(flags) = u32::from_str_radix(c[8], 16) else {
+                continue;
+            };
+            if flags & 1 == 0 || plen > 128 {
+                continue;
+            }
+            // Prefix match: full bytes then partial byte
+            let fb = (plen / 8) as usize;
+            let rb = plen % 8;
+            if to[..fb] != dest_b[..fb] {
+                continue;
+            }
+            if rb > 0 {
+                let m = 0xFFu8 << (8 - rb);
+                if to[fb] & m != dest_b[fb] & m {
+                    continue;
+                }
+            }
+            if plen as i32 > best_plen {
+                best_plen = plen as i32;
+                best_dev = Some(c[9].to_string());
+                best_nh = hex16(c[4]).and_then(|b| {
+                    let v = std::net::Ipv6Addr::from(b);
+                    if v.is_unspecified() {
+                        None
+                    } else {
+                        Some(v)
+                    }
+                });
+            }
+        }
+        let mtu = best_dev.as_deref().and_then(|d| {
+            std::fs::read_to_string(format!("/sys/class/net/{d}/mtu"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        });
+        (best_dev, best_nh.map(std::net::IpAddr::V6), mtu)
     }
 
     #[cfg(target_os = "linux")]
@@ -652,62 +751,266 @@ impl TcBpfManager {
     }
 
     #[cfg(target_os = "linux")]
+    /// Send a single ICMP/ICMPv6 echo request to warm up the neighbor cache.
+    /// Uses raw sockets via libc — no external binary needed.
+    /// Failures are silently ignored (best-effort ARP/NDP probe).
     fn try_probe_neighbor(ip: std::net::IpAddr, ifname: &str) {
-        use std::process::{Command, Stdio};
-
         match ip {
             std::net::IpAddr::V4(ipv4) => {
-                let _ = Command::new("ping")
-                    .args(["-c", "1", "-W", "1", "-I", ifname, &ipv4.to_string()])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+                Self::probe_icmp4(ipv4, ifname);
             }
             std::net::IpAddr::V6(ipv6) => {
-                let _ = Command::new("ping")
-                    .args(["-6", "-c", "1", "-W", "1", "-I", ifname, &ipv6.to_string()])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+                Self::probe_icmp6(ipv6, ifname);
             }
         }
     }
 
+    fn probe_icmp4(dst: std::net::Ipv4Addr, ifname: &str) {
+        use std::ffi::CString;
+        unsafe {
+            let sock = libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP);
+            if sock < 0 {
+                return;
+            }
+            // Bind to interface
+            if let Ok(ifname_c) = CString::new(ifname) {
+                libc::setsockopt(
+                    sock,
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
+                    ifname_c.as_ptr() as *const libc::c_void,
+                    (ifname.len() + 1) as libc::socklen_t,
+                );
+            }
+            // Build minimal ICMP echo request (8 bytes)
+            // type=8 code=0 checksum id=1 seq=1
+            let mut pkt = [0u8; 8];
+            pkt[0] = 8; // ICMP_ECHO
+            pkt[6] = 0;
+            pkt[7] = 1; // seq=1
+                        // checksum
+            let sum = Self::icmp_checksum(&pkt);
+            pkt[2] = (sum >> 8) as u8;
+            pkt[3] = (sum & 0xff) as u8;
+            let octets = dst.octets();
+            let dst_addr = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: 0,
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(octets),
+                },
+                sin_zero: [0; 8],
+            };
+            libc::sendto(
+                sock,
+                pkt.as_ptr() as *const libc::c_void,
+                pkt.len(),
+                libc::MSG_DONTWAIT,
+                &raw const dst_addr as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            libc::close(sock);
+        }
+    }
+
+    fn probe_icmp6(dst: std::net::Ipv6Addr, ifname: &str) {
+        use std::ffi::CString;
+        unsafe {
+            let sock = libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_ICMPV6);
+            if sock < 0 {
+                return;
+            }
+            if let Ok(ifname_c) = CString::new(ifname) {
+                libc::setsockopt(
+                    sock,
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
+                    ifname_c.as_ptr() as *const libc::c_void,
+                    (ifname.len() + 1) as libc::socklen_t,
+                );
+            }
+            // ICMPv6 echo request — kernel computes checksum for SOCK_RAW+ICMPV6
+            // type=128 code=0 checksum=0 id=1 seq=1
+            let pkt = [128u8, 0, 0, 0, 0, 1, 0, 1];
+            let octets = dst.octets();
+            let dst_addr = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: 0,
+                sin6_flowinfo: 0,
+                sin6_addr: libc::in6_addr { s6_addr: octets },
+                sin6_scope_id: 0,
+            };
+            libc::sendto(
+                sock,
+                pkt.as_ptr() as *const libc::c_void,
+                pkt.len(),
+                libc::MSG_DONTWAIT,
+                &raw const dst_addr as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            );
+            libc::close(sock);
+        }
+    }
+
+    fn icmp_checksum(data: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        let mut i = 0;
+        while i + 1 < data.len() {
+            sum += u32::from(u16::from_be_bytes([data[i], data[i + 1]]));
+            i += 2;
+        }
+        if i < data.len() {
+            sum += u32::from(data[i]) << 8;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
     #[cfg(target_os = "linux")]
     fn resolve_peer_mac(peer_ip: std::net::IpAddr, ifname: &str) -> Result<[u8; 6]> {
-        use std::process::Command;
         let l2_ip = Self::resolve_l2_peer_ip(peer_ip, ifname).unwrap_or(peer_ip);
 
-        for attempt in 0..5 {
-            // Use `ip neigh show` which works for both IPv4 (ARP) and IPv6 (NDP)
-            let output = Command::new("ip")
-                .args(["neigh", "show", &l2_ip.to_string(), "dev", ifname])
-                .output()
-                .map_err(|e| format!("Failed to run 'ip neigh': {e}"))?;
-
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Format: "<ip> dev <iface> lladdr <mac> <state>"
-            for line in stdout.lines() {
-                let cols: Vec<&str> = line.split_whitespace().collect();
-                if let Some(idx) = cols.iter().position(|&c| c == "lladdr") {
-                    if let Some(mac_str) = cols.get(idx + 1) {
-                        return Self::parse_mac(mac_str);
-                    }
-                }
+        // Probe every 2 attempts to avoid flooding, retry for up to ~2 s total.
+        for attempt in 0..6 {
+            let mac = match l2_ip {
+                std::net::IpAddr::V4(v4) => Self::lookup_arp_cache(v4, ifname),
+                std::net::IpAddr::V6(v6) => Self::lookup_ndp_cache(v6, ifname),
+            };
+            if let Some(mac) = mac {
+                return Ok(mac);
             }
 
-            if attempt == 0 {
-                // Cold neighbor cache on boot/startup is common; actively probe once.
+            if attempt % 2 == 0 {
+                // UDP connect triggers kernel ARP/NDP without requiring NET_RAW.
+                probe_neighbor_udp(l2_ip, ifname);
+                // Also try raw ICMP as a secondary probe (best-effort).
                 Self::try_probe_neighbor(l2_ip, ifname);
             }
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+
+        // Fallback: ARP/NDP resolution failed (common in L3-routed environments like
+        // RouterOS where containers are on separate veths without a shared L2 bridge).
+        // The actual next-hop is the default gateway — use its MAC instead.
+        let peer_v4 = if let std::net::IpAddr::V4(v4) = l2_ip { Some(v4) } else { None };
+        if let Some(gw_mac) = Self::resolve_default_gateway_mac(ifname, peer_v4) {
+            eprintln!(
+                "  ARP for {l2_ip} (peer {peer_ip}) failed; using default gateway MAC \
+                 {:02x?} on {ifname}",
+                gw_mac
+            );
+            return Ok(gw_mac);
         }
 
         Err(format!(
             "No neighbor entry for route next-hop {l2_ip} (peer {peer_ip}) on interface {ifname}. \
-            Check route with: ip route get {peer_ip}"
+            Hint: check /proc/net/arp or /proc/net/if_inet6 on the host."
         )
         .into())
+    }
+
+    /// Resolve the default gateway MAC on `ifname`.
+    /// Used as fallback when direct ARP fails in L3-routed environments.
+    ///
+    /// `peer_hint` — a peer IPv4 address used as the TTL-probe packet destination.
+    /// Providing it improves reliability in environments where ARP is suppressed.
+    #[cfg(target_os = "linux")]
+    fn resolve_default_gateway_mac(
+        ifname: &str,
+        peer_hint: Option<std::net::Ipv4Addr>,
+    ) -> Option<[u8; 6]> {
+        // Read default gateway from /proc/net/route (dest=0, mask=0, gw!=0).
+        //
+        // IMPORTANT: all `?` inside the `for` loop would return `None` from the
+        // whole function on any parse error (e.g., empty trailing line).  Use
+        // `let Some(...) = ... else { continue }` everywhere inside the loop.
+        let Ok(content) = std::fs::read_to_string("/proc/net/route") else {
+            eprintln!("  [gw-mac] /proc/net/route not readable");
+            return None;
+        };
+        let mut gw_exact: Option<std::net::Ipv4Addr> = None; // matches ifname
+        let mut gw_any:   Option<std::net::Ipv4Addr> = None; // any interface
+        for line in content.lines().skip(1) {
+            let mut f = line.split_whitespace();
+            let Some(iface) = f.next()                                         else { continue };
+            let Some(dest)  = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else { continue };
+            let Some(gw)    = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else { continue };
+            let Some(flags) = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else { continue };
+            for _ in 0..3 { f.next(); } // skip RefCnt, Use, Metric
+            let Some(mask)  = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else { continue };
+            // Default route: dest=0/0, GATEWAY flag (0x2) + UP flag (0x1) set, gw != 0
+            if dest == 0 && mask == 0 && flags & 0x3 == 0x3 && gw != 0 {
+                let ip = std::net::Ipv4Addr::from(gw.to_ne_bytes());
+                if iface == ifname {
+                    gw_exact = Some(ip);
+                    break; // exact interface match — stop searching
+                } else if gw_any.is_none() {
+                    gw_any = Some(ip); // keep as fallback
+                }
+            }
+        }
+        let gw = match gw_exact.or(gw_any) {
+            Some(ip) => ip,
+            None => {
+                eprintln!("  [gw-mac] no default gateway found in /proc/net/route for {ifname}");
+                return None;
+            }
+        };
+        eprintln!("  [gw-mac] probing gateway {gw} on {ifname}");
+        // Method 1: ARP Request + receive reply directly via AF_PACKET.
+        // Works even when /proc/net/arp and RTM_GETNEIGH are empty (RouterOS containers).
+        if let Some(mac) = crate::netlink::arp_request_reply(gw, ifname) {
+            eprintln!("  [gw-mac] gateway MAC resolved via ARP reply: {:02x?}", mac);
+            return Some(mac);
+        }
+        // Method 2: TTL=1 IP probe via AF_PACKET → read MAC from ICMP TTL-Exceeded reply.
+        // Bypasses ARP entirely — useful when the gateway silently ignores ARP requests
+        // (e.g. RouterOS bridges with ARP suppression or proxy ARP on the host side).
+        // We send a broadcast-MAC UDP frame (TTL=1) to `probe_dst_ip`; the gateway
+        // forwards it, hits TTL=0, and sends ICMP back — revealing its own L2 MAC.
+        let probe_dst = peer_hint.unwrap_or_else(|| {
+            // No peer hint — pick an address in the same /24 that the gateway
+            // is unlikely to be itself, so the frame is actually forwarded.
+            let [a, b, c, _] = gw.octets();
+            std::net::Ipv4Addr::new(a, b, c, 200)
+        });
+        if let Some(mac) = crate::netlink::resolve_mac_via_ttl_probe(gw, probe_dst, ifname) {
+            eprintln!("  [gw-mac] gateway MAC resolved via TTL probe: {:02x?}", mac);
+            return Some(mac);
+        }
+        // Method 3: UDP-triggered kernel ARP + RTM_GETNEIGH.
+        // Used when CAP_NET_RAW is absent (AF_PACKET unavailable).
+        let gw_addr = std::net::IpAddr::V4(gw);
+        for _ in 0..8 {
+            if let Some(mac) = lookup_arp_cache(gw, ifname) {
+                return Some(mac);
+            }
+            probe_neighbor_udp(gw_addr, ifname);
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        // Diagnostic: dump /proc/net/arp to help understand why lookup failed
+        match std::fs::read_to_string("/proc/net/arp") {
+            Ok(arp) if !arp.trim().is_empty() => {
+                eprintln!("  [gw-mac] /proc/net/arp:\n{arp}");
+            }
+            _ => eprintln!("  [gw-mac] /proc/net/arp: empty or unreadable"),
+        }
+        eprintln!("  [gw-mac] ARP for gateway {gw} on {ifname} failed after retries");
+        None
+    }
+
+    /// Look up an IPv4 MAC from the kernel ARP cache.
+    #[cfg(target_os = "linux")]
+    fn lookup_arp_cache(ip: std::net::Ipv4Addr, ifname: &str) -> Option<[u8; 6]> {
+        lookup_arp_cache(ip, ifname)
+    }
+
+    /// Look up an IPv6 neighbor MAC via RTM_GETNEIGH netlink.
+    #[cfg(target_os = "linux")]
+    fn lookup_ndp_cache(ip: std::net::Ipv6Addr, ifname: &str) -> Option<[u8; 6]> {
+        lookup_ndp_cache(ip, ifname)
     }
 
     #[cfg(target_os = "linux")]

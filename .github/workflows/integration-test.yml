@@ -40,7 +40,7 @@ jobs:
       run: |
         set -e
         GUTD=/tmp/bin/gutd-x86_64
-        KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        KEY=$(openssl rand -hex 32)
         PORTS="41000"
 
         # Mount bpffs if needed

@@ -97,6 +97,20 @@ The musl build requires Docker (libbpf-sys cannot be cross-compiled with plain m
 
 The resulting binary is at `target/musl/gutd`.
 
+### Cross-compile for Foreign Architectures
+
+aarch64 and other static binary build also possible with musl, but requires a cross-compilation toolchain and kernel headers for the target architecture. The easiest way to get these is with `cross`, which provides pre-built toolchains and QEMU emulation for testing.
+
+Requires [`cross`](https://github.com/cross-rs/cross):
+
+```bash
+cargo install cross --git https://github.com/cross-rs/cross
+
+# Build aarch64 static binary
+cross build --release --target aarch64-unknown-linux-musl
+cp target/aarch64-unknown-linux-musl/release/gutd dist/gutd-arm64
+```
+
 See [METRICS.md](METRICS.md) for counter descriptions.
 
 ## Configuration
