@@ -1,7 +1,8 @@
 pub mod config;
 pub mod crypto;
 pub mod installer;
-pub mod metrics;
+#[cfg(target_os = "linux")]
+pub mod netlink;
 pub mod proto;
 pub mod reload;
 #[cfg(target_os = "linux")]

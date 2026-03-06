@@ -39,7 +39,7 @@ jobs:
       id: run-test
       run: |
         set -ex
-        KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        KEY=$(openssl rand -hex 32)
         PORTS="41000"
         WG_OBFS="/usr/local/bin/wg-obfuscator"
 
@@ -135,7 +135,7 @@ jobs:
       id: run-test
       run: |
         set -ex
-        KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        KEY=$(openssl rand -hex 32)
         PORTS="41000"
         GUTD="/usr/local/bin/gutd"
 
