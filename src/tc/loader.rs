@@ -529,10 +529,12 @@ impl TcBpfManager {
             let Some(mask) = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else {
                 continue;
             };
-            if dest == 0 && mask == 0 && (flags & 0x0003) == 0x0003 {
-                if best.as_ref().map_or(true, |(m, _)| metric < *m) {
-                    best = Some((metric, iface.to_string()));
-                }
+            if dest == 0
+                && mask == 0
+                && (flags & 0x0003) == 0x0003
+                && best.as_ref().is_none_or(|(m, _)| metric < *m)
+            {
+                best = Some((metric, iface.to_string()));
             }
         }
         best.map(|(_, iface)| iface)
@@ -559,11 +561,14 @@ impl TcBpfManager {
             Some(sock.local_addr().ok()?.ip())
         })();
 
-        // ── 2. Look up dev + via from /proc ─────────────────────────────────
-        let (dev, via, mtu) = match peer_ip {
-            IpAddr::V4(target_v4) => Self::proc_route_lookup_v4(target_v4),
-            IpAddr::V6(target_v6) => Self::proc_route_lookup_v6(target_v6),
-        };
+        // ── 2. Look up dev + via using Netlink (RTM_GETROUTE) ───────────────
+        let (dev, via, mtu) = crate::netlink::nl_get_route(peer_ip).unwrap_or_else(|| {
+            // Fallback to /proc/net/route if netlink fails
+            match peer_ip {
+                IpAddr::V4(target_v4) => Self::proc_route_lookup_v4(target_v4),
+                IpAddr::V6(target_v6) => Self::proc_route_lookup_v6(target_v6),
+            }
+        });
 
         let first_line = format!(
             "{} dev {} src {}",
@@ -881,6 +886,20 @@ impl TcBpfManager {
 
         // Probe every 2 attempts to avoid flooding, retry for up to ~2 s total.
         for attempt in 0..6 {
+            // First, actively try to get a response directly via ARP request (bypassing caches)
+            match l2_ip {
+                std::net::IpAddr::V4(v4) => {
+                    if let Some(mac) = crate::netlink::arp_request_reply(v4, ifname) {
+                        return Ok(mac);
+                    }
+                }
+                std::net::IpAddr::V6(v6) => {
+                    if let Some(mac) = crate::netlink::ndp_request_reply(v6, ifname) {
+                        return Ok(mac);
+                    }
+                }
+            }
+
             let mac = match l2_ip {
                 std::net::IpAddr::V4(v4) => Self::lookup_arp_cache(v4, ifname),
                 std::net::IpAddr::V6(v6) => Self::lookup_ndp_cache(v6, ifname),
