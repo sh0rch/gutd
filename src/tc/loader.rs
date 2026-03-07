@@ -726,7 +726,14 @@ impl TcBpfManager {
     fn resolve_l2_peer_ip(peer_ip: std::net::IpAddr, ifname: &str) -> Result<std::net::IpAddr> {
         let info = Self::route_get_info(peer_ip)?;
         Self::ensure_route_dev(peer_ip, ifname, &info)?;
-        Ok(info.via.unwrap_or(peer_ip))
+        let l2_ip = info.via.unwrap_or(peer_ip);
+        if info.dev.is_none() {
+            eprintln!(
+                "  [resolve-mac] /proc/net/route lookup for {peer_ip} returned no dev; \
+                 using {l2_ip} as L2 target (may be wrong in L3 environments)"
+            );
+        }
+        Ok(l2_ip)
     }
 
     #[cfg(target_os = "linux")]
@@ -894,7 +901,11 @@ impl TcBpfManager {
         // Fallback: ARP/NDP resolution failed (common in L3-routed environments like
         // RouterOS where containers are on separate veths without a shared L2 bridge).
         // The actual next-hop is the default gateway — use its MAC instead.
-        let peer_v4 = if let std::net::IpAddr::V4(v4) = l2_ip { Some(v4) } else { None };
+        let peer_v4 = if let std::net::IpAddr::V4(v4) = l2_ip {
+            Some(v4)
+        } else {
+            None
+        };
         if let Some(gw_mac) = Self::resolve_default_gateway_mac(ifname, peer_v4) {
             eprintln!(
                 "  ARP for {l2_ip} (peer {peer_ip}) failed; using default gateway MAC \
@@ -931,15 +942,25 @@ impl TcBpfManager {
             return None;
         };
         let mut gw_exact: Option<std::net::Ipv4Addr> = None; // matches ifname
-        let mut gw_any:   Option<std::net::Ipv4Addr> = None; // any interface
+        let mut gw_any: Option<std::net::Ipv4Addr> = None; // any interface
         for line in content.lines().skip(1) {
             let mut f = line.split_whitespace();
-            let Some(iface) = f.next()                                         else { continue };
-            let Some(dest)  = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else { continue };
-            let Some(gw)    = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else { continue };
-            let Some(flags) = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else { continue };
-            for _ in 0..3 { f.next(); } // skip RefCnt, Use, Metric
-            let Some(mask)  = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else { continue };
+            let Some(iface) = f.next() else { continue };
+            let Some(dest) = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else {
+                continue;
+            };
+            let Some(gw) = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else {
+                continue;
+            };
+            let Some(flags) = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else {
+                continue;
+            };
+            for _ in 0..3 {
+                f.next();
+            } // skip RefCnt, Use, Metric
+            let Some(mask) = f.next().and_then(|s| u32::from_str_radix(s, 16).ok()) else {
+                continue;
+            };
             // Default route: dest=0/0, GATEWAY flag (0x2) + UP flag (0x1) set, gw != 0
             if dest == 0 && mask == 0 && flags & 0x3 == 0x3 && gw != 0 {
                 let ip = std::net::Ipv4Addr::from(gw.to_ne_bytes());
@@ -962,7 +983,10 @@ impl TcBpfManager {
         // Method 1: ARP Request + receive reply directly via AF_PACKET.
         // Works even when /proc/net/arp and RTM_GETNEIGH are empty (RouterOS containers).
         if let Some(mac) = crate::netlink::arp_request_reply(gw, ifname) {
-            eprintln!("  [gw-mac] gateway MAC resolved via ARP reply: {:02x?}", mac);
+            eprintln!(
+                "  [gw-mac] gateway MAC resolved via ARP reply: {:02x?}",
+                mac
+            );
             return Some(mac);
         }
         // Method 2: TTL=1 IP probe via AF_PACKET → read MAC from ICMP TTL-Exceeded reply.
@@ -977,7 +1001,10 @@ impl TcBpfManager {
             std::net::Ipv4Addr::new(a, b, c, 200)
         });
         if let Some(mac) = crate::netlink::resolve_mac_via_ttl_probe(gw, probe_dst, ifname) {
-            eprintln!("  [gw-mac] gateway MAC resolved via TTL probe: {:02x?}", mac);
+            eprintln!(
+                "  [gw-mac] gateway MAC resolved via TTL probe: {:02x?}",
+                mac
+            );
             return Some(mac);
         }
         // Method 3: UDP-triggered kernel ARP + RTM_GETNEIGH.
