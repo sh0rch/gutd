@@ -1,90 +1,13 @@
-//! veth pair creation for BPF-based tunnel
+//! veth pair creation for BPF-based tunnel.
+//!
+//! All Linux network operations delegate to `crate::netlink` — no external
+//! binaries (iproute2 / ethtool) are required.
 
+use crate::netlink::{
+    addr_add_p2p_v4, get_ifindex, link_delete, link_disable_offloads, link_set_gso_max_segs,
+    link_set_mac, link_set_mtu, link_set_noarp, link_set_up, neigh_add_v4_permanent, veth_create,
+};
 use crate::Result;
-
-fn interface_exists(name: &str) -> bool {
-    use std::process::Stdio;
-    std::process::Command::new("ip")
-        .args(["link", "show", "dev", name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn delete_interface(name: &str) {
-    use std::process::Stdio;
-    let _ = std::process::Command::new("ip")
-        .args(["link", "del", name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-fn create_veth_pair_once(peer_name: &str, xdp_name: &str) -> bool {
-    std::process::Command::new("ip")
-        .args([
-            "link", "add", xdp_name, "type", "veth", "peer", "name", peer_name,
-        ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn set_interface_offloads(ifname: &str) {
-    use std::process::Stdio;
-
-    // ── ETHTOOL ioctl — no external binary required ────────────────────
-    //
-    // Disable TX checksum offload and TSO on the veth interfaces so that
-    // packets reaching the TC BPF egress hook always carry a complete
-    // (or partial-but-handleable) L4 checksum, and so oversized GSO
-    // segments are never sent to our BPF program.
-    //
-    // Command codes from <linux/ethtool.h>:
-    //   ETHTOOL_STXCSUM = 0x0e — set TX hardware checksum capability
-    //   ETHTOOL_STSO    = 0x1e — set TCP segmentation offload
-    const ETHTOOL_STXCSUM: u32 = 0x0000_000e;
-    const ETHTOOL_STSO: u32 = 0x0000_001e;
-    const SIOCETHTOOL: u64 = 0x8946;
-
-    #[repr(C)]
-    struct EthtoolValue {
-        cmd: u32,
-        data: u32,
-    }
-
-    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if sock >= 0 {
-        for cmd in [ETHTOOL_STXCSUM, ETHTOOL_STSO] {
-            unsafe {
-                let mut ev = EthtoolValue { cmd, data: 0 };
-                let mut ifr: libc::ifreq = std::mem::zeroed();
-                let name_bytes = ifname.as_bytes();
-                let copy_len = name_bytes.len().min(libc::IFNAMSIZ - 1);
-                for (i, &b) in name_bytes[..copy_len].iter().enumerate() {
-                    ifr.ifr_name[i] = b as libc::c_char;
-                }
-                ifr.ifr_ifru.ifru_data = (&mut ev) as *mut EthtoolValue as *mut libc::c_char;
-                #[allow(clippy::cast_possible_truncation)]
-                libc::ioctl(sock, SIOCETHTOOL as _, &ifr as *const libc::ifreq);
-            }
-        }
-        unsafe { libc::close(sock) };
-    }
-
-    // ── ip link set gso_max_segs — belt-and-suspenders GSO cap ─────────
-    //
-    // gso_max_size is already limited to the tunnel MTU elsewhere.
-    // Setting gso_max_segs=1 prevents the kernel from coalescing multiple
-    // TCP segments into a single large skb that would exceed inner MTU.
-    let _ = std::process::Command::new("ip")
-        .args(["link", "set", "dev", ifname, "gso_max_segs", "1"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
 
 /// Compute peer address for a point-to-point /30 or /31 link.
 ///
@@ -208,44 +131,31 @@ pub fn create_veth_pair(
 
     // Create veth pair (idempotent for service restarts):
     // if names already exist, clean and retry once.
-    if !create_veth_pair_once(peer_name, xdp_name) {
-        let had_conflict = interface_exists(peer_name) || interface_exists(xdp_name);
+    // Use get_ifindex (ioctl) not link_exists (sysfs) — sysfs may be absent
+    // in minimal container environments (RouterOS).
+    if veth_create(peer_name, xdp_name).is_err() {
+        let had_conflict = get_ifindex(peer_name).is_ok() || get_ifindex(xdp_name).is_ok();
         if had_conflict {
-            // Deleting either end of a veth pair removes both; try both names to
-            // also handle partially existing stale interfaces.
-            delete_interface(xdp_name);
-            delete_interface(peer_name);
+            link_delete(xdp_name);
+            link_delete(peer_name);
         }
-
-        if !create_veth_pair_once(peer_name, xdp_name) {
-            return Err(format!("Failed to create veth pair {xdp_name} ↔ {peer_name}").into());
-        }
+        veth_create(peer_name, xdp_name)
+            .map_err(|e| format!("Failed to create veth pair {xdp_name} ↔ {peer_name}: {e}"))?;
     }
 
     // Set deterministic MAC addresses
-    let _ = std::process::Command::new("ip")
-        .args(["link", "set", "dev", peer_name, "address", &local_mac_str])
-        .status();
-    let _ = std::process::Command::new("ip")
-        .args(["link", "set", "dev", xdp_name, "address", &xdp_mac_str])
-        .status();
-
-    let mtu_str = mtu.to_string();
+    let _ = link_set_mac(peer_name, &local_mac);
+    let _ = link_set_mac(xdp_name, &xdp_mac);
 
     // Set MTU on both ends
-    let _ = std::process::Command::new("ip")
-        .args(["link", "set", "dev", peer_name, "mtu", &mtu_str])
-        .status();
-    let _ = std::process::Command::new("ip")
-        .args(["link", "set", "dev", xdp_name, "mtu", &mtu_str])
-        .status();
+    let _ = link_set_mtu(peer_name, mtu as u32);
+    let _ = link_set_mtu(xdp_name, mtu as u32);
 
-    // Disable offloads on both ends to keep checksum/segmentation behavior
-    // deterministic in BPF datapath across different VPS kernels.
-    set_interface_offloads(peer_name);
-    set_interface_offloads(xdp_name);
-
-    // gso_max_size is set by TC loader after PMTU/outer_mtu resolution.
+    // Disable TX checksum offload + TSO and cap gso_max_segs.
+    link_disable_offloads(peer_name);
+    link_disable_offloads(xdp_name);
+    link_set_gso_max_segs(peer_name, 1);
+    link_set_gso_max_segs(xdp_name, 1);
 
     // Assign point-to-point address + static neighbor (no ARP needed)
     if let Some((local_ip, peer_ip, prefix)) = &p2p_info {
@@ -255,62 +165,28 @@ pub fn create_veth_pair(
         );
 
         // Assign point-to-point address
-        let status = std::process::Command::new("ip")
-            .args([
-                "addr", "add", local_ip, "peer", &peer_cidr, "dev", peer_name,
-            ])
-            .status();
-        if status.is_err() || !status.as_ref().unwrap().success() {
-            return Err(format!(
-                "Failed to assign address {local_ip} peer {peer_cidr} to {peer_name}"
-            )
-            .into());
-        }
+        addr_add_p2p_v4(peer_name, local_ip, peer_ip, *prefix).map_err(|e| {
+            format!("Failed to assign address {local_ip} peer {peer_cidr} to {peer_name}: {e}")
+        })?;
 
         // Static neighbor entry — kernel never needs to ARP
-        let status = std::process::Command::new("ip")
-            .args([
-                "neigh",
-                "add",
-                peer_ip,
-                "lladdr",
-                &xdp_mac_str,
-                "dev",
-                peer_name,
-                "nud",
-                "permanent",
-            ])
-            .status();
-        if status.is_err() || !status.as_ref().unwrap().success() {
-            return Err(format!(
-                "Failed to add static neighbor {peer_ip} → {xdp_mac_str} on {peer_name}"
-            )
-            .into());
-        }
+        neigh_add_v4_permanent(peer_name, peer_ip, &xdp_mac).map_err(|e| {
+            format!("Failed to add static neighbor {peer_ip} → {xdp_mac_str} on {peer_name}: {e}")
+        })?;
 
-        // Disable ARP on the interface — everything is statically configured
-        let _ = std::process::Command::new("ip")
-            .args(["link", "set", "dev", peer_name, "arp", "off"])
-            .status();
-        let _ = std::process::Command::new("ip")
-            .args(["link", "set", "dev", xdp_name, "arp", "off"])
-            .status();
+        // Disable ARP on both ends — everything is statically configured
+        link_set_noarp(peer_name);
+        link_set_noarp(xdp_name);
     }
 
     // Bring both interfaces up
-    let _ = std::process::Command::new("ip")
-        .args(["link", "set", "dev", xdp_name, "up"])
-        .status();
-    let _ = std::process::Command::new("ip")
-        .args(["link", "set", "dev", peer_name, "up"])
-        .status();
+    link_set_up(xdp_name);
+    link_set_up(peer_name);
 
     Ok((local_mac, xdp_mac))
 }
 
 /// Destroy a veth pair by deleting one end (kernel removes the other automatically).
 pub fn destroy_veth(xdp_name: &str) {
-    let _ = std::process::Command::new("ip")
-        .args(["link", "del", xdp_name])
-        .status();
+    link_delete(xdp_name);
 }

@@ -88,7 +88,7 @@ impl GutConfig {
             chacha_rounds: CHACHA_ROUNDS,
             partial_ip_csum: 0, // computed later in build_gut_config when bind_ip is known
             default_xdp_action: 0, // XDP_PASS by default; overridden by loader from config
-            keepalive_drop_percent: 75,
+            keepalive_drop_percent: 30,
             feistel_rk,
             peer_ip6,
             bind_ip6: [0u8; 16],

@@ -9,7 +9,7 @@ opkg update
 opkg install ip-full wireguard-tools iperf3 kmod-wireguard
 
 GUTD=/tmp/bin/gutd-x86_64
-KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+KEY=$(head -c 32 /dev/urandom | xxd -p -c 32)
 PORTS="41000"
 
 # Mount BPF filesystem if not already mounted

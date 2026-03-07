@@ -141,7 +141,7 @@ address = 10.0.0.1/30       # IP address on veth. SERVER MUST HAVE ODD IP (e.g. 
 bind_ip = 0.0.0.0
 peer_ip = 203.0.113.10
 ports = 41000
-keepalive_drop_percent = 75
+keepalive_drop_percent = 30
 
 # Responds to UDP probes pretending to be a pure QUIC server (fast XDP path, no OS routing required).
 # Active by default to fool DPIs. Set to `false` if you have your own real UDP service on these ports.
