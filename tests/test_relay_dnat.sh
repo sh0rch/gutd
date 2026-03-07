@@ -126,7 +126,7 @@ address = 10.254.0.1/30
 bind_ip = 10.100.2.2
 peer_ip = 10.100.2.1
 ports = $GUT_PORTS_CSV
-keepalive_drop_percent = 75
+keepalive_drop_percent = 30
 key = $GUTD_SHARED_KEY
 EOF
 
@@ -143,7 +143,7 @@ address = 10.254.0.2/30
 bind_ip = 10.100.2.1
 peer_ip = 10.100.2.2
 ports = $GUT_PORTS_CSV
-keepalive_drop_percent = 75
+keepalive_drop_percent = 30
 key = $GUTD_SHARED_KEY
 EOF
 

@@ -88,7 +88,7 @@ pub fn load_config(path: &str) -> Result<Config> {
 /// - `GUTD_OUTER_MTU`          — outer/physical MTU      [default: `1500`]
 /// - `GUTD_NIC`                — ingress NIC override    [default: auto-detect]
 /// - `GUTD_DEFAULT_POLICY`     — `allow` or `drop`       [default: `allow`]
-/// - `GUTD_KEEPALIVE_DROP_PCT` — keepalive drop %        [default: `75`]
+/// - `GUTD_KEEPALIVE_DROP_PCT` — keepalive drop %        [default: `30`]
 /// - `GUTD_OWN_HTTP3`          — `true`/`false`          [default: `true`]
 /// - `GUTD_STATS_INTERVAL`     — stats interval seconds  [default: `5`]
 /// - `GUTD_STAT_FILE`          — stat file path          [default: `/run/gutd.stat`]
@@ -169,7 +169,7 @@ pub fn load_config_from_env() -> Result<Config> {
         }
     };
     let keepalive_drop_percent: u8 = std::env::var("GUTD_KEEPALIVE_DROP_PCT")
-        .unwrap_or_else(|_| "75".to_string())
+        .unwrap_or_else(|_| "30".to_string())
         .parse()
         .map_err(|e| format!("GUTD_KEEPALIVE_DROP_PCT: {e}"))?;
     let own_http3 = std::env::var("GUTD_OWN_HTTP3")
@@ -235,7 +235,7 @@ impl Default for PeerBuilder {
             ports: None,
             key: None,
             passphrase: None,
-            keepalive_drop_percent: 75,
+            keepalive_drop_percent: 30,
             own_http3: true,
         }
     }

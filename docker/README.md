@@ -37,10 +37,10 @@ Or via the helper script (also handles musl static linking):
 Uses [`cross`](https://github.com/cross-rs/cross) with `docker/Dockerfile.cross` as the per-target toolchain image (configured in `Cross.toml`):
 
 ```bash
-cross build --release --target aarch64-unknown-linux-musl   # MikroTik AX3, RPi 4+
+cross build --release --target aarch64-unknown-linux-musl RPi 4+
 cross build --release --target armv7-unknown-linux-musleabihf
-cross build --release --target mips-unknown-linux-musl      # MikroTik hEX big-endian
-cross build --release --target mipsel-unknown-linux-musl    # MikroTik hEX little-endian
+
+
 ```
 
 ---
@@ -85,10 +85,10 @@ make docker-push DOCKER_TAG=yourrepo/gutd:latest PLATFORMS=linux/amd64,linux/arm
 | Docker platform | Rust target | Hardware examples |
 |---|---|---|
 | `linux/amd64` | `x86_64-unknown-linux-musl` | PC / VPS / server |
-| `linux/arm64` | `aarch64-unknown-linux-musl` | MikroTik AX3, Raspberry Pi 4/5 |
+| `linux/arm64` | `aarch64-unknown-linux-musl` | Raspberry Pi 4/5 |
 | `linux/arm/v7` | `armv7-unknown-linux-musleabihf` | Raspberry Pi 2/3, older routers |
-| `linux/mips` | `mips-unknown-linux-musl` | MikroTik hEX (RB750Gr3), RB7xx |
-| `linux/mipsle` | `mipsel-unknown-linux-musl` | MikroTik RB750r2, hEX lite |
+
+| `linux/mipsle` | `mipsel-unknown-linux-musl` | hEX lite |
 
 ---
 
