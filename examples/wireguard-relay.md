@@ -42,7 +42,7 @@ address = 10.254.0.1/30
 bind_ip = 0.0.0.0
 peer_ip = 203.0.113.1       # server public IP
 ports = 6000,6001,6002,6003
-keepalive_drop_percent = 75
+keepalive_drop_percent = 30
 key = <output of: gutd genkey>   # shared with server
 ```
 
@@ -101,7 +101,7 @@ address = 10.254.0.2/30
 bind_ip = 0.0.0.0
 peer_ip = 198.51.100.1      # relay public IP
 ports = 6000,6001,6002,6003
-keepalive_drop_percent = 75
+keepalive_drop_percent = 30
 key = <same key as relay>
 ```
 

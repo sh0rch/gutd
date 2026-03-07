@@ -143,6 +143,13 @@ fn dump_counters_file(
         }
     }
 
+    // Ensure parent directory exists first
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+
     // Atomic write: tmp → rename
     let tmp = format!("{path}.tmp");
     if let Err(e) = std::fs::write(&tmp, &buf).and_then(|_| std::fs::rename(&tmp, path)) {
