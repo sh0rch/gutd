@@ -40,7 +40,7 @@ const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
 const SIOCGIFHWADDR: libc::c_ulong = 0x8927;
 const SIOCSIFMTU: libc::c_ulong = 0x8922;
 const SIOCSIFHWADDR: libc::c_ulong = 0x8924;
-const SIOCGIFADDR:   libc::c_ulong = 0x8915;
+const SIOCGIFADDR: libc::c_ulong = 0x8915;
 const SIOCETHTOOL: libc::c_ulong = 0x8946;
 
 // ── ethtool command codes (linux/ethtool.h) ───────────────────────────────────
@@ -170,11 +170,7 @@ fn nl_transact(msg: &[u8]) -> Result<()> {
             libc::NETLINK_ROUTE,
         );
         if fd < 0 {
-            return Err(format!(
-                "socket(AF_NETLINK): {}",
-                std::io::Error::last_os_error()
-            )
-            .into());
+            return Err(format!("socket(AF_NETLINK): {}", std::io::Error::last_os_error()).into());
         }
         let _g = FdGuard(fd);
 
@@ -191,14 +187,11 @@ fn nl_transact(msg: &[u8]) -> Result<()> {
 
         let sent = libc::send(fd, msg.as_ptr() as *const libc::c_void, msg.len(), 0);
         if sent < 0 {
-            return Err(
-                format!("netlink send: {}", std::io::Error::last_os_error()).into(),
-            );
+            return Err(format!("netlink send: {}", std::io::Error::last_os_error()).into());
         }
 
         let mut buf = [0u8; 4096];
-        let n =
-            libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) as usize;
+        let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) as usize;
         let nlh_size = std::mem::size_of::<libc::nlmsghdr>();
         if n < nlh_size {
             return Err("netlink: short reply".into());
@@ -248,8 +241,8 @@ pub fn parse_mac(mac: &str) -> Result<[u8; 6]> {
         return Err(format!("Invalid MAC format: {mac}").into());
     }
     for (i, p) in parts.iter().enumerate() {
-        out[i] = u8::from_str_radix(p, 16)
-            .map_err(|_| format!("Invalid MAC byte '{p}' in '{mac}'"))?;
+        out[i] =
+            u8::from_str_radix(p, 16).map_err(|_| format!("Invalid MAC byte '{p}' in '{mac}'"))?;
     }
     Ok(out)
 }
@@ -257,8 +250,8 @@ pub fn parse_mac(mac: &str) -> Result<[u8; 6]> {
 /// Read the MAC address of `name` from `/sys/class/net/<name>/address`.
 pub fn read_mac(name: &str) -> Result<[u8; 6]> {
     let path = format!("/sys/class/net/{name}/address");
-    let s = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Cannot read MAC for '{name}': {e}"))?;
+    let s =
+        std::fs::read_to_string(&path).map_err(|e| format!("Cannot read MAC for '{name}': {e}"))?;
     parse_mac(s.trim())
 }
 
@@ -398,9 +391,11 @@ pub fn link_set_mtu(name: &str, mtu: u32) -> Result<()> {
         fill_ifname(&mut ifr.ifr_name, name);
         ifr.ifr_ifru.ifru_mtu = mtu as libc::c_int;
         if libc::ioctl(sock, SIOCSIFMTU as _, &ifr) != 0 {
-            return Err(
-                format!("SIOCSIFMTU({name}, {mtu}): {}", std::io::Error::last_os_error()).into(),
-            );
+            return Err(format!(
+                "SIOCSIFMTU({name}, {mtu}): {}",
+                std::io::Error::last_os_error()
+            )
+            .into());
         }
         Ok(())
     }
@@ -486,7 +481,10 @@ pub fn link_disable_offloads(name: &str) {
 pub fn link_set_gso_max_segs(name: &str, segs: u32) {
     if nl_set_gso(name, IFLA_GSO_MAX_SEGS, segs).is_err() {
         // sysfs fallback (works on older kernels / some container configs)
-        let _ = std::fs::write(format!("/sys/class/net/{name}/gso_max_segs"), segs.to_string());
+        let _ = std::fs::write(
+            format!("/sys/class/net/{name}/gso_max_segs"),
+            segs.to_string(),
+        );
     }
 }
 
@@ -494,7 +492,10 @@ pub fn link_set_gso_max_segs(name: &str, segs: u32) {
 /// Falls back to sysfs write if netlink fails.
 pub fn link_set_gso_max_size(name: &str, size: u32) {
     if nl_set_gso(name, IFLA_GSO_MAX_SIZE, size).is_err() {
-        let _ = std::fs::write(format!("/sys/class/net/{name}/gso_max_size"), size.to_string());
+        let _ = std::fs::write(
+            format!("/sys/class/net/{name}/gso_max_size"),
+            size.to_string(),
+        );
     }
 }
 
@@ -534,8 +535,7 @@ pub fn addr_add_p2p_v4(name: &str, local_ip: &str, peer_ip: &str, prefix: u8) ->
     buf.push_u32(0);
     buf.push_u16(libc::RTM_NEWADDR as u16);
     buf.push_u16(
-        (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_REPLACE | libc::NLM_F_ACK)
-            as u16,
+        (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_REPLACE | libc::NLM_F_ACK) as u16,
     );
     buf.push_u32(1);
     buf.push_u32(0);
@@ -551,8 +551,9 @@ pub fn addr_add_p2p_v4(name: &str, local_ip: &str, peer_ip: &str, prefix: u8) ->
     buf.attr(IFA_ADDRESS, &peer.octets());
     buf.finalize_nlmsg();
 
-    nl_transact(&buf.0)
-        .map_err(|e| format!("addr_add_p2p_v4({name}, {local_ip} peer {peer_ip}/{prefix}): {e}").into())
+    nl_transact(&buf.0).map_err(|e| {
+        format!("addr_add_p2p_v4({name}, {local_ip} peer {peer_ip}/{prefix}): {e}").into()
+    })
 }
 
 /// Add a permanent IPv4 neighbor (ARP) entry via `RTM_NEWNEIGH`.
@@ -568,8 +569,7 @@ pub fn neigh_add_v4_permanent(name: &str, ip: &str, mac: &[u8; 6]) -> Result<()>
     buf.push_u32(0);
     buf.push_u16(libc::RTM_NEWNEIGH as u16);
     buf.push_u16(
-        (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_REPLACE | libc::NLM_F_ACK)
-            as u16,
+        (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_REPLACE | libc::NLM_F_ACK) as u16,
     );
     buf.push_u32(1);
     buf.push_u32(0);
@@ -584,8 +584,7 @@ pub fn neigh_add_v4_permanent(name: &str, ip: &str, mac: &[u8; 6]) -> Result<()>
     buf.attr(NDA_LLADDR, mac);
     buf.finalize_nlmsg();
 
-    nl_transact(&buf.0)
-        .map_err(|e| format!("neigh_add_v4_permanent({name}, {ip}): {e}").into())
+    nl_transact(&buf.0).map_err(|e| format!("neigh_add_v4_permanent({name}, {ip}): {e}").into())
 }
 
 // ── Neighbor cache lookup ─────────────────────────────────────────────────────
@@ -617,7 +616,9 @@ pub fn arp_request_reply(target_ip: std::net::Ipv4Addr, ifname: &str) -> Option<
             libc::SOCK_RAW | libc::SOCK_CLOEXEC,
             arp_proto,
         );
-        if fd < 0 { return None; } // CAP_NET_RAW absent
+        if fd < 0 {
+            return None;
+        } // CAP_NET_RAW absent
         let _guard = FdGuard(fd);
 
         let ifindex = match get_ifindex(ifname) {
@@ -627,22 +628,32 @@ pub fn arp_request_reply(target_ip: std::net::Ipv4Addr, ifname: &str) -> Option<
 
         // Bind to this interface + ARP ethertype (filters out other traffic)
         let mut bind_sll: libc::sockaddr_ll = std::mem::zeroed();
-        bind_sll.sll_family   = libc::AF_PACKET as u16;
+        bind_sll.sll_family = libc::AF_PACKET as u16;
         bind_sll.sll_protocol = (0x0806u16).to_be();
-        bind_sll.sll_ifindex  = ifindex;
-        if libc::bind(fd,
+        bind_sll.sll_ifindex = ifindex;
+        if libc::bind(
+            fd,
             &bind_sll as *const libc::sockaddr_ll as *const libc::sockaddr,
             std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-        ) < 0 { return None; }
+        ) < 0
+        {
+            return None;
+        }
 
         // Read our MAC via SIOCGIFHWADDR ioctl (no sysfs needed)
         let mut ifreq: libc::ifreq = std::mem::zeroed();
         fill_ifname(&mut ifreq.ifr_name, ifname);
-        if libc::ioctl(fd, SIOCGIFHWADDR as _, &raw mut ifreq) < 0 { return None; }
+        if libc::ioctl(fd, SIOCGIFHWADDR as _, &raw mut ifreq) < 0 {
+            return None;
+        }
         let sd = ifreq.ifr_ifru.ifru_hwaddr.sa_data;
         let src_mac: [u8; 6] = [
-            sd[0] as u8, sd[1] as u8, sd[2] as u8,
-            sd[3] as u8, sd[4] as u8, sd[5] as u8,
+            sd[0] as u8,
+            sd[1] as u8,
+            sd[2] as u8,
+            sd[3] as u8,
+            sd[4] as u8,
+            sd[5] as u8,
         ];
 
         // Read our IP via SIOCGIFADDR — requires an AF_INET socket (not AF_PACKET).
@@ -651,17 +662,18 @@ pub fn arp_request_reply(target_ip: std::net::Ipv4Addr, ifname: &str) -> Option<
         let inet_fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
         let mut ifreq2: libc::ifreq = std::mem::zeroed();
         fill_ifname(&mut ifreq2.ifr_name, ifname);
-        let sender_ip: [u8; 4] = if inet_fd >= 0
-            && libc::ioctl(inet_fd, SIOCGIFADDR as _, &raw mut ifreq2) >= 0
-        {
-            let p = &ifreq2.ifr_ifru.ifru_addr as *const libc::sockaddr as *const u8;
-            let ip = [*p.add(4), *p.add(5), *p.add(6), *p.add(7)];
-            libc::close(inet_fd);
-            ip
-        } else {
-            if inet_fd >= 0 { libc::close(inet_fd); }
-            [0, 0, 0, 0]
-        };
+        let sender_ip: [u8; 4] =
+            if inet_fd >= 0 && libc::ioctl(inet_fd, SIOCGIFADDR as _, &raw mut ifreq2) >= 0 {
+                let p = &ifreq2.ifr_ifru.ifru_addr as *const libc::sockaddr as *const u8;
+                let ip = [*p.add(4), *p.add(5), *p.add(6), *p.add(7)];
+                libc::close(inet_fd);
+                ip
+            } else {
+                if inet_fd >= 0 {
+                    libc::close(inet_fd);
+                }
+                [0, 0, 0, 0]
+            };
 
         // ARP REQUEST frame: 14-byte Ethernet header + 28-byte ARP payload = 42 bytes
         // Layout:
@@ -680,36 +692,51 @@ pub fn arp_request_reply(target_ip: std::net::Ipv4Addr, ifname: &str) -> Option<
         let mut frame = [0u8; 42];
         frame[0..6].copy_from_slice(&[0xff; 6]);
         frame[6..12].copy_from_slice(&src_mac);
-        frame[12] = 0x08; frame[13] = 0x06;
-        frame[14] = 0x00; frame[15] = 0x01;
-        frame[16] = 0x08; frame[17] = 0x00;
-        frame[18] = 6;    frame[19] = 4;
-        frame[20] = 0x00; frame[21] = 0x01; // REQUEST
+        frame[12] = 0x08;
+        frame[13] = 0x06;
+        frame[14] = 0x00;
+        frame[15] = 0x01;
+        frame[16] = 0x08;
+        frame[17] = 0x00;
+        frame[18] = 6;
+        frame[19] = 4;
+        frame[20] = 0x00;
+        frame[21] = 0x01; // REQUEST
         frame[22..28].copy_from_slice(&src_mac);
         frame[28..32].copy_from_slice(&sender_ip);
         // [32..38] already zero (target MAC unknown)
         frame[38..42].copy_from_slice(&target_ip.octets());
 
         let mut dst_sll: libc::sockaddr_ll = std::mem::zeroed();
-        dst_sll.sll_family   = libc::AF_PACKET as u16;
+        dst_sll.sll_family = libc::AF_PACKET as u16;
         dst_sll.sll_protocol = (0x0806u16).to_be();
-        dst_sll.sll_ifindex  = ifindex;
-        dst_sll.sll_halen    = 6;
+        dst_sll.sll_ifindex = ifindex;
+        dst_sll.sll_halen = 6;
         dst_sll.sll_addr[..6].copy_from_slice(&[0xff; 6]);
 
         // 400 ms recv timeout per attempt
-        let tv = libc::timeval { tv_sec: 0, tv_usec: 400_000 };
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
+        let tv = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 400_000,
+        };
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
             &tv as *const libc::timeval as *const libc::c_void,
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t);
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
 
         let target_octets = target_ip.octets();
         let mut buf = [0u8; 256];
 
         for _ in 0..4 {
             // Send ARP Request
-            libc::sendto(fd,
-                frame.as_ptr() as *const libc::c_void, frame.len(), 0,
+            libc::sendto(
+                fd,
+                frame.as_ptr() as *const libc::c_void,
+                frame.len(),
+                0,
                 &raw const dst_sll as *const libc::sockaddr,
                 std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
             );
@@ -717,12 +744,18 @@ pub fn arp_request_reply(target_ip: std::net::Ipv4Addr, ifname: &str) -> Option<
             // Read packets until timeout or we find the ARP Reply
             loop {
                 let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0);
-                if n < 0 { break; }  // EAGAIN/timeout → send another request
-                if n < 42 { continue; }
+                if n < 0 {
+                    break;
+                } // EAGAIN/timeout → send another request
+                if n < 42 {
+                    continue;
+                }
                 // ARP REPLY (opcode=2) from target_ip
                 // buf offsets: [12..14]=EtherType [20..22]=opcode [28..32]=senderIP
-                if buf[12] == 0x08 && buf[13] == 0x06
-                    && buf[20] == 0x00 && buf[21] == 0x02
+                if buf[12] == 0x08
+                    && buf[13] == 0x06
+                    && buf[20] == 0x00
+                    && buf[21] == 0x02
                     && buf[28..32] == target_octets
                 {
                     // Sender MAC is at [22..28]
@@ -762,8 +795,14 @@ pub fn resolve_mac_via_ttl_probe(
 ) -> Option<[u8; 6]> {
     unsafe {
         let eth_p_ip = (0x0800u16).to_be() as libc::c_int;
-        let fd = libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, eth_p_ip);
-        if fd < 0 { return None; }
+        let fd = libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            eth_p_ip,
+        );
+        if fd < 0 {
+            return None;
+        }
         let _guard = FdGuard(fd);
 
         let ifindex = match get_ifindex(ifname) {
@@ -773,27 +812,39 @@ pub fn resolve_mac_via_ttl_probe(
 
         // Bind to this interface + ETH_P_IP so we only see IPv4 frames
         let mut bind_sll: libc::sockaddr_ll = std::mem::zeroed();
-        bind_sll.sll_family   = libc::AF_PACKET as u16;
+        bind_sll.sll_family = libc::AF_PACKET as u16;
         bind_sll.sll_protocol = (0x0800u16).to_be();
-        bind_sll.sll_ifindex  = ifindex;
-        if libc::bind(fd,
+        bind_sll.sll_ifindex = ifindex;
+        if libc::bind(
+            fd,
             &bind_sll as *const libc::sockaddr_ll as *const libc::sockaddr,
             std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-        ) < 0 { return None; }
+        ) < 0
+        {
+            return None;
+        }
 
         // Use an AF_INET socket for both SIOCGIFHWADDR (our MAC) and SIOCGIFADDR
         // (our IPv4 address used as IP source in the probe frame).
         let inet_fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
-        if inet_fd < 0 { return None; }
+        if inet_fd < 0 {
+            return None;
+        }
         let _guard_inet = FdGuard(inet_fd);
 
         let mut ifreq: libc::ifreq = std::mem::zeroed();
         fill_ifname(&mut ifreq.ifr_name, ifname);
-        if libc::ioctl(inet_fd, SIOCGIFHWADDR as _, &raw mut ifreq) < 0 { return None; }
+        if libc::ioctl(inet_fd, SIOCGIFHWADDR as _, &raw mut ifreq) < 0 {
+            return None;
+        }
         let sd = ifreq.ifr_ifru.ifru_hwaddr.sa_data;
         let src_mac: [u8; 6] = [
-            sd[0] as u8, sd[1] as u8, sd[2] as u8,
-            sd[3] as u8, sd[4] as u8, sd[5] as u8,
+            sd[0] as u8,
+            sd[1] as u8,
+            sd[2] as u8,
+            sd[3] as u8,
+            sd[4] as u8,
+            sd[5] as u8,
         ];
 
         let mut ifreq2: libc::ifreq = std::mem::zeroed();
@@ -805,8 +856,8 @@ pub fn resolve_mac_via_ttl_probe(
             [0, 0, 0, 0]
         };
 
-        let dst_ip_b   = probe_dst_ip.octets();
-        let gw_ip_b    = gateway_ip.octets();
+        let dst_ip_b = probe_dst_ip.octets();
+        let gw_ip_b = gateway_ip.octets();
 
         // Build: 14-byte Ethernet + 20-byte IP + 8-byte UDP = 42 bytes
         //
@@ -817,20 +868,24 @@ pub fn resolve_mac_via_ttl_probe(
 
         // Ethernet header
         frame[0..6].copy_from_slice(&[0xff; 6]); // dst = broadcast
-        frame[6..12].copy_from_slice(&src_mac);  // src = our MAC
-        frame[12] = 0x08; frame[13] = 0x00;      // EtherType = IPv4
+        frame[6..12].copy_from_slice(&src_mac); // src = our MAC
+        frame[12] = 0x08;
+        frame[13] = 0x00; // EtherType = IPv4
 
         // IP header (offset 14)
         {
             let ip = &mut frame[14..34];
-            ip[0] = 0x45;             // version=4, IHL=5 (20 bytes)
-            ip[1] = 0;                // DSCP/ECN
-            ip[2] = 0; ip[3] = 28;   // total length = 20+8 = 28
-            ip[4] = 0; ip[5] = 1;    // identification
-            ip[6] = 0; ip[7] = 0;    // flags / fragment offset
-            ip[8] = 1;               // TTL = 1  ← gateway will decrement to 0 → ICMP
-            ip[9] = 17;              // protocol = UDP
-            // ip[10..12] = checksum (zero for calculation)
+            ip[0] = 0x45; // version=4, IHL=5 (20 bytes)
+            ip[1] = 0; // DSCP/ECN
+            ip[2] = 0;
+            ip[3] = 28; // total length = 20+8 = 28
+            ip[4] = 0;
+            ip[5] = 1; // identification
+            ip[6] = 0;
+            ip[7] = 0; // flags / fragment offset
+            ip[8] = 1; // TTL = 1  ← gateway will decrement to 0 → ICMP
+            ip[9] = 17; // protocol = UDP
+                        // ip[10..12] = checksum (zero for calculation)
             ip[12..16].copy_from_slice(&src_ip_b);
             ip[16..20].copy_from_slice(&dst_ip_b);
             // IP header checksum (ones-complement sum of the 10 16-bit words)
@@ -838,7 +893,9 @@ pub fn resolve_mac_via_ttl_probe(
             for i in (0..20).step_by(2) {
                 csum += ((ip[i] as u32) << 8) | (ip[i + 1] as u32);
             }
-            while csum >> 16 != 0 { csum = (csum & 0xffff) + (csum >> 16); }
+            while csum >> 16 != 0 {
+                csum = (csum & 0xffff) + (csum >> 16);
+            }
             let csum = !(csum as u16);
             ip[10] = (csum >> 8) as u8;
             ip[11] = (csum & 0xff) as u8;
@@ -847,45 +904,68 @@ pub fn resolve_mac_via_ttl_probe(
         // UDP header (offset 34)
         {
             let udp = &mut frame[34..42];
-            udp[0] = 0x30; udp[1] = 0x39; // src port = 12345
-            udp[2] = 0x30; udp[3] = 0x39; // dst port = 12345
-            udp[4] = 0;    udp[5] = 8;    // length = 8 (header only)
-            // udp[6..8] = checksum = 0 (optional for IPv4)
+            udp[0] = 0x30;
+            udp[1] = 0x39; // src port = 12345
+            udp[2] = 0x30;
+            udp[3] = 0x39; // dst port = 12345
+            udp[4] = 0;
+            udp[5] = 8; // length = 8 (header only)
+                        // udp[6..8] = checksum = 0 (optional for IPv4)
         }
 
         // Destination sockaddr_ll — broadcast
         let mut dst_sll: libc::sockaddr_ll = std::mem::zeroed();
-        dst_sll.sll_family   = libc::AF_PACKET as u16;
+        dst_sll.sll_family = libc::AF_PACKET as u16;
         dst_sll.sll_protocol = (0x0800u16).to_be();
-        dst_sll.sll_ifindex  = ifindex;
-        dst_sll.sll_halen    = 6;
+        dst_sll.sll_ifindex = ifindex;
+        dst_sll.sll_halen = 6;
         dst_sll.sll_addr[..6].copy_from_slice(&[0xff; 6]);
 
-        let tv = libc::timeval { tv_sec: 0, tv_usec: 400_000 };
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
+        let tv = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 400_000,
+        };
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
             &tv as *const libc::timeval as *const libc::c_void,
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t);
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
 
         let mut buf = [0u8; 256];
 
         for _ in 0..4 {
-            libc::sendto(fd,
-                frame.as_ptr() as *const libc::c_void, frame.len(), 0,
+            libc::sendto(
+                fd,
+                frame.as_ptr() as *const libc::c_void,
+                frame.len(),
+                0,
                 &raw const dst_sll as *const libc::sockaddr,
                 std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
             );
 
             loop {
                 let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0);
-                if n < 0 { break; } // EAGAIN / timeout → next attempt
-                // Minimum: 14 (eth) + 20 (ip) + 8 (icmp) = 42
-                if (n as usize) < 42 { continue; }
+                if n < 0 {
+                    break;
+                } // EAGAIN / timeout → next attempt
+                  // Minimum: 14 (eth) + 20 (ip) + 8 (icmp) = 42
+                if (n as usize) < 42 {
+                    continue;
+                }
                 // EtherType must be IPv4
-                if buf[12] != 0x08 || buf[13] != 0x00 { continue; }
+                if buf[12] != 0x08 || buf[13] != 0x00 {
+                    continue;
+                }
                 // IP protocol must be ICMP (1)
-                if buf[14 + 9] != 1 { continue; }
+                if buf[14 + 9] != 1 {
+                    continue;
+                }
                 // Source IP must be the gateway
-                if buf[14 + 12..14 + 16] != gw_ip_b { continue; }
+                if buf[14 + 12..14 + 16] != gw_ip_b {
+                    continue;
+                }
                 // ICMP type 11 = TTL Exceeded  (type 3 = Port Unreachable, also ok)
                 let icmp_type = buf[14 + 20];
                 if icmp_type == 11 || icmp_type == 3 {
@@ -909,7 +989,9 @@ pub fn probe_neighbor_udp(ip: std::net::IpAddr, ifname: &str) {
         std::net::IpAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
         std::net::IpAddr::V6(_) => "[::]:0".parse().unwrap(),
     };
-    let Ok(sock) = UdpSocket::bind(bind) else { return };
+    let Ok(sock) = UdpSocket::bind(bind) else {
+        return;
+    };
     let fd = sock.as_raw_fd();
 
     // IP_UNICAST_IF: route outgoing packets via ifname without CAP_NET_RAW
@@ -955,6 +1037,13 @@ pub fn lookup_arp_cache(ip: std::net::Ipv4Addr, ifname: &str) -> Option<[u8; 6]>
         if let Some(mac) = nl_get_neigh_v4(ip, ifindex as u32) {
             return Some(mac);
         }
+        // Some kernels (container namespaces) ignore ndm_ifindex in NLM_F_DUMP
+        // and return an empty response.  Retry with a full dump (ifindex=0) and
+        // filter by ifindex in the parser.  This is a no-op if the first query
+        // already returned results.
+        if let Some(mac) = nl_get_neigh_v4(ip, 0) {
+            return Some(mac);
+        }
     }
     // Fallback: /proc/net/arp (unreliable in some container namespaces).
     let Ok(content) = std::fs::read_to_string("/proc/net/arp") else {
@@ -992,21 +1081,32 @@ fn nl_get_neigh_v4(ip: std::net::Ipv4Addr, ifindex: u32) -> Option<[u8; 6]> {
             libc::SOCK_RAW | libc::SOCK_CLOEXEC,
             libc::NETLINK_ROUTE as libc::c_int,
         );
-        if fd < 0 { return None; }
+        if fd < 0 {
+            return None;
+        }
         let _guard = FdGuard(fd);
 
         let mut sa: libc::sockaddr_nl = std::mem::zeroed();
         sa.nl_family = libc::AF_NETLINK as u16;
-        if libc::bind(fd,
+        if libc::bind(
+            fd,
             &sa as *const libc::sockaddr_nl as *const libc::sockaddr,
             std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-        ) < 0 { return None; }
+        ) < 0
+        {
+            return None;
+        }
 
         #[repr(C)]
         struct NlMsgNdmsg {
             nlh: libc::nlmsghdr,
-            ndm_family: u8, ndm_pad1: u8, ndm_pad2: u16,
-            ndm_ifindex: i32, ndm_state: u16, ndm_flags: u8, ndm_type: u8,
+            ndm_family: u8,
+            ndm_pad1: u8,
+            ndm_pad2: u16,
+            ndm_ifindex: i32,
+            ndm_state: u16,
+            ndm_flags: u8,
+            ndm_type: u8,
         }
         let mut req: NlMsgNdmsg = std::mem::zeroed();
         req.nlh.nlmsg_len = std::mem::size_of::<NlMsgNdmsg>() as u32;
@@ -1014,25 +1114,38 @@ fn nl_get_neigh_v4(ip: std::net::Ipv4Addr, ifindex: u32) -> Option<[u8; 6]> {
         req.nlh.nlmsg_flags = (libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16;
         req.nlh.nlmsg_seq = 2;
         req.ndm_family = libc::AF_INET as u8;
+        // When ifindex==0 we request a full dump; parse_neigh_nlmsg_v4 filters
+        // by ifindex only when ifindex != 0, matching any interface otherwise.
         req.ndm_ifindex = ifindex as i32;
 
-        if libc::send(fd,
+        if libc::send(
+            fd,
             &req as *const NlMsgNdmsg as *const libc::c_void,
-            req.nlh.nlmsg_len as libc::size_t, 0,
-        ) < 0 { return None; }
+            req.nlh.nlmsg_len as libc::size_t,
+            0,
+        ) < 0
+        {
+            return None;
+        }
 
         let target = ip.octets();
         let mut buf = [0u8; 8192];
         loop {
             let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0);
-            if n <= 0 { break; }
+            if n <= 0 {
+                break;
+            }
             let mut offset = 0usize;
             while offset + std::mem::size_of::<libc::nlmsghdr>() <= n as usize {
                 let nlh = &*(buf.as_ptr().add(offset) as *const libc::nlmsghdr);
                 let msg_len = nlh.nlmsg_len as usize;
-                if msg_len < std::mem::size_of::<libc::nlmsghdr>()
-                    || offset + msg_len > n as usize { break; }
-                if nlh.nlmsg_type == libc::NLMSG_DONE as u16 { return None; }
+                if msg_len < std::mem::size_of::<libc::nlmsghdr>() || offset + msg_len > n as usize
+                {
+                    break;
+                }
+                if nlh.nlmsg_type == libc::NLMSG_DONE as u16 {
+                    return None;
+                }
                 if nlh.nlmsg_type == libc::RTM_NEWNEIGH as u16 {
                     if let Some(mac) =
                         parse_neigh_nlmsg_v4(buf.as_ptr().add(offset), msg_len, &target, ifindex)
@@ -1049,24 +1162,37 @@ fn nl_get_neigh_v4(ip: std::net::Ipv4Addr, ifindex: u32) -> Option<[u8; 6]> {
 
 /// Parse RTM_NEWNEIGH for AF_INET (4-byte NDA_DST).
 unsafe fn parse_neigh_nlmsg_v4(
-    base: *const u8, msg_len: usize,
-    target_ip4: &[u8; 4], ifindex: u32,
+    base: *const u8,
+    msg_len: usize,
+    target_ip4: &[u8; 4],
+    ifindex: u32,
 ) -> Option<[u8; 6]> {
     #[repr(C)]
     struct Ndmsg {
-        ndm_family: u8, ndm_pad1: u8, ndm_pad2: u16,
-        ndm_ifindex: i32, ndm_state: u16, ndm_flags: u8, ndm_type: u8,
+        ndm_family: u8,
+        ndm_pad1: u8,
+        ndm_pad2: u16,
+        ndm_ifindex: i32,
+        ndm_state: u16,
+        ndm_flags: u8,
+        ndm_type: u8,
     }
     #[repr(C)]
-    struct Rtattr { rta_len: u16, rta_type: u16 }
+    struct Rtattr {
+        rta_len: u16,
+        rta_type: u16,
+    }
 
     let nlh_size = std::mem::size_of::<libc::nlmsghdr>();
     let ndm_size = std::mem::size_of::<Ndmsg>();
-    if msg_len < nlh_size + ndm_size { return None; }
+    if msg_len < nlh_size + ndm_size {
+        return None;
+    }
 
     let ndm = &*(base.add(nlh_size) as *const Ndmsg);
     const NUD_VALID: u16 = 0x02 | 0x04 | 0x08 | 0x10 | 0x80; // REACHABLE|STALE|DELAY|PROBE|PERMANENT
-    if ndm.ndm_ifindex as u32 != ifindex || ndm.ndm_state & NUD_VALID == 0 {
+                                                             // ifindex==0 means "match any interface" (used for full-dump fallback).
+    if (ifindex != 0 && ndm.ndm_ifindex as u32 != ifindex) || ndm.ndm_state & NUD_VALID == 0 {
         return None;
     }
 
@@ -1078,7 +1204,9 @@ unsafe fn parse_neigh_nlmsg_v4(
     while off + rta_hdr <= msg_len {
         let rta = &*(base.add(off) as *const Rtattr);
         let rlen = rta.rta_len as usize;
-        if rlen < rta_hdr || off + rlen > msg_len { break; }
+        if rlen < rta_hdr || off + rlen > msg_len {
+            break;
+        }
         let dptr = base.add(off + rta_hdr);
         let dlen = rlen - rta_hdr;
         match rta.rta_type {
@@ -1100,7 +1228,11 @@ unsafe fn parse_neigh_nlmsg_v4(
         }
         off += (rlen + 3) & !3;
     }
-    if found_ip { mac } else { None }
+    if found_ip {
+        mac
+    } else {
+        None
+    }
 }
 
 fn nl_get_neigh_v6(ip: std::net::Ipv6Addr, ifindex: u32) -> Option<[u8; 6]> {
@@ -1167,8 +1299,7 @@ fn nl_get_neigh_v6(ip: std::net::Ipv6Addr, ifindex: u32) -> Option<[u8; 6]> {
             while offset + std::mem::size_of::<libc::nlmsghdr>() <= n as usize {
                 let nlh = &*(buf.as_ptr().add(offset) as *const libc::nlmsghdr);
                 let msg_len = nlh.nlmsg_len as usize;
-                if msg_len < std::mem::size_of::<libc::nlmsghdr>()
-                    || offset + msg_len > n as usize
+                if msg_len < std::mem::size_of::<libc::nlmsghdr>() || offset + msg_len > n as usize
                 {
                     break;
                 }
@@ -1260,7 +1391,11 @@ unsafe fn parse_neigh_nlmsg(
         off += (rlen + 3) & !3;
     }
 
-    if found_ip { mac } else { None }
+    if found_ip {
+        mac
+    } else {
+        None
+    }
 }
 
 /// Decode a 32-char lowercase hex string into 16 bytes (for `/proc/net/ipv6_route`).
