@@ -88,7 +88,7 @@ impl NlBuf {
         self.0.extend_from_slice(b);
     }
     fn align4(&mut self) {
-        while self.0.len() % 4 != 0 {
+        while !self.0.len().is_multiple_of(4) {
             self.0.push(0);
         }
     }
@@ -286,7 +286,7 @@ pub fn link_delete(name: &str) {
     };
     let mut buf = NlBuf::new();
     buf.push_u32(0); // len placeholder
-    buf.push_u16(libc::RTM_DELLINK as u16);
+    buf.push_u16(libc::RTM_DELLINK);
     buf.push_u16((libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16);
     buf.push_u32(1);
     buf.push_u32(0);
@@ -309,7 +309,7 @@ pub fn veth_create(name: &str, peer: &str) -> Result<()> {
 
     // nlmsghdr
     buf.push_u32(0);
-    buf.push_u16(libc::RTM_NEWLINK as u16);
+    buf.push_u16(libc::RTM_NEWLINK);
     buf.push_u16(
         (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_EXCL | libc::NLM_F_ACK) as u16,
     );
@@ -504,7 +504,7 @@ fn nl_set_gso(name: &str, attr: u16, value: u32) -> Result<()> {
     let ifindex = get_ifindex(name)?;
     let mut buf = NlBuf::new();
     buf.push_u32(0);
-    buf.push_u16(libc::RTM_NEWLINK as u16);
+    buf.push_u16(libc::RTM_NEWLINK);
     buf.push_u16((libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16);
     buf.push_u32(1);
     buf.push_u32(0);
@@ -533,7 +533,7 @@ pub fn addr_add_p2p_v4(name: &str, local_ip: &str, peer_ip: &str, prefix: u8) ->
 
     let mut buf = NlBuf::new();
     buf.push_u32(0);
-    buf.push_u16(libc::RTM_NEWADDR as u16);
+    buf.push_u16(libc::RTM_NEWADDR);
     buf.push_u16(
         (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_REPLACE | libc::NLM_F_ACK) as u16,
     );
@@ -567,7 +567,7 @@ pub fn neigh_add_v4_permanent(name: &str, ip: &str, mac: &[u8; 6]) -> Result<()>
 
     let mut buf = NlBuf::new();
     buf.push_u32(0);
-    buf.push_u16(libc::RTM_NEWNEIGH as u16);
+    buf.push_u16(libc::RTM_NEWNEIGH);
     buf.push_u16(
         (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_REPLACE | libc::NLM_F_ACK) as u16,
     );
@@ -576,9 +576,9 @@ pub fn neigh_add_v4_permanent(name: &str, ip: &str, mac: &[u8; 6]) -> Result<()>
     buf.write_ndmsg(
         libc::AF_INET as u8,
         ifindex,
-        libc::NUD_PERMANENT as u16,
+        libc::NUD_PERMANENT,
         0,
-        libc::RTN_UNICAST as u8,
+        libc::RTN_UNICAST,
     );
     buf.attr(NDA_DST, &addr.octets());
     buf.attr(NDA_LLADDR, mac);
@@ -1110,7 +1110,7 @@ fn nl_get_neigh_v4(ip: std::net::Ipv4Addr, ifindex: u32) -> Option<[u8; 6]> {
         }
         let mut req: NlMsgNdmsg = std::mem::zeroed();
         req.nlh.nlmsg_len = std::mem::size_of::<NlMsgNdmsg>() as u32;
-        req.nlh.nlmsg_type = libc::RTM_GETNEIGH as u16;
+        req.nlh.nlmsg_type = libc::RTM_GETNEIGH;
         req.nlh.nlmsg_flags = (libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16;
         req.nlh.nlmsg_seq = 2;
         req.ndm_family = libc::AF_INET as u8;
@@ -1146,7 +1146,7 @@ fn nl_get_neigh_v4(ip: std::net::Ipv4Addr, ifindex: u32) -> Option<[u8; 6]> {
                 if nlh.nlmsg_type == libc::NLMSG_DONE as u16 {
                     return None;
                 }
-                if nlh.nlmsg_type == libc::RTM_NEWNEIGH as u16 {
+                if nlh.nlmsg_type == libc::RTM_NEWNEIGH {
                     if let Some(mac) =
                         parse_neigh_nlmsg_v4(buf.as_ptr().add(offset), msg_len, &target, ifindex)
                     {
@@ -1272,7 +1272,7 @@ fn nl_get_neigh_v6(ip: std::net::Ipv6Addr, ifindex: u32) -> Option<[u8; 6]> {
         }
         let mut req: NlMsgNdmsg = std::mem::zeroed();
         req.nlh.nlmsg_len = std::mem::size_of::<NlMsgNdmsg>() as u32;
-        req.nlh.nlmsg_type = libc::RTM_GETNEIGH as u16;
+        req.nlh.nlmsg_type = libc::RTM_GETNEIGH;
         req.nlh.nlmsg_flags = (libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16;
         req.nlh.nlmsg_seq = 1;
         req.ndm_family = libc::AF_INET6 as u8;
@@ -1306,7 +1306,7 @@ fn nl_get_neigh_v6(ip: std::net::Ipv6Addr, ifindex: u32) -> Option<[u8; 6]> {
                 if nlh.nlmsg_type == libc::NLMSG_DONE as u16 {
                     return None;
                 }
-                if nlh.nlmsg_type == libc::RTM_NEWNEIGH as u16 {
+                if nlh.nlmsg_type == libc::RTM_NEWNEIGH {
                     if let Some(mac) =
                         parse_neigh_nlmsg(buf.as_ptr().add(offset), msg_len, &target, ifindex)
                     {
@@ -1408,4 +1408,377 @@ pub fn hex16(s: &str) -> Option<[u8; 16]> {
         b[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
     }
     Some(b)
+}
+
+/// Request the routing table for a given IP address via RTM_GETROUTE.
+/// Returns a tuple of (output_interface_name, next_hop_ip, pmtu).
+pub fn nl_get_route(
+    ip: std::net::IpAddr,
+) -> Option<(Option<String>, Option<std::net::IpAddr>, Option<u16>)> {
+    use std::os::unix::io::RawFd;
+    unsafe {
+        let fd: RawFd = libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE as libc::c_int,
+        );
+        if fd < 0 {
+            return None;
+        }
+        let _guard = FdGuard(fd);
+
+        let mut sa: libc::sockaddr_nl = std::mem::zeroed();
+        sa.nl_family = libc::AF_NETLINK as u16;
+        if libc::bind(
+            fd,
+            &sa as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_nl>() as u32,
+        ) < 0
+        {
+            return None;
+        }
+
+        #[repr(C)]
+        struct NlMsgRtMsg {
+            nlh: libc::nlmsghdr,
+            rtm_family: u8,
+            rtm_dst_len: u8,
+            rtm_src_len: u8,
+            rtm_tos: u8,
+            rtm_table: u8,
+            rtm_protocol: u8,
+            rtm_scope: u8,
+            rtm_type: u8,
+            rtm_flags: u32,
+        }
+
+        #[repr(C)]
+        struct Rtattr {
+            rta_len: u16,
+            rta_type: u16,
+        }
+
+        let is_v4 = matches!(ip, std::net::IpAddr::V4(_));
+        let payload_len: u16 = if is_v4 { 4 } else { 16 };
+        let rta_full_len = (std::mem::size_of::<Rtattr>() as u16 + payload_len + 3) & !3;
+
+        let mut req: NlMsgRtMsg = std::mem::zeroed();
+        req.nlh.nlmsg_len = std::mem::size_of::<NlMsgRtMsg>() as u32 + rta_full_len as u32;
+        req.nlh.nlmsg_type = libc::RTM_GETROUTE;
+        req.nlh.nlmsg_flags = libc::NLM_F_REQUEST as u16;
+        req.nlh.nlmsg_seq = 1;
+        req.rtm_family = if is_v4 {
+            libc::AF_INET as u8
+        } else {
+            libc::AF_INET6 as u8
+        };
+        req.rtm_dst_len = if is_v4 { 32 } else { 128 };
+
+        let mut buf = [0u8; 8192];
+        std::ptr::copy_nonoverlapping(
+            &req as *const _ as *const u8,
+            buf.as_mut_ptr(),
+            std::mem::size_of::<NlMsgRtMsg>(),
+        );
+
+        let rta = buf.as_mut_ptr().add(std::mem::size_of::<NlMsgRtMsg>()) as *mut Rtattr;
+        (*rta).rta_len = std::mem::size_of::<Rtattr>() as u16 + payload_len;
+        (*rta).rta_type = 1; // RTA_DST
+
+        match ip {
+            std::net::IpAddr::V4(v4) => std::ptr::copy_nonoverlapping(
+                v4.octets().as_ptr(),
+                buf.as_mut_ptr()
+                    .add(std::mem::size_of::<NlMsgRtMsg>() + std::mem::size_of::<Rtattr>()),
+                4,
+            ),
+            std::net::IpAddr::V6(v6) => std::ptr::copy_nonoverlapping(
+                v6.octets().as_ptr(),
+                buf.as_mut_ptr()
+                    .add(std::mem::size_of::<NlMsgRtMsg>() + std::mem::size_of::<Rtattr>()),
+                16,
+            ),
+        }
+
+        if libc::send(fd, buf.as_ptr() as *const _, req.nlh.nlmsg_len as usize, 0) < 0 {
+            return None;
+        }
+
+        let n = libc::recv(fd, buf.as_mut_ptr() as *mut _, buf.len(), 0);
+        if n <= 0 {
+            return None;
+        }
+
+        let mut dev: Option<String> = None;
+        let mut via: Option<std::net::IpAddr> = None;
+
+        let mut offset = 0usize;
+        while offset + std::mem::size_of::<libc::nlmsghdr>() <= n as usize {
+            let nlh = &*(buf.as_ptr().add(offset) as *const libc::nlmsghdr);
+            let msg_len = nlh.nlmsg_len as usize;
+            if msg_len < std::mem::size_of::<libc::nlmsghdr>() || offset + msg_len > n as usize {
+                break;
+            }
+            if nlh.nlmsg_type == libc::NLMSG_DONE as u16
+                || nlh.nlmsg_type == libc::NLMSG_ERROR as u16
+            {
+                break;
+            }
+
+            if nlh.nlmsg_type == libc::RTM_NEWROUTE {
+                let mut attr_offset = offset + std::mem::size_of::<NlMsgRtMsg>();
+                while attr_offset + std::mem::size_of::<Rtattr>() <= offset + msg_len {
+                    let rta = &*(buf.as_ptr().add(attr_offset) as *const Rtattr);
+                    let rta_len = rta.rta_len as usize;
+                    if rta_len < std::mem::size_of::<Rtattr>()
+                        || attr_offset + rta_len > offset + msg_len
+                    {
+                        break;
+                    }
+
+                    let data_ptr = buf
+                        .as_ptr()
+                        .add(attr_offset + std::mem::size_of::<Rtattr>());
+                    let dlen = rta_len - std::mem::size_of::<Rtattr>();
+                    match rta.rta_type {
+                        4 /* RTA_OIF */ => {
+                            if dlen == 4 {
+                                let mut ifindex = [0u8; 4];
+                                std::ptr::copy_nonoverlapping(data_ptr, ifindex.as_mut_ptr(), 4);
+                                let idx = i32::from_ne_bytes(ifindex);
+                                let mut ifname = [0i8; libc::IF_NAMESIZE];
+                                if !libc::if_indextoname(idx as u32, ifname.as_mut_ptr()).is_null() {
+                                    dev = Some(std::ffi::CStr::from_ptr(ifname.as_ptr()).to_string_lossy().into_owned());
+                                }
+                            }
+                        }
+                        5 /* RTA_GATEWAY */ => {
+                            if is_v4 && dlen == 4 {
+                                let mut octets = [0u8; 4];
+                                std::ptr::copy_nonoverlapping(data_ptr, octets.as_mut_ptr(), 4);
+                                via = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets)));
+                            } else if !is_v4 && dlen == 16 {
+                                let mut octets = [0u8; 16];
+                                std::ptr::copy_nonoverlapping(data_ptr, octets.as_mut_ptr(), 16);
+                                via = Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)));
+                            }
+                        }
+                        _ => {}
+                    }
+                    attr_offset += (rta_len + 3) & !3;
+                }
+                return Some((dev, via, None));
+            }
+            offset += (msg_len + 3) & !3;
+        }
+        None
+    }
+}
+
+/// Send a raw ICMPv6 Neighbor Solicitation directly via AF_PACKET and wait for a Neighbor Advertisement.
+/// Bypasses the kernel neighbor cache. Returns the extracted MAC address on success.
+pub fn ndp_request_reply(target_ip: std::net::Ipv6Addr, ifname: &str) -> Option<[u8; 6]> {
+    use std::os::unix::io::AsRawFd;
+
+    let ifindex = match get_ifindex(ifname) {
+        Ok(i) => i,
+        Err(_) => return None,
+    };
+
+    unsafe {
+        let fd = libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            (0x86DDu16).to_be() as i32,
+        );
+        if fd < 0 {
+            return None;
+        }
+        let _guard = FdGuard(fd);
+
+        let mut bind_sll: libc::sockaddr_ll = std::mem::zeroed();
+        bind_sll.sll_family = libc::AF_PACKET as u16;
+        bind_sll.sll_protocol = (0x86DDu16).to_be();
+        bind_sll.sll_ifindex = ifindex;
+        if libc::bind(
+            fd,
+            &bind_sll as *const _ as *const _,
+            std::mem::size_of::<libc::sockaddr_ll>() as u32,
+        ) < 0
+        {
+            return None;
+        }
+
+        // Get MAC
+        let mut ifreq: libc::ifreq = std::mem::zeroed();
+        fill_ifname(&mut ifreq.ifr_name, ifname);
+        if libc::ioctl(fd, 0x8927 /* SIOCGIFHWADDR */, &mut ifreq) < 0 {
+            return None;
+        }
+        let sd = ifreq.ifr_ifru.ifru_hwaddr.sa_data;
+        let mut src_mac = [0u8; 6];
+        for i in 0..6 {
+            src_mac[i] = sd[i] as u8;
+        }
+
+        // Get our Source IP
+        let mut sender_ip = [0u8; 16];
+        if let Ok(s) = std::net::UdpSocket::bind("[::]:0") {
+            if let Ok(c) = std::ffi::CString::new(ifname) {
+                libc::setsockopt(
+                    s.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
+                    c.as_ptr() as *const _,
+                    (ifname.len() + 1) as _,
+                );
+            }
+            if s.connect(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                target_ip, 1, 0, 0,
+            )))
+            .is_ok()
+            {
+                if let Ok(std::net::SocketAddr::V6(addr)) = s.local_addr() {
+                    sender_ip = addr.ip().octets();
+                }
+            }
+        }
+
+        let target_octets = target_ip.octets();
+        let dst_mac = [
+            0x33,
+            0x33,
+            0xff,
+            target_octets[13],
+            target_octets[14],
+            target_octets[15],
+        ];
+        let dst_ip = [
+            0xff,
+            0x02,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0xff,
+            target_octets[13],
+            target_octets[14],
+            target_octets[15],
+        ];
+
+        let mut frame = [0u8; 86];
+        frame[0..6].copy_from_slice(&dst_mac);
+        frame[6..12].copy_from_slice(&src_mac);
+        frame[12..14].copy_from_slice(&[0x86, 0xdd]); // EtherType: IPv6
+
+        frame[14..18].copy_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+        frame[18..20].copy_from_slice(&[0x00, 0x20]); // Payload length: 32 bytes
+        frame[20] = 58; // Next header: ICMPv6
+        frame[21] = 255; // Hop limit: 255 (mandatory for NDP)
+        frame[22..38].copy_from_slice(&sender_ip);
+        frame[38..54].copy_from_slice(&dst_ip);
+
+        // ICMPv6 (starts at 54)
+        frame[54] = 135; // Type: Neighbor Solicitation
+        frame[55] = 0; // Code: 0
+        frame[62..78].copy_from_slice(&target_octets);
+        frame[78] = 1; // Option: source link-layer
+        frame[79] = 1; // Length: 1 (*8 = 8 bytes)
+        frame[80..86].copy_from_slice(&src_mac);
+
+        let mut sum = 0u32;
+        // Pseudo header
+        for i in (0..16).step_by(2) {
+            sum += u32::from(u16::from_be_bytes([sender_ip[i], sender_ip[i + 1]]));
+        }
+        for i in (0..16).step_by(2) {
+            sum += u32::from(u16::from_be_bytes([dst_ip[i], dst_ip[i + 1]]));
+        }
+        sum += 32; // Upper layer length
+        sum += 58; // Next header
+
+        for i in (54..86).step_by(2) {
+            sum += u32::from(u16::from_be_bytes([frame[i], frame[i + 1]]));
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        let checksum = !(sum as u16);
+        let chk = checksum.to_be_bytes();
+        frame[56] = chk[0];
+        frame[57] = chk[1];
+
+        // Send
+        libc::send(fd, frame.as_ptr() as *const _, frame.len(), 0);
+
+        // Poll for reply
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let end_time = std::time::Instant::now() + std::time::Duration::from_millis(150);
+
+        let mut buf = [0u8; 1500];
+        loop {
+            let timeout = end_time
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis() as i32;
+            if timeout <= 0 {
+                break;
+            }
+            if libc::poll(&mut pfd, 1, timeout) <= 0 {
+                continue;
+            }
+
+            let n = libc::recv(
+                fd,
+                buf.as_mut_ptr() as *mut _,
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            );
+            if n < 86 {
+                continue;
+            }
+
+            let eth_type = u16::from_be_bytes([buf[12], buf[13]]);
+            if eth_type != 0x86dd {
+                continue;
+            } // must be ipv6
+
+            // basic checking: NextHeader(20)==58, Type(54)==136 (Neighbor Advertisement)
+            if buf[20] == 58 && buf[54] == 136 {
+                let target_replied = &buf[62..78];
+                if target_replied == target_octets {
+                    // Extract MAC from target link-layer option (Type=2)
+                    let mut idx = 78;
+                    while idx + 1 < n as usize {
+                        let opt_type = buf[idx];
+                        let opt_len = buf[idx + 1] as usize * 8;
+                        if opt_len == 0 || idx + opt_len > n as usize {
+                            break;
+                        }
+                        // Target link-layer address is option type 2
+                        if opt_type == 2 && opt_len >= 8 {
+                            let mut mac = [0u8; 6];
+                            mac.copy_from_slice(&buf[idx + 2..idx + 8]);
+                            return Some(mac);
+                        }
+                        idx += opt_len;
+                    }
+                    // For NA without TLLAO, fallback to src mac from Ethernet
+                    let mut mac = [0u8; 6];
+                    mac.copy_from_slice(&buf[6..12]);
+                    return Some(mac);
+                }
+            }
+        }
+        None
+    }
 }
