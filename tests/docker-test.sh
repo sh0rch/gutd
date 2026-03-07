@@ -46,10 +46,12 @@ fail()   { echo -e "${RED}  ✗${NC} $*"; }
 # ── Argument parsing ─────────────────────────────────────────────
 PRIVILEGED=0
 REBUILD=0
+CI_MODE=0
 for arg in "$@"; do
     case $arg in
         --privileged) PRIVILEGED=1 ;;
         --rebuild)    REBUILD=1 ;;
+        --ci)         CI_MODE=1 ;;
     esac
 done
 
@@ -371,6 +373,15 @@ for name in gutd_server gutd_relay; do
 done
 
 [[ $WG_PING_OK -eq 1 ]] && ok "WireGuard through gutd: PASS" || fail "WireGuard through gutd: FAIL"
+
+if [[ $CI_MODE -eq 1 ]]; then
+    log "CI mode: tearing down..."
+    if [[ $WG_PING_OK -eq 1 ]]; then
+        exit 0
+    else
+        exit 1
+    fi
+fi
 
 echo ""
 log "Containers are still running. Attach to inspect:"
