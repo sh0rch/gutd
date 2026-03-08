@@ -90,31 +90,16 @@ jobs:
         timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5201 &
         sleep 1
         timeout 15 sudo ip netns exec ns1 iperf3 -c 10.200.0.2 -p 5201 -P 4 -t 5 2>&1 | tee /tmp/iperf_tcp.txt || true
-        WGOBFS_TCP=$(grep "SUM.*sender" /tmp/iperf_tcp.txt | awk '{print $6, $7}') || true
-        [ -z "$WGOBFS_TCP" ] && WGOBFS_TCP=$(grep "sender" /tmp/iperf_tcp.txt | tail -1 | awk '{print $7, $8}') || true
-
-        sleep 2
-        timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5202 &
-        sleep 1
-        timeout 15 sudo ip netns exec ns1 iperf3 -c 10.200.0.2 -p 5202 -u -b 2G -t 5 2>&1 | tee /tmp/iperf_udp.txt || true
-        WGOBFS_UDP=$(grep "receiver" /tmp/iperf_udp.txt | awk '{print $7, $8}') || true
-        WGOBFS_UDP_LOSS=$(grep "receiver" /tmp/iperf_udp.txt | grep -oP '\(\K[^)]+' || echo "?")
-        set -e
-
-        sudo kill -9 $G1PID $G2PID 2>/dev/null || true
-
-        echo "WGOBFS_TCP=$WGOBFS_TCP" >> $GITHUB_OUTPUT
-        echo "WGOBFS_UDP=$WGOBFS_UDP" >> $GITHUB_OUTPUT
-        echo "WGOBFS_UDP_LOSS=$WGOBFS_UDP_LOSS" >> $GITHUB_OUTPUT
-
-  benchmark-gutd:
-    name: Benchmark gutd
-    runs-on: ubuntu-22.04
-    outputs:
-      tcp: ${{ steps.run-test.outputs.GUTD_TCP }}
-      udp: ${{ steps.run-test.outputs.GUTD_UDP }}
-      loss: ${{ steps.run-test.outputs.GUTD_UDP_LOSS }}
-      tag: ${{ steps.run-test.outputs.GUTD_LATEST_TAG }}
+        WGOBFS_TCP: ${{ needs.benchmark-wgobfs.outputs.tcp }}
+        WGOBFS_UDP: ${{ needs.benchmark-wgobfs.outputs.udp }}
+        WGOBFS_UDP_LOSS: ${{ needs.benchmark-wgobfs.outputs.loss }}
+        GUTD_TCP: ${{ needs.benchmark-gutd.outputs.tcp }}
+        GUTD_UDP: ${{ needs.benchmark-gutd.outputs.udp }}
+        GUTD_UDP_LOSS: ${{ needs.benchmark-gutd.outputs.loss }}
+        GUTD_USERSPACE_TCP: ${{ needs.benchmark-gutd-userspace.outputs.tcp }}
+        GUTD_USERSPACE_UDP: ${{ needs.benchmark-gutd-userspace.outputs.udp }}
+        GUTD_USERSPACE_UDP_LOSS: ${{ needs.benchmark-gutd-userspace.outputs.loss }}
+        GUTD_LATEST_TAG: ${{ needs.benchmark-gutd.outputs.tag }}
     steps:
     - name: Install dependencies
       run: |
@@ -210,9 +195,112 @@ jobs:
         echo "GUTD_UDP_LOSS=$GUTD_UDP_LOSS" >> $GITHUB_OUTPUT
         echo "GUTD_LATEST_TAG=$TAG" >> $GITHUB_OUTPUT
 
+  benchmark-gutd-userspace:
+    name: Benchmark gutd
+    runs-on: ubuntu-22.04
+    outputs:
+      tcp: ${{ steps.run-test.outputs.GUTD_USERSPACE_TCP }}
+      udp: ${{ steps.run-test.outputs.GUTD_USERSPACE_UDP }}
+      loss: ${{ steps.run-test.outputs.GUTD_USERSPACE_UDP_LOSS }}
+      tag: ${{ steps.run-test.outputs.GUTD_USERSPACE_LATEST_TAG }}
+    steps:
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y iperf3 iproute2 iputils-ping wireguard-tools jq curl
+    
+    - name: Download latest gutd release
+      run: |
+        echo "Fetching latest sh0rch/gutd..."
+        LATEST_URL=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r '.assets[] | select(.name|test("^gutd-x86_64-.*$")) | .browser_download_url')
+        RELEASE_TAG=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r '.tag_name')
+        curl -LO $LATEST_URL
+        chmod +x gutd-x86_64-*
+        sudo mv gutd-x86_64-* /usr/local/bin/gutd
+        echo "TAG=$RELEASE_TAG" >> $GITHUB_ENV
+
+    - name: Run gutd Test
+      id: run-test
+      run: |
+        set -ex
+        KEY=$(openssl rand -hex 32)
+        PORTS="41000"
+        GUTD="/usr/local/bin/gutd"
+
+        # Mount bpffs
+        sudo mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
+
+        sudo ip netns add ns1
+        sudo ip netns add ns2
+        sudo ip link add veth1 type veth peer name veth2
+        sudo ip link set veth1 netns ns1
+        sudo ip link set veth2 netns ns2
+        sudo ip netns exec ns1 bash -c 'ip link set lo up; ip link set veth1 up; ip addr add 10.0.0.1/24 dev veth1'
+        sudo ip netns exec ns2 bash -c 'ip link set lo up; ip link set veth2 up; ip addr add 10.0.0.2/24 dev veth2'
+        
+        sudo ip netns exec ns1 ip link set dev veth1 gso_max_size 1492 2>/dev/null || true
+        sudo ip netns exec ns2 ip link set dev veth2 gso_max_size 1492 2>/dev/null || true
+
+        WG_CLIENT_PRIV=$(wg genkey)
+        WG_CLIENT_PUB=$(echo "$WG_CLIENT_PRIV" | wg pubkey)
+        WG_SERVER_PRIV=$(wg genkey)
+        WG_SERVER_PUB=$(echo "$WG_SERVER_PRIV" | wg pubkey)
+
+        printf '[Interface]\nPrivateKey = %s\nListenPort = 51820\n\n[Peer]\nPublicKey = %s\nAllowedIPs = 10.200.0.1/32\n' \
+          "$WG_SERVER_PRIV" "$WG_CLIENT_PUB" > /tmp/wg-server.conf
+
+        printf '[global]\nuserspace_only = true\n[peer]\nname = gut1\nmtu = 1500\nnic = veth1\naddress = 192.168.99.1/30\nbind_ip = 10.0.0.1\npeer_ip = 10.0.0.2\nports = %s\nkey = %s\n' \
+          "$PORTS" "$KEY" > /tmp/g1.conf
+        printf '[global]\nuserspace_only = true\n[peer]\nname = gut2\nmtu = 1500\nnic = veth2\naddress = 192.168.99.2/30\nbind_ip = 10.0.0.2\npeer_ip = 10.0.0.1\nports = %s\nkey = %s\n' \
+          "$PORTS" "$KEY" > /tmp/g2.conf
+
+        sudo ip netns exec ns1 $GUTD --config /tmp/g1.conf > /tmp/gutd-ns1.log 2>&1 &
+        G1PID=$!
+        sleep 1
+        sudo ip netns exec ns2 $GUTD --config /tmp/g2.conf > /tmp/gutd-ns2.log 2>&1 &
+        G2PID=$!
+        sleep 2
+
+        sudo ip netns exec ns2 ip link add wg0 type wireguard
+        sudo ip netns exec ns2 ip addr add 10.200.0.2/24 dev wg0
+        sudo ip netns exec ns2 wg setconf wg0 /tmp/wg-server.conf
+        sudo ip netns exec ns2 ip link set wg0 mtu 1420 up
+
+        printf '[Interface]\nPrivateKey = %s\n\n[Peer]\nPublicKey = %s\nEndpoint = 192.168.99.2:51820\nAllowedIPs = 10.200.0.0/24\nPersistentKeepalive = 5\n' \
+          "$WG_CLIENT_PRIV" "$WG_SERVER_PUB" > /tmp/wg-client-tunnel.conf
+        sudo ip netns exec ns1 ip link add wg0 type wireguard
+        sudo ip netns exec ns1 ip addr add 10.200.0.1/24 dev wg0
+        sudo ip netns exec ns1 wg setconf wg0 /tmp/wg-client-tunnel.conf
+        sudo ip netns exec ns1 ip link set wg0 mtu 1420 up
+
+        sleep 4
+        sudo ip netns exec ns1 ping -c2 -i0.2 -W2 10.200.0.2
+
+        set +e
+        timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5201 &
+        sleep 1
+        timeout 15 sudo ip netns exec ns1 iperf3 -c 10.200.0.2 -p 5201 -P 4 -t 5 2>&1 | tee /tmp/iperf_tcp.txt || true
+        GUTD_USERSPACE_TCP=$(grep "SUM.*sender" /tmp/iperf_tcp.txt | awk '{print $6, $7}') || true
+        [ -z "$GUTD_USERSPACE_TCP" ] && GUTD_USERSPACE_TCP=$(grep "sender" /tmp/iperf_tcp.txt | tail -1 | awk '{print $7, $8}') || true
+
+        sleep 2
+        timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5202 &
+        sleep 1
+        timeout 15 sudo ip netns exec ns1 iperf3 -c 10.200.0.2 -p 5202 -u -b 2G -t 5 2>&1 | tee /tmp/iperf_udp.txt || true
+        GUTD_USERSPACE_UDP=$(grep "receiver" /tmp/iperf_udp.txt | awk '{print $7, $8}') || true
+        GUTD_USERSPACE_UDP_LOSS=$(grep "receiver" /tmp/iperf_udp.txt | grep -oP '\(\K[^)]+' || echo "?")
+        set -e
+
+        sudo kill -9 $G1PID $G2PID 2>/dev/null || true
+
+        echo "GUTD_USERSPACE_TCP=$GUTD_USERSPACE_TCP" >> $GITHUB_OUTPUT
+        echo "GUTD_USERSPACE_UDP=$GUTD_USERSPACE_UDP" >> $GITHUB_OUTPUT
+        echo "GUTD_USERSPACE_UDP_LOSS=$GUTD_USERSPACE_UDP_LOSS" >> $GITHUB_OUTPUT
+        echo "GUTD_USERSPACE_LATEST_TAG=$TAG" >> $GITHUB_OUTPUT
+
   publish-results:
     name: Compare & Publish
-    needs: [benchmark-wgobfs, benchmark-gutd]
+    needs: [benchmark-wgobfs, benchmark-gutd, benchmark-gutd-userspace]
     runs-on: ubuntu-22.04
     steps:
     - name: Publish Comparative Summary
@@ -223,13 +311,17 @@ jobs:
         GUTD_TCP: ${{ needs.benchmark-gutd.outputs.tcp }}
         GUTD_UDP: ${{ needs.benchmark-gutd.outputs.udp }}
         GUTD_UDP_LOSS: ${{ needs.benchmark-gutd.outputs.loss }}
+        GUTD_USERSPACE_TCP: ${{ needs.benchmark-gutd-userspace.outputs.tcp }}
+        GUTD_USERSPACE_UDP: ${{ needs.benchmark-gutd-userspace.outputs.udp }}
+        GUTD_USERSPACE_UDP_LOSS: ${{ needs.benchmark-gutd-userspace.outputs.loss }}
         GUTD_LATEST_TAG: ${{ needs.benchmark-gutd.outputs.tag }}
       run: |
         echo "## Benchmark: wg-obfuscator vs gutd" >> $GITHUB_STEP_SUMMARY
         echo "| Tool | TCP Bandwidth | UDP Bandwidth | UDP Loss |" >> $GITHUB_STEP_SUMMARY
         echo "|---|---|---|---|" >> $GITHUB_STEP_SUMMARY
+        echo "| **gutd (eBPF)** ([$GUTD_LATEST_TAG](https://github.com/${{ github.repository }}/releases/tag/$GUTD_LATEST_TAG)) | $GUTD_TCP | $GUTD_UDP | $GUTD_UDP_LOSS |" >> $GITHUB_STEP_SUMMARY
+        echo "| **gutd (Userspace)** ([$GUTD_LATEST_TAG](https://github.com/${{ github.repository }}/releases/tag/$GUTD_LATEST_TAG)) | $GUTD_USERSPACE_TCP | $GUTD_USERSPACE_UDP | $GUTD_USERSPACE_UDP_LOSS |" >> $GITHUB_STEP_SUMMARY
         echo "| **wg-obfuscator** (latest) | $WGOBFS_TCP | $WGOBFS_UDP | $WGOBFS_UDP_LOSS |" >> $GITHUB_STEP_SUMMARY
-        echo "| **gutd** ([$GUTD_LATEST_TAG](https://github.com/${{ github.repository }}/releases/tag/$GUTD_LATEST_TAG)) | $GUTD_TCP | $GUTD_UDP | $GUTD_UDP_LOSS |" >> $GITHUB_STEP_SUMMARY
 
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -244,6 +336,9 @@ jobs:
         GUTD_TCP: ${{ needs.benchmark-gutd.outputs.tcp }}
         GUTD_UDP: ${{ needs.benchmark-gutd.outputs.udp }}
         GUTD_UDP_LOSS: ${{ needs.benchmark-gutd.outputs.loss }}
+        GUTD_USERSPACE_TCP: ${{ needs.benchmark-gutd-userspace.outputs.tcp }}
+        GUTD_USERSPACE_UDP: ${{ needs.benchmark-gutd-userspace.outputs.udp }}
+        GUTD_USERSPACE_UDP_LOSS: ${{ needs.benchmark-gutd-userspace.outputs.loss }}
         GUTD_LATEST_TAG: ${{ needs.benchmark-gutd.outputs.tag }}
       run: |
         DATE_STR=$(date +'%Y-%m-%d %H:%M')
@@ -253,9 +348,9 @@ jobs:
         ### Benchmark: gutd vs wg-obfuscator
         | Tool | TCP Bandwidth | UDP Bandwidth | UDP Loss |
         |---|---|---|---|
-        | **gutd** ([$GUTD_LATEST_TAG](https://github.com/${{ github.repository }}/releases/tag/$GUTD_LATEST_TAG)) | $GUTD_TCP | $GUTD_UDP | $GUTD_UDP_LOSS |
+        | **gutd (eBPF)** ([$GUTD_LATEST_TAG](https://github.com/${{ github.repository }}/releases/tag/$GUTD_LATEST_TAG)) | $GUTD_TCP | $GUTD_UDP | $GUTD_UDP_LOSS |
+        | **gutd (Userspace)** ([$GUTD_LATEST_TAG](https://github.com/${{ github.repository }}/releases/tag/$GUTD_LATEST_TAG)) | $GUTD_USERSPACE_TCP | $GUTD_USERSPACE_UDP | $GUTD_USERSPACE_UDP_LOSS |
         | **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | $WGOBFS_TCP | $WGOBFS_UDP | $WGOBFS_UDP_LOSS |
-
         <sub><i>* Performance measured using \`iperf3\` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. [See test logic and full logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). Last updated: $DATE_STR</i></sub>
         <!-- INTEGRATION_TEST_RESULTS_END -->
         SNIPPET

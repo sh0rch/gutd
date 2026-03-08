@@ -18,7 +18,7 @@ jobs:
       - id: set-matrix
         run: |
           if [ "${{ inputs.build_all == true }}" = "true" ]; then
-            echo 'matrix={"include": [{"target": "x86_64-unknown-linux-musl", "label": "x86_64", "uses_cross": false, "qemu": ""}, {"target": "aarch64-unknown-linux-musl", "label": "aarch64", "uses_cross": true, "nightly": false, "extra_args": "", "qemu": "qemu-aarch64-static"}, {"target": "armv7-unknown-linux-musleabihf", "label": "armv7", "uses_cross": true, "nightly": false, "extra_args": "", "qemu": "qemu-arm-static"}, {"target": "mips-unknown-linux-musl", "label": "mips", "uses_cross": true, "nightly": true, "extra_args": "-Z build-std=std,panic_abort", "qemu": "qemu-mips-static"}, {"target": "mipsel-unknown-linux-musl", "label": "mipsel", "uses_cross": true, "nightly": true, "extra_args": "-Z build-std=std,panic_abort", "qemu": "qemu-mipsel-static"}]}' >> "$GITHUB_OUTPUT"
+            echo 'matrix={"include": [{"target": "x86_64-unknown-linux-musl", "label": "x86_64", "uses_cross": false, "qemu": ""}, {"target": "aarch64-unknown-linux-musl", "label": "aarch64", "uses_cross": true, "nightly": false, "extra_args": "", "qemu": "qemu-aarch64-static"}, {"target": "armv7-unknown-linux-musleabihf", "label": "armv7", "uses_cross": true, "nightly": false, "extra_args": "", "qemu": "qemu-arm-static"}, {"target": "mips-unknown-linux-musl", "label": "mips", "uses_cross": true, "nightly": true, "extra_args": "-Z build-std=std,panic_abort", "qemu": "qemu-mips-static"}, {"target": "mipsel-unknown-linux-musl", "label": "mipsel", "uses_cross": true, "nightly": true, "extra_args": "-Z build-std=std,panic_abort", "qemu": "qemu-mipsel-static"}, {"target": "aarch64-unknown-linux-musl", "label": "ros-arm64", "uses_cross": true, "nightly": false, "extra_args": "--no-default-features", "qemu": "qemu-aarch64-static", "make_ros": true}]}' >> "$GITHUB_OUTPUT"
           else
             echo 'matrix={"include": [{"target": "x86_64-unknown-linux-musl", "label": "x86_64", "uses_cross": false, "qemu": ""}]}' >> "$GITHUB_OUTPUT"
           fi
@@ -82,9 +82,17 @@ jobs:
         mv target/${{ matrix.target }}/release/gutd target/${{ matrix.target }}/release/gutd-${{ matrix.label }}
         ls -lh target/${{ matrix.target }}/release/gutd-${{ matrix.label }}
         
+
+    - name: Package ROS image
+      if: matrix.make_ros
+      run: |
+        bash docker/make-ros-tar.sh target/${{ matrix.target }}/release/gutd-${{ matrix.label }} target/${{ matrix.target }}/release/gutd-${{ matrix.label }}.tar
+        rm target/${{ matrix.target }}/release/gutd-${{ matrix.label }}
+
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: gutd-${{ matrix.label }}
-        path: target/${{ matrix.target }}/release/gutd-${{ matrix.label }}
+        path: target/${{ matrix.target }}/release/gutd-${{ matrix.label }}*
         retention-days: 1
+

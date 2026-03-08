@@ -5,8 +5,9 @@ pub mod installer;
 pub mod netlink;
 pub mod proto;
 pub mod reload;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
 pub mod tc;
 pub mod tun;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+pub mod userspace;
