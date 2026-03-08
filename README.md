@@ -11,7 +11,7 @@
 | **gutd (Userspace)** ([v2.0.0](https://github.com/sh0rch/gutd/releases/tag/v2.0.0)) | TBA | TBA | TBA |
 | **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | 315 Mbits/sec | 242 Mbits/sec | 73% |
 
-<sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. [See test logic and full logs](https://github.com/sh0rch/gutd/actions/runs/22722690185). Last updated: 2026-03-05 14:34</i></sub>
+<sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. [See test logic and full logs](https://github.com/sh0rch/gutd/actions/runs/22815723781). Last updated: 2026-03-08 06:37</i></sub>
 <!-- INTEGRATION_TEST_RESULTS_END -->
 
 
