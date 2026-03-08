@@ -5,8 +5,8 @@ pub fn feistel32(x: u32, rk: &[u32; 4]) -> u32 {
     let mut lo = (x & 0xFFFF) as u16;
     let mut hi = (x >> 16) as u16;
 
-    for i in 0..4 {
-        let f = ((lo as u32).wrapping_mul(0x9E37).wrapping_add(rk[i]))
+    for &k in rk {
+        let f = ((lo as u32).wrapping_mul(0x9E37).wrapping_add(k))
             ^ ((lo as u32) << 3)
             ^ ((lo as u32) >> 5);
         let new_lo = hi ^ (f & 0xFFFF) as u16;
