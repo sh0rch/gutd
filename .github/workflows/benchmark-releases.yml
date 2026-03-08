@@ -102,13 +102,6 @@ jobs:
       udp: ${{ steps.run-test.outputs.GUTD_UDP }}
       loss: ${{ steps.run-test.outputs.GUTD_UDP_LOSS }}
       tag: ${{ steps.run-test.outputs.GUTD_LATEST_TAG }}
-        GUTD_TCP: ${{ needs.benchmark-gutd.outputs.tcp }}
-        GUTD_UDP: ${{ needs.benchmark-gutd.outputs.udp }}
-        GUTD_UDP_LOSS: ${{ needs.benchmark-gutd.outputs.loss }}
-        GUTD_USERSPACE_TCP: ${{ needs.benchmark-gutd-userspace.outputs.tcp }}
-        GUTD_USERSPACE_UDP: ${{ needs.benchmark-gutd-userspace.outputs.udp }}
-        GUTD_USERSPACE_UDP_LOSS: ${{ needs.benchmark-gutd-userspace.outputs.loss }}
-        GUTD_LATEST_TAG: ${{ needs.benchmark-gutd.outputs.tag }}
     steps:
     - name: Install dependencies
       run: |
