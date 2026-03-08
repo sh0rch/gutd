@@ -195,7 +195,7 @@ fn quic_decap(
     };
 
     // We can decrypt ports from QUIC Header
-    
+    let enc_ports;
     if quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
         enc_ports = u32::from_le_bytes(buf[9..13].try_into().unwrap());
     } else {
@@ -246,7 +246,8 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let rounds: u8 = 4;
     let feistel_rk = compute_feistel_rk(&key, rounds);
 
-    let addr = &peer.address; let is_server = {
+    let addr = &peer.address;
+    let is_server = {
         let parts: Vec<&str> = addr.split('/').collect();
         let ip_parts: Vec<&str> = parts[0].split('.').collect();
         if ip_parts.len() == 4 {
@@ -267,9 +268,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let wg_addr: SocketAddr = format!("127.0.0.1:{}", wg_port_str).parse()?;
 
     // Optional override for where to send egress traffic
-    let peer_ip_str = env::var("GUTD_PEER_IP").unwrap_or_else(|_| {
-        peer.peer_ip.to_string()
-    });
+    let peer_ip_str = env::var("GUTD_PEER_IP").unwrap_or_else(|_| peer.peer_ip.to_string());
     // For ports, use the first one from config
     let peer_port = peer.ports.get(0).copied().unwrap_or(41000);
     let remote_peer_addr: SocketAddr = format!("{}:{}", peer_ip_str, peer_port).parse()?;
@@ -286,12 +285,12 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     for &port in &peer.ports {
         let ext_addr = SocketAddr::new(peer.bind_ip, port);
         let std_sock = std::net::UdpSocket::bind(ext_addr).unwrap();
-            let _ = std_sock.set_nonblocking(true);
+        let _ = std_sock.set_nonblocking(true);
         #[cfg(target_family = "unix")]
-            let _ = std::os::unix::io::AsRawFd::as_raw_fd(&std_sock);
-            /* we'll use libc if available later, for now ignore OS limits for std_sock */
-        
-            match Ok::<_, std::io::Error>(mio::net::UdpSocket::from_std(std_sock)) {
+        let _ = std::os::unix::io::AsRawFd::as_raw_fd(&std_sock);
+        /* we'll use libc if available later, for now ignore OS limits for std_sock */
+
+        match Ok::<_, std::io::Error>(mio::net::UdpSocket::from_std(std_sock)) {
             Ok(mut socket) => {
                 let token = Token(current_token_id);
                 current_token_id += 1;
@@ -315,7 +314,6 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     // For sending back to WG clients with the right ephemeral source port
     let std_local = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let _ = std_local.set_nonblocking(true);
-
 
     let mut local_socket = UdpSocket::from_std(std_local);
     let local_token = Token(current_token_id);
