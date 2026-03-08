@@ -16,7 +16,6 @@ jobs:
   benchmark-wgobfs:
     name: Benchmark wg-obfuscator
     runs-on: ubuntu-22.04
-    needs: [benchmark-gutd]
     outputs:
       tcp: ${{ steps.run-test.outputs.WGOBFS_TCP }}
       udp: ${{ steps.run-test.outputs.WGOBFS_UDP }}
