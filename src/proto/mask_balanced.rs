@@ -99,7 +99,6 @@ pub fn chacha_ballast(key: &[u8; 32], nonce: u32, rounds: u8) -> ([u8; 63], usiz
     (out, blen)
 }
 
-
 pub fn chacha_init(key: &[u8; 32]) -> [u32; 12] {
     let mut s = [0u32; 12];
     s[0] = 0x6170_7865;
