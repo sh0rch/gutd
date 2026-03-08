@@ -41,6 +41,7 @@ jobs:
 
     - name: Verify config parsing
       run: |
+        TEST_KEY=$(openssl rand -hex 32)
         cat > test.conf <<CONF
         [global]
         [peer]
@@ -51,10 +52,10 @@ jobs:
         bind_ip = 127.0.0.1
         peer_ip = 127.0.0.1
         ports = 6000
-        key = 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        key = ${TEST_KEY}
         CONF
 
-        timeout 2 sudo ./gutd-x86_64 --config test.conf 2>&1 | tee log.txt || true
+        sudo timeout -k 1 2 ./gutd-x86_64 --config test.conf 2>&1 | tee log.txt || true
         if grep -iq "panic\|parse error\|unknown section\|missing required" log.txt; then
           echo "FAIL Config parsing failed"
           cat log.txt

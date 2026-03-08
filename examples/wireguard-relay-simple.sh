@@ -50,7 +50,7 @@ address = 10.254.0.1/30
 bind_ip = 0.0.0.0
 peer_ip = SERVER_PUBLIC_IP_HERE
 ports = 6000,6001,6002,6003
-keepalive_drop_percent = 75
+keepalive_drop_percent = 30
 key = SHARED_KEY_HERE
 EOF
     
@@ -109,7 +109,7 @@ address = 10.254.0.2/30
 bind_ip = 0.0.0.0
 peer_ip = RELAY_PUBLIC_IP_HERE
 ports = 6000,6001,6002,6003
-keepalive_drop_percent = 75
+keepalive_drop_percent = 30
 key = SHARED_KEY_HERE
 EOF
     
