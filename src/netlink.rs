@@ -1546,7 +1546,7 @@ pub fn nl_get_route(
                                 let mut ifindex = [0u8; 4];
                                 std::ptr::copy_nonoverlapping(data_ptr, ifindex.as_mut_ptr(), 4);
                                 let idx = i32::from_ne_bytes(ifindex);
-                                let mut ifname = [0i8; libc::IF_NAMESIZE];
+                                let mut ifname = [0 as libc::c_char; libc::IF_NAMESIZE];
                                 if !libc::if_indextoname(idx as u32, ifname.as_mut_ptr()).is_null() {
                                     dev = Some(std::ffi::CStr::from_ptr(ifname.as_ptr()).to_string_lossy().into_owned());
                                 }
