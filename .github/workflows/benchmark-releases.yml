@@ -90,11 +90,25 @@ jobs:
         timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5201 &
         sleep 1
         timeout 15 sudo ip netns exec ns1 iperf3 -c 10.200.0.2 -p 5201 -P 4 -t 5 2>&1 | tee /tmp/iperf_tcp.txt || true
-        WGOBFS_TCP: ${{ needs.benchmark-wgobfs.outputs.tcp }}
-        WGOBFS_UDP: ${{ needs.benchmark-wgobfs.outputs.udp }}
-        WGOBFS_UDP_LOSS: ${{ needs.benchmark-wgobfs.outputs.loss }}
+        WGOBFS_TCP=$(grep "SUM" /tmp/iperf_tcp.txt | tail -1 | awk '{print $6, $7}') || true
+        [ -z "$WGOBFS_TCP" ] && WGOBFS_TCP=$(grep "sender" /tmp/iperf_tcp.txt | tail -1 | awk '{print $7, $8}') || true
+
+        sleep 2
+        timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5202 &
+        sleep 1
+        timeout 15 sudo ip netns exec ns1 iperf3 -c 10.200.0.2 -p 5202 -u -b 2G -t 5 2>&1 | tee /tmp/iperf_udp.txt || true
+        WGOBFS_UDP=$(grep "receiver" /tmp/iperf_udp.txt | awk '{print $7, $8}') || true
+        WGOBFS_UDP_LOSS=$(grep "receiver" /tmp/iperf_udp.txt | grep -oP '\(\K[^)]+' || echo "?")
+        set -e
+
+        sudo kill -9 $G1PID $G2PID 2>/dev/null || true
+
+        echo "WGOBFS_TCP=$WGOBFS_TCP" >> $GITHUB_OUTPUT
+        echo "WGOBFS_UDP=$WGOBFS_UDP" >> $GITHUB_OUTPUT
+        echo "WGOBFS_UDP_LOSS=$WGOBFS_UDP_LOSS" >> $GITHUB_OUTPUT
 
   benchmark-gutd:
+    needs: benchmark-wgobfs
     name: Benchmark gutd
     runs-on: ubuntu-22.04
     outputs:
@@ -198,6 +212,7 @@ jobs:
         echo "GUTD_LATEST_TAG=$TAG" >> $GITHUB_OUTPUT
 
   benchmark-gutd-userspace:
+    needs: benchmark-gutd
     name: Benchmark gutd
     runs-on: ubuntu-22.04
     outputs:
