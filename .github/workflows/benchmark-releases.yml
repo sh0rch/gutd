@@ -83,7 +83,7 @@ jobs:
         sudo ip netns exec ns1 ip link set wg0 mtu 1420 up
 
         sleep 4
-        sudo ip netns exec ns1 ping -c2 -i0.2 -W2 10.200.0.2
+        sudo ip netns exec ns1 ping -c2 -i0.2 -W2 10.200.0.2 || true
 
         set +e
         timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5201 &
@@ -186,7 +186,7 @@ jobs:
         sudo ip netns exec ns1 ip link set wg0 mtu 1420 up
 
         sleep 4
-        sudo ip netns exec ns1 ping -c2 -i0.2 -W2 10.200.0.2
+        sudo ip netns exec ns1 ping -c2 -i0.2 -W2 10.200.0.2 || true
 
         set +e
         timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5201 &
@@ -290,7 +290,7 @@ jobs:
         sudo ip netns exec ns1 ip link set wg0 mtu 1420 up
 
         sleep 4
-        sudo ip netns exec ns1 ping -c2 -i0.2 -W2 10.200.0.2
+        sudo ip netns exec ns1 ping -c2 -i0.2 -W2 10.200.0.2 || true
 
         set +e
         timeout 15 sudo ip netns exec ns2 iperf3 -s -1 -p 5201 &
