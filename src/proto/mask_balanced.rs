@@ -99,6 +99,44 @@ pub fn chacha_ballast(key: &[u8; 32], nonce: u32, rounds: u8) -> ([u8; 63], usiz
     (out, blen)
 }
 
+pub fn chacha_init(key: &[u8; 32]) -> [u32; 12] {
+    let mut s = [0u32; 12];
+    s[0] = 0x6170_7865;
+    s[1] = 0x3320_646e;
+    s[2] = 0x7962_2d32;
+    s[3] = 0x6b20_6574;
+    for i in 0..8 {
+        s[4 + i] = u32::from_le_bytes(key[i * 4..(i + 1) * 4].try_into().unwrap());
+    }
+    s
+}
+
+#[inline(always)]
+pub fn chacha_block_fast(init: &[u32; 12], counter: u32, nonce: u32, rounds: u8) -> [u32; 16] {
+    let mut s = [0u32; 16];
+    s[0..12].copy_from_slice(init);
+    s[12] = counter;
+    s[13] = nonce;
+    s[14] = 0;
+    s[15] = 0;
+
+    let initial = s;
+    let dr = (rounds / 2).max(1);
+    for _ in 0..dr {
+        qr(&mut s, 0, 4, 8, 12);
+        qr(&mut s, 1, 5, 9, 13);
+        qr(&mut s, 2, 6, 10, 14);
+        qr(&mut s, 3, 7, 11, 15);
+        qr(&mut s, 0, 5, 10, 15);
+        qr(&mut s, 1, 6, 11, 12);
+        qr(&mut s, 2, 7, 8, 13);
+        qr(&mut s, 3, 4, 9, 14);
+    }
+    for i in 0..16 {
+        s[i] = s[i].wrapping_add(initial[i]);
+    }
+    s
+}
 #[cfg(test)]
 mod tests {
     use super::*;
