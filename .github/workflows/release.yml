@@ -53,17 +53,19 @@ jobs:
         mkdir -p release-out
         cd artifacts
         for f in gutd-*; do
-          # Only process files that look like compiled binaries
+          # Only process files that look like compiled binaries or tars
           if [ -f "$f" ]; then
-            chmod +x "$f"
-            
-            # Simple smoke test
-            if [ "$f" = "gutd-x86_64" ]; then
-                ./"$f" --version
+            if [[ "$f" == *.tar ]]; then
+              base="${f%.tar}"
+              NEW_NAME="${base}-${VERSION}.tar"
+            else
+              chmod +x "$f"
+              if [ "$f" = "gutd-x86_64" ]; then
+                  ./"$f" --version
+              fi
+              NEW_NAME="${f}-${VERSION}"
             fi
             
-            # Form final name like gutd-x86_64-v1.0.0
-            NEW_NAME="${f}-${VERSION}"
             cp "$f" "../release-out/$NEW_NAME"
             cd ../release-out
             sha256sum "$NEW_NAME" >> checksums.txt
@@ -123,6 +125,14 @@ jobs:
           
           ### Installation
           
+          **RouterOS (arm64)**
+          Userspace-only Docker image for RouterOS Container feature:
+          ```bash
+          # Download gutd-ros-arm64-${{ steps.version.outputs.version }}.tar from assets
+          # Upload to RouterOS and import:
+          /container/add file=gutd-ros-arm64-${{ steps.version.outputs.version }}.tar interface=veth1 logging=yes
+          ```
+
           **x86_64**
           ```bash
           wget https://github.com/sh0rch/gutd/releases/download/${{ steps.version.outputs.version }}/gutd-x86_64-${{ steps.version.outputs.version }} -O gutd

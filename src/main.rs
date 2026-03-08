@@ -342,6 +342,9 @@ fn cmd_status(args: &[String]) -> Result<()> {
 // ──────────────────────────────────────────────────────────────────
 
 fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<()> {
+    if config.global.userspace_only || std::env::var("GUTD_USERSPACE").is_ok() {
+        return gutd::userspace::run(&config);
+    }
     eprintln!("gutd {VERSION} starting...");
 
     match &reload_source {
@@ -373,7 +376,7 @@ fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<(
         return Err("TC eBPF mode is only supported on Linux".into());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
     {
         use gutd::tc::TcBpfManager;
 

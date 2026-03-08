@@ -7,7 +7,8 @@
 ### Benchmark: gutd vs wg-obfuscator
 | Tool | TCP Bandwidth | UDP Bandwidth | UDP Loss |
 |---|---|---|---|
-| **gutd** ([v2.0.0](https://github.com/sh0rch/gutd/releases/tag/v2.0.0)) | 918 Mbits/sec | 874 Mbits/sec | 0% |
+| **gutd (eBPF)** ([v2.0.0](https://github.com/sh0rch/gutd/releases/tag/v2.0.0)) | 918 Mbits/sec | 874 Mbits/sec | 0% |
+| **gutd (Userspace)** ([v2.0.0](https://github.com/sh0rch/gutd/releases/tag/v2.0.0)) | TBA | TBA | TBA |
 | **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | 315 Mbits/sec | 242 Mbits/sec | 73% |
 
 <sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. [See test logic and full logs](https://github.com/sh0rch/gutd/actions/runs/22722690185). Last updated: 2026-03-05 14:34</i></sub>
@@ -22,6 +23,8 @@ On ingress, the XDP program removes the QUIC emulation and unmasks the packet
 before passing it up. The XDP program can also optionally mock an HTTP/3 server
 by answering DPI UDP probes directly from the kernel ring buffer.
 The WireGuard process is unaware of gutd.
+
+It also features a **pure userspace mode** natively implemented with Mio that ignores all eBPF requirements. This fallback is 100% wire-compatible with the kernel eBPF path and is designed for older kernels, unprivileged containers, and specialized routers (e.g. MikroTik RouterOS).
 
 If QUIC traffic mimicry is not desired and one prefers traffic that looks like
 random UDP garbage (valid packets with checksums but intentionally not matching
@@ -41,6 +44,7 @@ of QUIC-style traffic shaping.
 - keepalive probabilistic drop to suppress WireGuard timing patterns
 - Variable padding to obscure packet sizes
 - Hot reload via SIGHUP (BPF map update, no restart)
+- Pure userspace fallback mode (zero eBPF requirements, ~500Mbps capable) for RouterOS / Mac / Unprivileged environments
 - Multi-peer support (one veth pair + BPF program per peer)
 - Static musl build supported
 - Zero OS dependencies: handles routing (Netlink) and ARP/NDP natively. Can be run in entirely empty `scratch` containers.
@@ -122,6 +126,7 @@ All supported keys (see `gutd.conf` for the annotated example):
 [global]
 outer_mtu = 1500          # outer link MTU; runtime: max(route_pmtu, iface_mtu, outer_mtu)
 stats_interval = 5        # write /run/gutd.stat every N seconds (0 = off)
+userspace_only = false      # set to true to force Mio userspace proxy instead of eBPF
 stat_file = /run/gutd.stat
 
 [peer]
@@ -163,6 +168,10 @@ gutd genkey --passphrase "my secret phrase"
 # Run with config
 sudo ./gutd gutd.conf
 
+# Run in pure userspace mode (no BPF load/mount required, no sudo on Linux if using capabilities)
+GUTD_USERSPACE=1 ./gutd gutd.conf
+# (Alternatively, set `userspace_only = true` in config)
+
 # Run with custom config path
 sudo ./gutd /etc/gutd/custom.conf
 ```
@@ -174,7 +183,75 @@ sudo ./gutd /etc/gutd/custom.conf
 sudo pkill -HUP gutd
 ```
 
-### P2P Mode (Two Machines)
+#
+## RouterOS / MikroTik Container Setup
+
+Since v2.0.0, gutd supports pure-userspace execution perfectly suited for MikroTik RouterOS (arm64). To run it, you must use the pre-built Docker tarball release.
+
+**1. Download the Image and Upload to RouterOS**
+Download the `gutd-ros-arm64-vX.Y.Z.tar` from the GitHub Releases page.
+Using WinBox or SCP, upload this file to your router (e.g. into `disk1/` or `flash/`).
+
+**2. Configure Container Networking**
+
+```routeros
+# Create a veth interface for the container
+/interface veth add name=veth-gutd address=172.16.1.2/24 gateway=172.16.1.1
+
+# Attach it to a bridge or network (assuming you want it routed)
+/interface bridge add name=bridge-containers
+/interface bridge port add bridge=bridge-containers interface=veth-gutd
+/ip address add address=172.16.1.1/24 interface=bridge-containers
+```
+
+**3. Configure gutd**
+Create a directory/file on your router to hold the configuration: `disk1/gutd/gutd.conf`
+*(You can edit this file from the RouterOS terminal using `/file/edit disk1/gutd/gutd.conf contents`)*
+
+```ini
+[global]
+userspace_only = true          # Crucial for RouterOS
+
+[peer]
+name = gut0
+bind_ip = 172.16.1.2           # The veth IP
+peer_ip = 203.0.113.10         # Your remote gutd server IP
+ports = 41000                  # UDP obfuscation port
+key = 001122...
+```
+
+**4. Create and Start the Container**
+```routeros
+# Allow container feature (requires reboot if not enabled)
+/system/device-mode/update container=yes
+
+# Create a mount point for the config file
+/container/mounts/add name=gutd_cfg src=disk1/gutd dst=/etc/gutd
+
+# Import the container from the tar file
+/container/add file=disk1/gutd-ros-arm64-v2.X.X.tar interface=veth-gutd mounts=gutd_cfg root-dir=disk1/gutd-root cmd="--config /etc/gutd/gutd.conf" logging=yes
+
+# Start the container (wait for it to extract first, status will change to "stopped")
+/container/start [find file~"gutd"]
+```
+
+**5. WireGuard and NAT rules**
+Point your local WireGuard interface to the remote WireGuard server IP, but we must route this traffic into our `gutd` container using NAT.
+
+If your WireGuard server is `10.200.0.1` and `gutd` is stripping to port `41000`:
+```routeros
+# Create local WireGuard interface
+/interface/wireguard/add name=wg0 listen-port=51820
+/interface/wireguard/peers/add interface=wg0 public-key="..." endpoint-address=10.200.0.1 endpoint-port=51820
+
+# Create a DNAT rule to intercept WireGuard traffic and send it to the container instead
+/ip/firewall/nat/add chain=dstnat dst-address=10.200.0.1 protocol=udp dst-port=51820 action=dst-nat to-addresses=172.16.1.2 to-ports=41000
+
+# Make sure the container can reach the internet
+/ip/firewall/nat/add chain=srcnat src-address=172.16.1.0/24 action=masquerade
+```
+
+## P2P Mode (Two Machines)
 
 **Machine A (10.0.0.1):**
 ```ini
