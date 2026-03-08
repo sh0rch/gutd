@@ -34,6 +34,7 @@ fn xor16(p: &mut [u8], k: &[u8]) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn quic_encap(
     buf: &mut [u8],
     orig_len: usize,
@@ -195,12 +196,11 @@ fn quic_decap(
     };
 
     // We can decrypt ports from QUIC Header
-    let enc_ports;
-    if quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
-        enc_ports = u32::from_le_bytes(buf[9..13].try_into().unwrap());
+    let enc_ports = if quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
+        u32::from_le_bytes(buf[9..13].try_into().unwrap())
     } else {
-        enc_ports = u32::from_le_bytes(buf[30..34].try_into().unwrap());
-    }
+        u32::from_le_bytes(buf[30..34].try_into().unwrap())
+    };
 
     let plain_ports = feistel32_inv(enc_ports, feistel_rk) ^ FEISTEL_SALT_PORTS;
     let wg_sport = (plain_ports >> 16) as u16;
@@ -270,7 +270,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     // Optional override for where to send egress traffic
     let peer_ip_str = env::var("GUTD_PEER_IP").unwrap_or_else(|_| peer.peer_ip.to_string());
     // For ports, use the first one from config
-    let peer_port = peer.ports.get(0).copied().unwrap_or(41000);
+    let peer_port = peer.ports.first().copied().unwrap_or(41000);
     let remote_peer_addr: SocketAddr = format!("{}:{}", peer_ip_str, peer_port).parse()?;
 
     println!("Forwarding INGRESS to local WireGuard at {}", wg_addr);

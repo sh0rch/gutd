@@ -20,6 +20,7 @@ extern "C" fn handle_exit(_: libc::c_int) {
 //  Lightweight sd_notify (no external crate)
 // ──────────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 fn sd_notify(msg: &str) {
     if let Ok(path) = std::env::var("NOTIFY_SOCKET") {
         use std::os::unix::net::UnixDatagram;
@@ -66,6 +67,7 @@ fn print_bpf_stats(managers: &[gutd::tc::TcBpfManager]) {
 }
 
 /// Dump counters to file (atomic write via tmp + rename).
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
 fn dump_counters_file(
     path: &str,
     uptime_secs: f64,
@@ -342,6 +344,7 @@ fn cmd_status(args: &[String]) -> Result<()> {
 // ──────────────────────────────────────────────────────────────────
 
 fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<()> {
+    sd_notify("READY=1");
     if config.global.userspace_only || std::env::var("GUTD_USERSPACE").is_ok() {
         return gutd::userspace::run(&config);
     }
@@ -352,7 +355,9 @@ fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<(
         None => eprintln!("Loaded config from environment variables"),
     }
 
+    #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
     let stats_interval = config.runtime.stats_interval;
+    #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
     let stat_file = config.runtime.stat_file.clone();
 
     // Signal handlers
