@@ -265,9 +265,9 @@ jobs:
         printf '[Interface]\nPrivateKey = %s\nListenPort = 51820\n\n[Peer]\nPublicKey = %s\nAllowedIPs = 10.200.0.1/32\n' \
           "$WG_SERVER_PRIV" "$WG_CLIENT_PUB" > /tmp/wg-server.conf
 
-        printf '[global]\nuserspace_only = true\n[peer]\nname = gut1\nmtu = 1500\nnic = veth1\naddress = 192.168.99.1/30\nbind_ip = 0.0.0.0\npeer_ip = 10.0.0.2\nports = %s\nkey = %s\n' \
+        printf '[global]\nuserspace_only = true\n[peer]\nname = gut1\nmtu = 1500\nnic = veth1\naddress = 192.168.99.2/30\nbind_ip = 0.0.0.0\npeer_ip = 10.0.0.2\nports = %s\nkey = %s\n' \
           "$PORTS" "$KEY" > /tmp/g1.conf
-        printf '[global]\nuserspace_only = true\n[peer]\nname = gut2\nmtu = 1500\nnic = veth2\naddress = 192.168.99.2/30\nbind_ip = 0.0.0.0\npeer_ip = 10.0.0.1\nports = %s\nkey = %s\n' \
+        printf '[global]\nuserspace_only = true\n[peer]\nname = gut2\nmtu = 1500\nnic = veth2\naddress = 192.168.99.1/30\nbind_ip = 0.0.0.0\npeer_ip = 10.0.0.1\nports = %s\nkey = %s\n' \
           "$PORTS" "$KEY" > /tmp/g2.conf
 
         sudo ip netns exec ns1 $GUTD --config /tmp/g1.conf > /tmp/gutd-ns1.log 2>&1 &
