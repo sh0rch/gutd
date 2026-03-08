@@ -1,6 +1,6 @@
 # Cross.toml — configuration for the `cross` cross-compilation tool
 #
-# Used for: aarch64, armv7, mipsel, mips targets (x86_64 builds natively via Dockerfile)
+# Used for: aarch64, armv7, mipsel, mips targets (x86_64 builds natively via Dockerfile.x86_64)
 # Custom images extend ghcr.io/cross-rs/<target> with:
 #   - clang + lld  (Rust linker — avoids GCC LTO plugin / LLVM bitcode version mismatch)
 #   - Alpine sysroot  (musl-compiled libelf.a, libzstd.a, headers)

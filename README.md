@@ -43,10 +43,11 @@ of QUIC-style traffic shaping.
 - Hot reload via SIGHUP (BPF map update, no restart)
 - Multi-peer support (one veth pair + BPF program per peer)
 - Static musl build supported
+- Zero OS dependencies: handles routing (Netlink) and ARP/NDP natively. Can be run in entirely empty `scratch` containers.
 - IPv4 and IPv6 outer transport
 - Stats readable via `gutd status` or SIGUSR1 signal
 
-## Statistics
+## Stats
 
 ```bash
 # Print BPF map counters to stderr (while daemon is running)
@@ -97,6 +98,20 @@ The musl build requires Docker (libbpf-sys cannot be cross-compiled with plain m
 
 The resulting binary is at `target/musl/gutd`.
 
+### Cross-compile for Foreign Architectures
+
+aarch64 and other static binary build also possible with musl, but requires a cross-compilation toolchain and kernel headers for the target architecture. The easiest way to get these is with `cross`, which provides pre-built toolchains and QEMU emulation for testing.
+
+Requires [`cross`](https://github.com/cross-rs/cross):
+
+```bash
+cargo install cross --git https://github.com/cross-rs/cross
+
+# Build aarch64 static binary
+cross build --release --target aarch64-unknown-linux-musl
+cp target/aarch64-unknown-linux-musl/release/gutd dist/gutd-arm64
+```
+
 See [METRICS.md](METRICS.md) for counter descriptions.
 
 ## Configuration
@@ -118,7 +133,7 @@ address = 10.0.0.1/30    # point-to-point IP on the veth (/30 or /31 only)
 bind_ip = 0.0.0.0        # local bind IP (0.0.0.0 = auto from route src)
 peer_ip = 203.0.113.10
 ports = 41000,41001       # UDP ports (must match WG listen/endpoint ports)
-keepalive_drop_percent = 75
+keepalive_drop_percent = 30
 # own_http3 = true        # eBPF XDP responder for active DPI probes on UDP ports
 key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 # passphrase = my-secret  # alternative to key (HKDF-SHA256 derived)
@@ -251,12 +266,12 @@ has no effect.
 
 In relay mode a separate machine accepts WireGuard connections from clients and
 forwards them through a gutd tunnel to the final server. This requires standard
-NAT rules — they apply to the WireGuard traffic, not the gutd ports.
+NAT rules - they apply to the WireGuard traffic, not the gutd ports.
 
 See [examples/wireguard-relay.md](examples/wireguard-relay.md) for the full
 topology. The relevant rules for each machine follow.
 
-**Relay** (e.g. `198.51.100.1`) — forwards client WireGuard traffic into the
+**Relay** (e.g. `198.51.100.1`) - forwards client WireGuard traffic into the
 gut tunnel toward the server's gut0 peer address (`10.254.0.2`):
 
 ```bash
@@ -292,7 +307,7 @@ table inet gut_relay {
 }
 ```
 
-**Server** (e.g. `203.0.113.1`) — gutd decodes tunnel packets and delivers them
+**Server** (e.g. `203.0.113.1`) - gutd decodes tunnel packets and delivers them
 to the `gut0` interface with the original destination address intact (the gut0
 peer IP and the WireGuard port configured on the relay). WireGuard receives
 them directly since it listens on `0.0.0.0`. Only MASQUERADE is needed so that
@@ -353,8 +368,8 @@ See [tests/README.md](tests/README.md) for details.
 ## Architecture
 
 gutd creates a **veth pair** (`gut0 ↔ gut0_xdp`) and attaches two BPF programs:
-- **TC egress** on `gut0` — intercepts outgoing WireGuard UDP before it hits the wire
-- **XDP ingress** on the physical NIC — intercepts incoming obfuscated UDP before the kernel stack sees it
+- **TC egress** on `gut0` - intercepts outgoing WireGuard UDP before it hits the wire
+- **XDP ingress** on the physical NIC - intercepts incoming obfuscated UDP before the kernel stack sees it
 
 WireGuard is configured to use the gutd veth address as its endpoint. It is
 unaware of gutd and sees a normal UDP socket.
@@ -447,8 +462,13 @@ ping <peer_ip>
 gutd status
 ```
 
-## Dependencies
+## Zero Dependencies and Scratch Containers
 
+gutd v2 requires no external OS binaries (like `iproute2` or `ethtool`). It is fully self-contained using raw sockets and Netlink for routing and ARP/NDP resolution. 
+
+Because of this, you can run gutd inside a completely empty Docker `scratch` container. This ensures minimal footprint and high portability across operating systems. 
+
+Libraries used in compilation:
 - `libc` - system calls
 - `anyhow` - error handling
 - `nix` - Linux-specific IO
@@ -475,12 +495,12 @@ This project is part of a lineage of WireGuard traffic obfuscation tools:
   gutd       (TC/XDP eBPF, this project)
 ```
 
-**[xt_wgobfs](https://github.com/infinet/xt_wgobfs)** – original iptables/xtables WireGuard obfuscation module created by [Wei Chen](https://github.com/infinet).  
+**[xt_wgobfs](https://github.com/infinet/xt_wgobfs)** - original iptables/xtables WireGuard obfuscation module created by [Wei Chen](https://github.com/infinet).  
 The idea of in-place masking of WireGuard payloads originates from this project and inspired the work that eventually led to `nf_wgobfs` and later `gutd`.
 
-**[nf_wgobfs](https://github.com/sh0rch/nf_wgobfs)** – NFQUEUE-based successor implementing the same concept in userspace.
+**[nf_wgobfs](https://github.com/sh0rch/nf_wgobfs)** - NFQUEUE-based successor implementing the same concept in userspace.
 
-**gutd** – TC/XDP eBPF implementation that moves packet processing into the kernel datapath and adds more advanced traffic shaping and obfuscation mechanisms.
+**gutd** - TC/XDP eBPF implementation that moves packet processing into the kernel datapath and adds more advanced traffic shaping and obfuscation mechanisms.
 
 ## References
 

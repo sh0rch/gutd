@@ -1,0 +1,25 @@
+name: Docker Container Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker-test:
+    name: E2E Test (Docker Container)
+    runs-on: ubuntu-22.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y wireguard-tools xxd iperf3
+        sudo modprobe wireguard || true
+        sudo mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
+
+    - name: Run Docker test
+      run: sudo bash tests/docker-test.sh --rebuild --ci

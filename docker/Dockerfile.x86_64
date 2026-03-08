@@ -8,7 +8,7 @@
 # For aarch64 / armv7 / mipsel / mips: use `cross` (see Cross.toml)
 #
 # Build:
-#   docker build -t gutd -f docker/Dockerfile .
+#   docker build -t gutd -f docker/Dockerfile.x86_64 .
 # Extract:
 #   CID=$(docker create gutd) && docker cp "$CID:/out/gutd" gutd && docker rm "$CID"
 

@@ -1,0 +1,66 @@
+# docker-compose example for gutd runtime container.
+#
+# Prerequisites:
+#   Build a multi-arch image and push it to a registry:
+#     bash docker/build-multiarch.sh --tag yourrepo/gutd:latest --push
+#   OR build a local single-arch image for the current machine:
+#     make docker-build DOCKER_TAG=gutd:latest
+#
+# On each host, Docker pulls the manifest variant that matches the host CPU:
+#   x86_64          → linux/amd64
+#   MikroTik AX3    → linux/arm64  (MT7986A / Cortex-A53)
+#   RPi 4 / 5       → linux/arm64
+#   armv7 boards    → linux/arm/v7
+#   MikroTik hEX    → linux/mips or linux/mipsle  (use PLATFORMS=... to include)
+#
+# Start:  docker compose -f docker/docker-compose.example.yml up -d
+# Stop:   docker compose -f docker/docker-compose.example.yml down
+# Reload: docker compose -f docker/docker-compose.example.yml kill -s HUP gutd
+# Status: docker exec gutd /gutd status
+
+services:
+  gutd:
+    image: yourrepo/gutd:latest # replace with your registry image
+    container_name: gutd
+    restart: unless-stopped
+
+    # gutd attaches TC/XDP programs to real host interfaces — host networking
+    # is required so the container sees the same NICs as the host.
+    network_mode: host
+
+    # Required Linux capabilities:
+    #   NET_ADMIN — attach TC qdisc / XDP programs
+    #   SYS_ADMIN — lock BPF map memory, pin objects to bpffs
+    #   NET_RAW   — raw socket access used by XDP helpers
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+      - NET_RAW
+
+    # BPF filesystem must be visible inside the container.
+    volumes:
+      - /sys/fs/bpf:/sys/fs/bpf
+
+    # ── Option A: config file ────────────────────────────────────────────────
+    # Uncomment and point to your config file.  Remove the `environment:` block.
+    #
+    # volumes:
+    #   - /sys/fs/bpf:/sys/fs/bpf
+    #   - /etc/gutd.conf:/etc/gutd.conf:ro
+
+    # ── Option B: environment variables (no config file needed) ─────────────
+    environment:
+      GUTD_BIND_IP: "0.0.0.0" # listen on all interfaces
+      GUTD_PEER_IP: "203.0.113.10" # change to your peer public IP
+      GUTD_ADDRESS: "10.99.0.1/30" # tunnel CIDR for this end
+      GUTD_PORTS: "41000,41001,41002,41003"
+      # GUTD_KEY: "<64-char-hex-key>"
+      GUTD_PASSPHRASE: "change-me-use-gutd-genkey-instead"
+      GUTD_NIC: "eth0" # host NIC to attach XDP to; omit for auto
+      GUTD_MTU: "1492"
+      GUTD_OUTER_MTU: "1500"
+      GUTD_OWN_HTTP3: "true"
+      GUTD_KEEPALIVE_DROP_PERCENT: "75"
+      GUTD_DEFAULT_POLICY: "allow"
+      GUTD_STATS_INTERVAL: "60"
+      # GUTD_STAT_FILE: "/run/gutd.stat"

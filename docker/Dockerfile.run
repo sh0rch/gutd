@@ -1,0 +1,93 @@
+# Runtime image for gutd — FROM scratch, fully static musl binary.
+#
+# ── Multi-arch build (recommended) ───────────────────────────────────────────
+# Use docker/build-multiarch.sh to build and push a multi-arch manifest that
+# covers linux/amd64, linux/arm64 (MikroTik AX3 / RPi4), linux/arm/v7, and
+# linux/mips (MikroTik hEX/RB7xx series).
+#
+#   bash docker/build-multiarch.sh --tag yourrepo/gutd:latest --push
+#
+# ── Single-platform build ─────────────────────────────────────────────────────
+# 1. Build the static binary for the desired platform (see BUILD.md):
+#      # x86_64
+#      docker build -t gutd-build -f docker/Dockerfile.x86_64 . && \
+#        CID=$(docker create gutd-build) && docker cp "$CID:/out/gutd" dist/gutd-amd64 && docker rm "$CID"
+#      # aarch64 (MikroTik AX3, RPi4)
+#      cross build --release --target aarch64-unknown-linux-musl && \
+#        cp target/aarch64-unknown-linux-musl/release/gutd dist/gutd-arm64
+#
+# 2. Build the runtime image for a single platform:
+#      docker build --build-arg TARGETARCH=amd64 \
+#        --platform linux/amd64 -t gutd-run -f docker/Dockerfile.run .
+#
+# ── Capabilities required at runtime ─────────────────────────────────────────
+#   NET_ADMIN  — attach/detach TC qdisc and XDP programs
+#   SYS_ADMIN  — lock memory (BPF maps), pin objects to /sys/fs/bpf
+#   NET_RAW    — raw packet access for XDP
+#
+# ── Volume / bind mounts ─────────────────────────────────────────────────────
+#   /sys/fs/bpf  — BPF filesystem must be visible inside the container
+#
+# ── Configuration — two modes ────────────────────────────────────────────────
+#
+# Mode 1 — config file:
+#   docker run --rm --privileged \
+#     -v /sys/fs/bpf:/sys/fs/bpf \
+#     -v /path/to/gutd.conf:/etc/gutd.conf:ro \
+#     --network host yourrepo/gutd:latest
+#
+# Mode 2 — environment variables (no config file needed):
+#   docker run --rm --privileged \
+#     -v /sys/fs/bpf:/sys/fs/bpf \
+#     --network host \
+#     -e GUTD_BIND_IP=0.0.0.0 \
+#     -e GUTD_PEER_IP=203.0.113.10 \
+#     -e GUTD_ADDRESS=10.99.0.1/30 \
+#     -e GUTD_PORTS=41000,41001,41002,41003 \
+#     -e GUTD_KEY=<64-char-hex> \
+#     -e GUTD_NIC=eth0 \
+#     yourrepo/gutd:latest
+#
+# ── Environment variables reference ──────────────────────────────────────────
+#
+# Required (when not using a config file):
+#   GUTD_BIND_IP    Local listen address (e.g. 0.0.0.0 or 192.168.1.1)
+#   GUTD_PEER_IP    Remote peer IP
+#   GUTD_ADDRESS    Tunnel CIDR assigned to this end (e.g. 10.99.0.1/30)
+#   GUTD_PORTS      Comma-separated port list (e.g. 41000,41001,41002,41003)
+#   GUTD_KEY        64-char hex key   —OR—
+#   GUTD_PASSPHRASE Plaintext passphrase (key derived via HKDF-SHA256)
+#
+# Optional (defaults shown):
+#   GUTD_NAME                   gut0
+#   GUTD_NIC                    (auto-detected by BPF loader)
+#   GUTD_MTU                    1492
+#   GUTD_OUTER_MTU              1500
+#   GUTD_OWN_HTTP3              true
+#   GUTD_KEEPALIVE_DROP_PERCENT 75
+#   GUTD_DEFAULT_POLICY         allow   (allow|drop non-GUT XDP ingress)
+#   GUTD_STATS_INTERVAL         0       (seconds; 0 = disabled)
+#   GUTD_STAT_FILE              /run/gutd.stat
+
+FROM scratch
+
+# TARGETARCH is injected automatically by `docker buildx`:
+#   linux/amd64   → amd64
+#   linux/arm64   → arm64   (MikroTik AX3, Raspberry Pi 4+)
+#   linux/arm/v7  → arm     (armv7 boards)
+#   linux/mips    → mips    (MikroTik hEX / RB750Gr3 / etc.)
+#   linux/mipsle  → mipsle  (MikroTik RB750r2 / hEX lite / etc.)
+#
+# The build script (docker/build-multiarch.sh) places the pre-built static
+# binaries in dist/ with these exact names before calling `docker buildx build`.
+ARG TARGETARCH=amd64
+COPY dist/gutd-${TARGETARCH} /gutd
+
+# Default: load config from file.  Override with GUTD_* env vars — the binary
+# automatically prefers env-var config when GUTD_PEER_IP is set and no
+# explicit --config flag is given.
+ENTRYPOINT ["/gutd"]
+# No default CMD — RouterOS Container appends cmd to ENTRYPOINT rather than
+# replacing it, so a default CMD would interfere with user-supplied commands.
+# Without env vars: set cmd="--config /etc/gutd.conf" in RouterOS.
+# With GUTD_* env vars: leave cmd empty — gutd auto-detects GUTD_PEER_IP.

@@ -143,6 +143,13 @@ fn dump_counters_file(
         }
     }
 
+    // Ensure parent directory exists first
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+
     // Atomic write: tmp → rename
     let tmp = format!("{path}.tmp");
     if let Err(e) = std::fs::write(&tmp, &buf).and_then(|_| std::fs::rename(&tmp, path)) {
@@ -211,15 +218,61 @@ fn main() -> Result<()> {
         i += 1;
     }
 
-    let config_path = config_path.unwrap_or_else(|| {
-        if std::path::Path::new(DEFAULT_CONFIG).exists() {
-            DEFAULT_CONFIG.to_string()
-        } else {
-            "gutd.conf".to_string()
-        }
-    });
+    let config_path_explicit = config_path.is_some();
 
-    run_daemon(&config_path)
+    // Env-var mode takes full priority — no file lookup at all.
+    if !config_path_explicit && std::env::var("GUTD_PEER_IP").is_ok() {
+        eprintln!("GUTD_PEER_IP detected — loading configuration from environment variables");
+        let config = config::load_config_from_env()?;
+        return run_daemon(config, None);
+    }
+
+    // Resolve config path: explicit > /etc/gutd.conf > ./gutd.conf > helpful error.
+    let config_path = if let Some(p) = config_path {
+        p
+    } else if std::path::Path::new(DEFAULT_CONFIG).exists() {
+        DEFAULT_CONFIG.to_string()
+    } else if std::path::Path::new("gutd.conf").exists() {
+        "gutd.conf".to_string()
+    } else {
+        eprintln!("Error: no configuration found.");
+        eprintln!();
+        eprintln!("Option 1 — environment variables (no file needed):");
+        print_env_hint();
+        eprintln!("Option 2 — config file:");
+        eprintln!("  gutd --config /path/to/gutd.conf");
+        eprintln!("  gutd install    # install system service + example config");
+        eprintln!();
+        eprintln!("Run 'gutd --help' for full reference.");
+        std::process::exit(1);
+    };
+
+    let config = match config::load_config(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            eprintln!();
+            eprintln!("Tip: use environment variables instead of a config file:");
+            print_env_hint();
+            eprintln!("Run 'gutd --help' for full reference.");
+            std::process::exit(1);
+        }
+    };
+    run_daemon(config, Some(config_path))
+}
+
+// ──────────────────────────────────────────────────────────────────
+//  Helpers
+// ──────────────────────────────────────────────────────────────────
+
+fn print_env_hint() {
+    eprintln!("  export GUTD_PEER_IP=<remote-ip>");
+    eprintln!("  export GUTD_BIND_IP=0.0.0.0");
+    eprintln!("  export GUTD_ADDRESS=10.0.0.1/30");
+    eprintln!("  export GUTD_PORTS=41000,41001,41002,41003");
+    eprintln!("  export GUTD_KEY=<64-char-hex>   # or GUTD_PASSPHRASE=<phrase>");
+    eprintln!("  gutd");
+    eprintln!();
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -288,11 +341,13 @@ fn cmd_status(args: &[String]) -> Result<()> {
 //  Daemon main loop
 // ──────────────────────────────────────────────────────────────────
 
-fn run_daemon(config_path: &str) -> Result<()> {
+fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<()> {
     eprintln!("gutd {VERSION} starting...");
 
-    let config = config::load_config(config_path)?;
-    eprintln!("Loaded config from {config_path}");
+    match &reload_source {
+        Some(path) => eprintln!("Loaded config from {path}"),
+        None => eprintln!("Loaded config from environment variables"),
+    }
 
     let stats_interval = config.runtime.stats_interval;
     let stat_file = config.runtime.stat_file.clone();
@@ -382,8 +437,17 @@ fn run_daemon(config_path: &str) -> Result<()> {
             if reload::should_reload() {
                 reload::clear_reload_flag();
                 sd_notify("RELOADING=1");
-                eprintln!("SIGHUP received — reloading config from {config_path}");
-                match config::load_config(config_path) {
+                let new_config_result = match &reload_source {
+                    Some(path) => {
+                        eprintln!("SIGHUP received — reloading config from {path}");
+                        config::load_config(path)
+                    }
+                    None => {
+                        eprintln!("SIGHUP received — reloading config from environment variables");
+                        config::load_config_from_env()
+                    }
+                };
+                match new_config_result {
                     Ok(new_config) => {
                         let mut any_err = false;
                         for mgr in &mut managers {
@@ -418,7 +482,9 @@ fn run_daemon(config_path: &str) -> Result<()> {
         }
 
         // Final stats
-        dump_counters_file(&stat_file, start.elapsed().as_secs_f64(), &managers);
+        if stats_ticks_target > 0 {
+            dump_counters_file(&stat_file, start.elapsed().as_secs_f64(), &managers);
+        }
         print_bpf_stats(&managers);
         eprintln!("Exiting, BPF programs will be detached");
     }
