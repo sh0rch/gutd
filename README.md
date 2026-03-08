@@ -7,11 +7,10 @@
 ### Benchmark: gutd vs wg-obfuscator
 | Tool | TCP Bandwidth | UDP Bandwidth | UDP Loss |
 |---|---|---|---|
-| **gutd (eBPF)** ([v2.0.0](https://github.com/sh0rch/gutd/releases/tag/v2.0.0)) | 918 Mbits/sec | 874 Mbits/sec | 0% |
-| **gutd (Userspace)** ([v2.0.0](https://github.com/sh0rch/gutd/releases/tag/v2.0.0)) | TBA | TBA | TBA |
-| **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | 315 Mbits/sec | 242 Mbits/sec | 73% |
-
-<sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. [See test logic and full logs](https://github.com/sh0rch/gutd/actions/runs/22815723781). Last updated: 2026-03-08 06:37</i></sub>
+| **gutd (eBPF)** ([v2.2.0](https://github.com/sh0rch/gutd/releases/tag/v2.2.0)) | 873 Mbits/sec | 790 Mbits/sec | 0% |
+| **gutd (Userspace)** ([v2.2.0](https://github.com/sh0rch/gutd/releases/tag/v2.2.0)) | 930 Mbits/sec | 689 Mbits/sec | 28% |
+| **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | 323 Mbits/sec | 261 Mbits/sec | 68% |
+<sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. [See test logic and full logs](https://github.com/sh0rch/gutd/actions/runs/22830260411). Last updated: 2026-03-08 21:30</i></sub>
 <!-- INTEGRATION_TEST_RESULTS_END -->
 
 
