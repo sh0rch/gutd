@@ -253,13 +253,20 @@ cleanup_wireguard_baseline() {
 
 # Setup gutd relay + server
 setup_gutd() {
-    log "Setting up gutd relay and server..."
+    local mode=${1:-ebpf}
+    log "Setting up gutd relay and server (mode: $mode)..."
+    
+    local userspace_line=""
+    if [ "$mode" = "userspace" ]; then
+        userspace_line="userspace_only = true"
+    fi
     
     # gutd config for relay (in server_ns)
     cat > /tmp/gutd-relay.conf <<EOF
 [global]
 outer_mtu = 1500
 stats_interval = 0
+$userspace_line
 
 [peer]
 name = gut0
@@ -278,6 +285,7 @@ EOF
 [global]
 outer_mtu = 1500
 stats_interval = 0
+$userspace_line
 
 [peer]
 name = gut1
@@ -482,6 +490,7 @@ EOF
 
 # Test WireGuard through gutd
 test_wireguard_via_gutd() {
+    local mode=${1:-ebpf}
     log "Testing WireGuard through gutd tunnel..."
     
     # Start iperf3 server on host
@@ -535,7 +544,11 @@ test_wireguard_via_gutd() {
     local throughput_mbps=$(echo "scale=2; $throughput / 1000000" | bc)
     
     log "WireGuard via gutd throughput: ${throughput_mbps} Mbps"
-    echo "wireguard_gutd_mbps=$throughput_mbps" >> "$RESULTS_FILE"
+    if [ "$mode" = "userspace" ]; then
+        echo "wireguard_gutd_userspace_mbps=$throughput_mbps" >> "$RESULTS_FILE"
+    else
+        echo "wireguard_gutd_mbps=$throughput_mbps" >> "$RESULTS_FILE"
+    fi
     
     # Analyze captured packets
     local wire_packets
@@ -705,14 +718,23 @@ main() {
     
     sleep 2
     
-    # Test 2: WireGuard through gutd
-    log "=== Test 2: WireGuard via gutd ==="
-    setup_gutd
+    # Test 2: WireGuard through gutd (eBPF)
+    log "=== Test 2: WireGuard via gutd (eBPF) ==="
+    setup_gutd "ebpf"
     setup_wireguard_via_gutd
-    test_wireguard_via_gutd
+    test_wireguard_via_gutd "ebpf"
     
-    # Test 3: QUIC anti-probing
-    log "=== Test 3: QUIC anti-probing ==="
+    cleanup_gutd
+    sleep 2
+
+    # Test 3: WireGuard through gutd (Userspace)
+    log "=== Test 3: WireGuard via gutd (Userspace) ==="
+    setup_gutd "userspace"
+    setup_wireguard_via_gutd
+    test_wireguard_via_gutd "userspace"
+
+    # Test 4: QUIC anti-probing
+    log "=== Test 4: QUIC anti-probing ==="
     test_quic_antiprobe
 
     # Compare

@@ -33,6 +33,7 @@ impl Config {
 #[derive(Clone)]
 pub struct GlobalConfig {
     pub outer_mtu: u16,
+    pub userspace_only: bool,
 }
 
 /// XDP default policy for non-GUT traffic on the ingress NIC.
@@ -148,6 +149,9 @@ pub fn load_config_from_env() -> Result<Config> {
         .unwrap_or_else(|_| "1492".to_string())
         .parse()
         .map_err(|e| format!("GUTD_MTU: {e}"))?;
+    let userspace_only: bool = std::env::var("GUTD_USERSPACE_ONLY")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
     let outer_mtu: u16 = std::env::var("GUTD_OUTER_MTU")
         .unwrap_or_else(|_| "1500".to_string())
         .parse()
@@ -183,7 +187,10 @@ pub fn load_config_from_env() -> Result<Config> {
         std::env::var("GUTD_STAT_FILE").unwrap_or_else(|_| "/run/gutd.stat".to_string());
 
     Ok(Config {
-        global: GlobalConfig { outer_mtu },
+        global: GlobalConfig {
+            outer_mtu,
+            userspace_only,
+        },
         runtime: RuntimeConfig {
             stats_interval,
             stat_file,
@@ -289,6 +296,7 @@ impl PeerBuilder {
 #[allow(clippy::too_many_lines)]
 fn parse_config(content: &str) -> Result<Config> {
     let mut outer_mtu = 1500u16;
+    let mut userspace_only = false;
     let mut stats_interval = 5u32;
     let mut stat_file = "/run/gutd.stat".to_string();
 
@@ -336,6 +344,7 @@ fn parse_config(content: &str) -> Result<Config> {
             match current_section {
                 "global" => match key_name {
                     "outer_mtu" => outer_mtu = value.parse()?,
+                    "userspace_only" => userspace_only = value.parse()?,
                     "stats_interval" => stats_interval = value.parse()?,
                     "stat_file" => stat_file = value.trim_matches('"').to_string(),
                     _ => {}
@@ -439,7 +448,10 @@ fn parse_config(content: &str) -> Result<Config> {
     }
 
     Ok(Config {
-        global: GlobalConfig { outer_mtu },
+        global: GlobalConfig {
+            outer_mtu,
+            userspace_only,
+        },
         runtime: RuntimeConfig {
             stats_interval,
             stat_file,
