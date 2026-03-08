@@ -93,6 +93,15 @@ jobs:
         WGOBFS_TCP: ${{ needs.benchmark-wgobfs.outputs.tcp }}
         WGOBFS_UDP: ${{ needs.benchmark-wgobfs.outputs.udp }}
         WGOBFS_UDP_LOSS: ${{ needs.benchmark-wgobfs.outputs.loss }}
+
+  benchmark-gutd:
+    name: Benchmark gutd
+    runs-on: ubuntu-22.04
+    outputs:
+      tcp: ${{ steps.run-test.outputs.GUTD_TCP }}
+      udp: ${{ steps.run-test.outputs.GUTD_UDP }}
+      loss: ${{ steps.run-test.outputs.GUTD_UDP_LOSS }}
+      tag: ${{ steps.run-test.outputs.GUTD_LATEST_TAG }}
         GUTD_TCP: ${{ needs.benchmark-gutd.outputs.tcp }}
         GUTD_UDP: ${{ needs.benchmark-gutd.outputs.udp }}
         GUTD_UDP_LOSS: ${{ needs.benchmark-gutd.outputs.loss }}
