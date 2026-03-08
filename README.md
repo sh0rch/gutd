@@ -185,7 +185,7 @@ sudo pkill -HUP gutd
 #
 ## RouterOS / MikroTik Container Setup
 
-Since v2.0.0, gutd supports pure-userspace execution perfectly suited for MikroTik RouterOS (arm64). To run it, you must use the pre-built Docker tarball release.
+Since v2.2.0, gutd supports pure-userspace execution perfectly suited for MikroTik RouterOS (arm64). To run it, you must use the pre-built Docker tarball release.
 
 **1. Download the Image and Upload to RouterOS**
 Download the `gutd-ros-arm64-vX.Y.Z.tar` from the GitHub Releases page.
