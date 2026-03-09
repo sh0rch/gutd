@@ -24,6 +24,52 @@ key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 # passphrase = my-secret  # alternative to key (HKDF-SHA256 derived)
 ```
 
+## Environment Variables
+
+When `GUTD_PEER_IP` is set and no config file is passed via CLI, gutd reads all settings from environment variables instead of a config file. This is convenient for Docker/container deployments.
+
+| Env Var | Required | Default | Config Equivalent |
+|---|---|---|---|
+| `GUTD_PEER_IP` | **yes** | — | `peer_ip` |
+| `GUTD_BIND_IP` | **yes** | — | `bind_ip` |
+| `GUTD_ADDRESS` | **yes** | — | `address` |
+| `GUTD_PORTS` | **yes** | — | `ports` |
+| `GUTD_KEY` | **yes**\* | — | `key` |
+| `GUTD_SECRET` | alias | — | `key` (fallback for `GUTD_KEY`) |
+| `GUTD_CIPHER` | alias | — | `key` (fallback for `GUTD_SECRET`) |
+| `GUTD_PASSPHRASE` | **yes**\* | — | `passphrase` (used if no key vars set) |
+| `GUTD_PHRASE` | alias | — | `passphrase` (fallback for `GUTD_PASSPHRASE`) |
+| `GUTD_NAME` | no | `gut0` | `name` |
+| `GUTD_MTU` | no | `1492` | `mtu` |
+| `GUTD_OUTER_MTU` | no | `1500` | `outer_mtu` |
+| `GUTD_NIC` | no | auto | `nic` |
+| `GUTD_DEFAULT_POLICY` | no | `allow` | `default_policy` |
+| `GUTD_KEEPALIVE_DROP_PCT` | no | `30` | `keepalive_drop_percent` |
+| `GUTD_OWN_HTTP3` | no | `true` | `own_http3` |
+| `GUTD_USERSPACE_ONLY` | no | `false` | `userspace_only` |
+| `GUTD_STATS_INTERVAL` | no | `5` | `stats_interval` |
+| `GUTD_STAT_FILE` | no | `/run/gutd.stat` | `stat_file` |
+
+\* One of `GUTD_KEY`/`GUTD_SECRET`/`GUTD_CIPHER` **or** `GUTD_PASSPHRASE`/`GUTD_PHRASE` is required.
+
+### Runtime overrides (always checked, both modes)
+
+| Env Var | Description |
+|---|---|
+| `GUTD_USERSPACE` | If set to any value, forces userspace proxy mode regardless of config |
+| `GUTD_FORCE_L4_CSUM` | Set to `0`/`false`/`no` to disable BPF inner L4 checksum (debug) |
+
+Minimal env-var example:
+
+```bash
+export GUTD_PEER_IP=203.0.113.10
+export GUTD_BIND_IP=0.0.0.0
+export GUTD_ADDRESS=10.0.0.1/30
+export GUTD_PORTS=41000
+export GUTD_KEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+sudo ./gutd
+```
+
 ## Key Generation
 
 ```bash
