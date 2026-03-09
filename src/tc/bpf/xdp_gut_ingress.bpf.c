@@ -179,6 +179,38 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             return -1;
     }
 
+    /* ── Dynamic peer endpoint learning ──────────────────────────────
+     * When dynamic_peer==1 (server mode, peer behind NAT), record the
+     * real source IP:port of this crypto-validated packet so TC egress
+     * knows where to send replies. */
+    if (cfg->dynamic_peer)
+    {
+        struct peer_endpoint *ep = bpf_map_lookup_elem(&peer_endpoint_map, &zero);
+        if (ep)
+        {
+            if (ipver == 4)
+            {
+                struct iphdr *src_iph = (void *)((__u8 *)data + ip_off);
+                if ((void *)(src_iph + 1) <= data_end)
+                {
+                    ep->ip4 = src_iph->saddr;
+                    __builtin_memset(ep->ip6, 0, 16);
+                }
+            }
+            else
+            {
+                struct ipv6hdr *src_ip6h = (void *)((__u8 *)data + ip_off);
+                if ((void *)(src_ip6h + 1) <= data_end)
+                {
+                    ep->ip4 = 0;
+                    __builtin_memcpy(ep->ip6, &src_ip6h->saddr, 16);
+                }
+            }
+            ep->port = bpf_ntohs(udph->source);
+            ep->valid = 1;
+        }
+    }
+
     /* Read feistel-encrypted ports from the QUIC header (4 bytes, stored by TC egress).
      * Short header (GUT_QUIC_SHORT_HEADER_SIZE=14): enc_ports at bytes [9-12].
      * Long header  (GUT_QUIC_LONG_HEADER_SIZE=100): enc_ports at bytes [30-33].

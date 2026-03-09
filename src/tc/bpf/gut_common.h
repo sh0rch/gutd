@@ -100,7 +100,20 @@ struct gut_config
     __u8 tun_local_ip6[16];      /* Local veth IPv6 (zero if v4 only) */
     __u8 tun_peer_ip6[16];       /* Remote veth peer IPv6 (zero if v4 only) */
     __u8 own_http3;              /* Respond to DPI probes via XDP_TX (1=yes) */
+    __u8 dynamic_peer;           /* 1 = peer_ip unknown, learn from validated inbound packets */
 } __attribute__((packed));
+
+/* Dynamic peer endpoint — learned from validated inbound packets.
+ * Updated by XDP ingress after DCID/PPN crypto-validation passes.
+ * Read by TC egress to set outer IP dst + UDP dst port. */
+struct peer_endpoint
+{
+    __u32 ip4;    /* Last-seen IPv4 (network byte order), 0 if IPv6 */
+    __u8 ip6[16]; /* Last-seen IPv6 (network byte order), zero if IPv4 */
+    __u16 port;   /* Last-seen UDP source port (host byte order) */
+    __u8 valid;   /* 1 = endpoint learned, 0 = not yet */
+    __u8 _pad;    /* alignment */
+};
 
 /* Per-CPU statistics */
 struct gut_stats
@@ -157,6 +170,16 @@ struct
     __type(value, __u8[SCRATCH_SIZE]);
 } scratch_map SEC(".maps");
 
+/* Dynamic peer endpoint map — shared between XDP ingress (writer) and TC egress (reader).
+ * Only used when gut_config.dynamic_peer == 1 (server mode, peer behind NAT). */
+struct
+{
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct peer_endpoint);
+} peer_endpoint_map SEC(".maps");
+
 /* Compile-time ChaCha round count.  Override at build via -DCHACHA_ROUNDS=N.
  * Must match between sender and receiver BPF programs.
  * Default: 4 (ChaCha4 — 2 double-rounds).  Valid: 2,4,6,...,20. */
@@ -200,34 +223,34 @@ struct
 
 /* ChaCha quarter-round on a __u32 state array at compile-time-constant indices.
  * All index arguments must be integer literals so the BPF verifier sees fixed offsets. */
-#define CHACHA_QR_IDX(st, ai, bi, ci, di)            \
-    do                                               \
-    {                                                \
-        st[ai] += st[bi];                            \
-        st[di] ^= st[ai];                            \
-        st[di] = (st[di] << 16) | (st[di] >> 16);   \
-        st[ci] += st[di];                            \
-        st[bi] ^= st[ci];                            \
-        st[bi] = (st[bi] << 12) | (st[bi] >> 20);   \
-        st[ai] += st[bi];                            \
-        st[di] ^= st[ai];                            \
-        st[di] = (st[di] << 8) | (st[di] >> 24);    \
-        st[ci] += st[di];                            \
-        st[bi] ^= st[ci];                            \
-        st[bi] = (st[bi] << 7) | (st[bi] >> 25);    \
+#define CHACHA_QR_IDX(st, ai, bi, ci, di)         \
+    do                                            \
+    {                                             \
+        st[ai] += st[bi];                         \
+        st[di] ^= st[ai];                         \
+        st[di] = (st[di] << 16) | (st[di] >> 16); \
+        st[ci] += st[di];                         \
+        st[bi] ^= st[ci];                         \
+        st[bi] = (st[bi] << 12) | (st[bi] >> 20); \
+        st[ai] += st[bi];                         \
+        st[di] ^= st[ai];                         \
+        st[di] = (st[di] << 8) | (st[di] >> 24);  \
+        st[ci] += st[di];                         \
+        st[bi] ^= st[ci];                         \
+        st[bi] = (st[bi] << 7) | (st[bi] >> 25);  \
     } while (0)
 
 /* One ChaCha double-round (column + diagonal) operating in-place on st[16].
  * Uses CHACHA_QR_IDX so all indices are compile-time constants — no stack needed. */
-#define CHACHA_DOUBLE_ROUND_IDX(st)       \
-    CHACHA_QR_IDX(st, 0,  4,  8, 12);    \
-    CHACHA_QR_IDX(st, 1,  5,  9, 13);    \
-    CHACHA_QR_IDX(st, 2,  6, 10, 14);    \
-    CHACHA_QR_IDX(st, 3,  7, 11, 15);    \
-    CHACHA_QR_IDX(st, 0,  5, 10, 15);    \
-    CHACHA_QR_IDX(st, 1,  6, 11, 12);    \
-    CHACHA_QR_IDX(st, 2,  7,  8, 13);    \
-    CHACHA_QR_IDX(st, 3,  4,  9, 14)
+#define CHACHA_DOUBLE_ROUND_IDX(st)  \
+    CHACHA_QR_IDX(st, 0, 4, 8, 12);  \
+    CHACHA_QR_IDX(st, 1, 5, 9, 13);  \
+    CHACHA_QR_IDX(st, 2, 6, 10, 14); \
+    CHACHA_QR_IDX(st, 3, 7, 11, 15); \
+    CHACHA_QR_IDX(st, 0, 5, 10, 15); \
+    CHACHA_QR_IDX(st, 1, 6, 11, 12); \
+    CHACHA_QR_IDX(st, 2, 7, 8, 13);  \
+    CHACHA_QR_IDX(st, 3, 4, 9, 14)
 
 /* Generate 64 bytes of ChaCha keystream into ks[16].
  * chacha_init[12] = loader-precomputed constants+key.
@@ -244,12 +267,18 @@ static __attribute__((noinline)) void chacha_block(__u32 ks[16],
                                                    __u32 counter, __u32 nonce)
 {
     /* Load initial state into ks[] — no s0..s15 locals, no stack pressure. */
-    ks[0]  = chacha_init[0];  ks[1]  = chacha_init[1];
-    ks[2]  = chacha_init[2];  ks[3]  = chacha_init[3];
-    ks[4]  = chacha_init[4];  ks[5]  = chacha_init[5];
-    ks[6]  = chacha_init[6];  ks[7]  = chacha_init[7];
-    ks[8]  = chacha_init[8];  ks[9]  = chacha_init[9];
-    ks[10] = chacha_init[10]; ks[11] = chacha_init[11];
+    ks[0] = chacha_init[0];
+    ks[1] = chacha_init[1];
+    ks[2] = chacha_init[2];
+    ks[3] = chacha_init[3];
+    ks[4] = chacha_init[4];
+    ks[5] = chacha_init[5];
+    ks[6] = chacha_init[6];
+    ks[7] = chacha_init[7];
+    ks[8] = chacha_init[8];
+    ks[9] = chacha_init[9];
+    ks[10] = chacha_init[10];
+    ks[11] = chacha_init[11];
     ks[12] = counter;
     ks[13] = nonce;
     ks[14] = 0;
@@ -304,12 +333,18 @@ static __attribute__((noinline)) void chacha_block(__u32 ks[16],
 #endif
 
     /* Add initial state back (re-read chacha_init instead of keeping copies). */
-    ks[0]  += chacha_init[0];  ks[1]  += chacha_init[1];
-    ks[2]  += chacha_init[2];  ks[3]  += chacha_init[3];
-    ks[4]  += chacha_init[4];  ks[5]  += chacha_init[5];
-    ks[6]  += chacha_init[6];  ks[7]  += chacha_init[7];
-    ks[8]  += chacha_init[8];  ks[9]  += chacha_init[9];
-    ks[10] += chacha_init[10]; ks[11] += chacha_init[11];
+    ks[0] += chacha_init[0];
+    ks[1] += chacha_init[1];
+    ks[2] += chacha_init[2];
+    ks[3] += chacha_init[3];
+    ks[4] += chacha_init[4];
+    ks[5] += chacha_init[5];
+    ks[6] += chacha_init[6];
+    ks[7] += chacha_init[7];
+    ks[8] += chacha_init[8];
+    ks[9] += chacha_init[9];
+    ks[10] += chacha_init[10];
+    ks[11] += chacha_init[11];
     ks[12] += counter;
     ks[13] += nonce;
     /* ks[14] += 0 and ks[15] += 0 are no-ops; values stay correct. */

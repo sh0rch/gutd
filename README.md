@@ -30,6 +30,7 @@
 - Multi-peer support (one veth pair + BPF program per peer)
 - Static musl build, zero OS dependencies — runs in empty `scratch` containers
 - IPv4 and IPv6 outer transport
+- Dynamic peer endpoint learning for clients behind NAT (`peer_ip = dynamic`)
 - Stats via `gutd status` or SIGUSR1 signal
 
 ## Quick Start

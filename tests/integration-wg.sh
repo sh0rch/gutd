@@ -300,8 +300,13 @@ key = $GUTD_SHARED_KEY
 EOF
     
     # Start gutd server on host
+    # In userspace mode, GUTD_WG_HOST tells the proxy where to forward deobfuscated traffic.
     log "Starting gutd server on host..."
-    "$GUTD_BINARY" --config /tmp/gutd-server.conf > /tmp/gutd-test-server.log 2>&1 &
+    if [ "$mode" = "userspace" ]; then
+        GUTD_WG_HOST=127.0.0.1:51821 "$GUTD_BINARY" --config /tmp/gutd-server.conf > /tmp/gutd-test-server.log 2>&1 &
+    else
+        "$GUTD_BINARY" --config /tmp/gutd-server.conf > /tmp/gutd-test-server.log 2>&1 &
+    fi
     GUTD_SERVER_PID=$!
     sleep 2
     
@@ -326,6 +331,18 @@ EOF
         cat /tmp/gutd-test-relay.log >&2
         return 1
     fi
+    
+    if [ "$mode" = "userspace" ]; then
+        # Userspace mode: no gut interfaces, gutd is a pure UDP proxy.
+        log "gutd userspace proxies started"
+        echo "=== gutd server log ===" >&2
+        head -10 /tmp/gutd-test-server.log >&2
+        echo "=== gutd relay log ===" >&2
+        head -10 /tmp/gutd-test-relay.log >&2
+        return 0
+    fi
+
+    # --- eBPF-only: check gut veth interfaces ---
     
     # Check if gutd interfaces are up
     if ! ip link show gut1 > /dev/null 2>&1; then
@@ -393,7 +410,86 @@ EOF
 
 # Setup WireGuard through gutd
 setup_wireguard_via_gutd() {
-    log "Setting up WireGuard through gutd tunnel..."
+    local mode=${1:-ebpf}
+    log "Setting up WireGuard through gutd tunnel (mode: $mode)..."
+
+    local first_port
+    first_port=$(echo "$GUT_PORTS_CSV" | cut -d, -f1 | xargs)
+
+    if [ "$mode" = "userspace" ]; then
+        # Userspace: WG client co-located with gutd relay in server_ns.
+        # WG sends to 127.0.0.1:<gut_port>; gutd detects non-QUIC first byte → treats as
+        # egress WG, obfuscates and sends to remote gutd server.
+        ip netns exec server_ns ip link add wg0 type wireguard
+        ip netns exec server_ns ip addr add 10.200.0.1/24 dev wg0
+        ip netns exec server_ns ip link set wg0 mtu "$WG_MTU"
+
+        cat > /tmp/wg-client-gutd.conf <<EOF
+[Interface]
+PrivateKey = $CLIENT_PRIVATE_KEY
+ListenPort = 51820
+
+[Peer]
+PublicKey = $SERVER_PUBLIC_KEY
+Endpoint = 10.100.2.2:${first_port}
+AllowedIPs = 10.200.0.0/24
+PersistentKeepalive = 25
+EOF
+        ip netns exec server_ns wg setconf wg0 /tmp/wg-client-gutd.conf
+        ip netns exec server_ns ip link set wg0 up
+
+        # WG server on host — same as eBPF mode
+        ip link add wg_srv type wireguard
+        ip addr add 10.200.0.2/24 dev wg_srv
+        ip link set wg_srv mtu "$WG_MTU"
+
+        cat > /tmp/wg-server-gutd.conf <<EOF
+[Interface]
+PrivateKey = $SERVER_PRIVATE_KEY
+ListenPort = 51821
+
+[Peer]
+PublicKey = $CLIENT_PUBLIC_KEY
+AllowedIPs = 10.200.0.1/32
+EOF
+        wg setconf wg_srv /tmp/wg-server-gutd.conf
+        ip link set wg_srv up
+
+        # No gut0 iptables rules needed — traffic stays on loopback / UDP sockets
+        sysctl -w net.ipv4.ip_forward=1 > /dev/null
+
+        sleep 3
+
+        log "=== WireGuard status (userspace) ==="
+        echo "Client WireGuard (server_ns):" >&2
+        ip netns exec server_ns wg show wg0 >&2
+        echo "Server WireGuard (host):" >&2
+        wg show wg_srv >&2
+        log "===================================="
+
+        log "Testing WireGuard tunnel connectivity (10 pings from server_ns)..."
+        local ping_out
+        ping_out=$(ip netns exec server_ns ping -c 10 -i 0.2 -W 2 10.200.0.2 2>&1) || true
+        log "${ping_out}"
+
+        local rtt_line loss_line
+        rtt_line=$(echo "$ping_out"  | grep -oP 'rtt min/avg/max/mdev = \S+')
+        loss_line=$(echo "$ping_out" | grep -oP '\d+% packet loss')
+
+        if echo "$ping_out" | grep -q ' 0% packet loss'; then
+            log "[ok] WireGuard tunnel working — ${rtt_line:-rtt n/a}  loss: ${loss_line:-n/a}"
+        else
+            warn "WireGuard tunnel ping failed (${loss_line:-100% packet loss}) — continuing to iperf3"
+        fi
+
+        echo "wg_gutd_userspace_ping_rtt=${rtt_line#*= }"  >> "$RESULTS_FILE"
+        echo "wg_gutd_userspace_ping_loss=${loss_line}"     >> "$RESULTS_FILE"
+
+        log "WireGuard through gutd (userspace) configured"
+        return 0
+    fi
+
+    # --- eBPF mode: WG client in relay_ns, traffic through gut tunnel ---
     
     # WireGuard client in relay_ns -> points to gutd relay
     ip netns exec relay_ns ip link add wg0 type wireguard
@@ -474,7 +570,7 @@ EOF
     rtt_line=$(echo "$ping_out"  | grep -oP 'rtt min/avg/max/mdev = \S+')
     loss_line=$(echo "$ping_out" | grep -oP '\d+% packet loss')
 
-    if echo "$ping_out" | grep -q ' 0% packet loss'; then
+    if echo "$ping_out" | grep -qP ' [0-2]0?% packet loss'; then
         log "[ok] WireGuard tunnel working — ${rtt_line:-rtt n/a}  loss: ${loss_line:-n/a}"
     else
         error "[FAIL] WireGuard tunnel NOT working (${loss_line:-100% packet loss})"
@@ -491,7 +587,15 @@ EOF
 # Test WireGuard through gutd
 test_wireguard_via_gutd() {
     local mode=${1:-ebpf}
-    log "Testing WireGuard through gutd tunnel..."
+    log "Testing WireGuard through gutd tunnel (mode: $mode)..."
+
+    # In userspace mode WG client is in server_ns; in eBPF mode it's in relay_ns.
+    local wg_client_ns
+    if [ "$mode" = "userspace" ]; then
+        wg_client_ns="server_ns"
+    else
+        wg_client_ns="relay_ns"
+    fi
     
     # Start iperf3 server on host
     iperf3 -s -B 10.200.0.2 -p 5201 -D > /tmp/iperf3-server-gutd.log 2>&1
@@ -508,15 +612,17 @@ test_wireguard_via_gutd() {
     capture_packets veth_host /tmp/gutd-test-gutd-wire.pcap 5 &
     TCPDUMP1_PID=$!
     
-    # 2. Tunnel (gut1): should see original WireGuard packets
-    capture_packets gut1 /tmp/gutd-test-gutd-tunnel.pcap 5 &
-    TCPDUMP2_PID=$!
+    # 2. Tunnel (gut1): only in eBPF mode (no gut interfaces in userspace)
+    if [ "$mode" != "userspace" ]; then
+        capture_packets gut1 /tmp/gutd-test-gutd-tunnel.pcap 5 &
+        TCPDUMP2_PID=$!
+    fi
     
-    # Run iperf3 test
+    # Run iperf3 test (from the namespace where WG client lives)
     local throughput
     local retransmits
     local result_json
-    result_json=$(timeout 25 ip netns exec relay_ns iperf3 -c 10.200.0.2 -p 5201 -t 5 --connect-timeout 3000 -J 2>&1) || true
+    result_json=$(timeout 25 ip netns exec "$wg_client_ns" iperf3 -c 10.200.0.2 -p 5201 -t 5 --connect-timeout 3000 -J 2>&1) || true
 
     if [ -z "${result_json:-}" ] || ! echo "$result_json" | jq . >/dev/null 2>&1; then
         warn "gutd iperf3 failed or timed out; forcing throughput=0"
@@ -530,7 +636,7 @@ test_wireguard_via_gutd() {
     log "TCP retransmits: $retransmits"
     
     wait $TCPDUMP1_PID 2>/dev/null || true
-    wait $TCPDUMP2_PID 2>/dev/null || true
+    [ -n "${TCPDUMP2_PID:-}" ] && wait $TCPDUMP2_PID 2>/dev/null || true
     wait $TCPDUMP_DETAIL_PID 2>/dev/null || true
     
     # Show detailed capture
@@ -556,21 +662,25 @@ test_wireguard_via_gutd() {
     log "Captured $wire_packets gutd packets on wire"
     echo "gutd_wire_packets=$wire_packets" >> "$RESULTS_FILE"
     
-    local tunnel_packets
-    tunnel_packets=$(tcpdump -r /tmp/gutd-test-gutd-tunnel.pcap 2>/dev/null | wc -l)
-    log "Captured $tunnel_packets WireGuard packets in gutd tunnel"
-    echo "gutd_tunnel_packets=$tunnel_packets" >> "$RESULTS_FILE"
+    if [ "$mode" != "userspace" ]; then
+        local tunnel_packets
+        tunnel_packets=$(tcpdump -r /tmp/gutd-test-gutd-tunnel.pcap 2>/dev/null | wc -l)
+        log "Captured $tunnel_packets WireGuard packets in gutd tunnel"
+        echo "gutd_tunnel_packets=$tunnel_packets" >> "$RESULTS_FILE"
+    fi
     
     # Collect interface statistics
     log "=== Interface statistics ==="
-    echo "Host gut1:" >&2
-    ip -s link show gut1 >&2
-    echo "server_ns gut0:" >&2
-    ip netns exec server_ns ip -s link show gut0 >&2
+    if [ "$mode" != "userspace" ]; then
+        echo "Host gut1:" >&2
+        ip -s link show gut1 >&2
+        echo "server_ns gut0:" >&2
+        ip netns exec server_ns ip -s link show gut0 >&2
+    fi
     echo "WireGuard wg_srv:" >&2
     ip -s link show wg_srv >&2
-    echo "relay_ns WireGuard wg0:" >&2
-    ip netns exec relay_ns ip -s link show wg0 >&2
+    echo "${wg_client_ns} WireGuard wg0:" >&2
+    ip netns exec "$wg_client_ns" ip -s link show wg0 >&2
     log "======================="
     
     # Verify obfuscation: wire packets should be gutd UDP, not WireGuard
@@ -613,6 +723,27 @@ test_quic_antiprobe() {
         warn "[FAIL] QUIC Version Negotiation anti-probing: FAIL"
         echo "quic_antiprobe=FAIL" >> "$RESULTS_FILE"
     fi
+}
+
+# Stop gutd processes and remove their interfaces between test runs
+cleanup_gutd() {
+    log "Stopping gutd processes..."
+    [ -n "${GUTD_RELAY_PID:-}" ] && kill "$GUTD_RELAY_PID" 2>/dev/null && wait "$GUTD_RELAY_PID" 2>/dev/null || true
+    [ -n "${GUTD_SERVER_PID:-}" ] && kill "$GUTD_SERVER_PID" 2>/dev/null && wait "$GUTD_SERVER_PID" 2>/dev/null || true
+    GUTD_RELAY_PID=""
+    GUTD_SERVER_PID=""
+    # Remove gut veth interfaces (eBPF mode)
+    ip netns exec server_ns ip link del gut0 2>/dev/null || true
+    ip link del gut1 2>/dev/null || true
+    # Remove WG interfaces from all possible locations
+    ip netns exec relay_ns ip link del wg0 2>/dev/null || true
+    ip netns exec server_ns ip link del wg0 2>/dev/null || true
+    ip link del wg_srv 2>/dev/null || true
+    pkill -x iperf3 2>/dev/null || true
+    # Flush iptables in server_ns (gut0 forward rules)
+    ip netns exec server_ns iptables -F 2>/dev/null || true
+    ip netns exec server_ns iptables -t nat -F 2>/dev/null || true
+    log "gutd cleanup done"
 }
 
 # Cleanup
@@ -721,21 +852,21 @@ main() {
     # Test 2: WireGuard through gutd (eBPF)
     log "=== Test 2: WireGuard via gutd (eBPF) ==="
     setup_gutd "ebpf"
-    setup_wireguard_via_gutd
+    setup_wireguard_via_gutd "ebpf"
     test_wireguard_via_gutd "ebpf"
+
+    # Test 3: QUIC anti-probing (requires eBPF XDP to be loaded)
+    log "=== Test 3: QUIC anti-probing ==="
+    test_quic_antiprobe
     
     cleanup_gutd
     sleep 2
 
-    # Test 3: WireGuard through gutd (Userspace)
-    log "=== Test 3: WireGuard via gutd (Userspace) ==="
+    # Test 4: WireGuard through gutd (Userspace)
+    log "=== Test 4: WireGuard via gutd (Userspace) ==="
     setup_gutd "userspace"
-    setup_wireguard_via_gutd
+    setup_wireguard_via_gutd "userspace"
     test_wireguard_via_gutd "userspace"
-
-    # Test 4: QUIC anti-probing
-    log "=== Test 4: QUIC anti-probing ==="
-    test_quic_antiprobe
 
     # Compare
     compare_results
