@@ -100,7 +100,7 @@ int gut_egress(struct __sk_buff *skb)
      * then encrypt with feistel32 using the shared round keys.  XDP ingress decrypts
      * with feistel32_inv to recover the original WireGuard port numbers. */
     __u32 plain_ports = (((__u32)bpf_ntohs(udph->source)) << 16) |
-                         ((__u32)bpf_ntohs(udph->dest));
+                        ((__u32)bpf_ntohs(udph->dest));
     __u32 enc_ports = feistel32(plain_ports ^ FEISTEL_SALT_PORTS, cfg->feistel_rk);
 
     __u32 nonce = wg_nonce32(wg_head);
@@ -140,7 +140,7 @@ int gut_egress(struct __sk_buff *skb)
     if (wg_len < BALLAST_THRESHOLD)
     {
         __u32 raw = pad_block[63] & 0x3F; /* [0..63] uniform */
-        pad_len = raw + 1;                 /* [1..64] */
+        pad_len = raw + 1;                /* [1..64] */
         if (bpf_skb_change_tail(skb, skb->len + pad_len, 0) < 0)
             return TC_ACT_OK;
         /* Re-establish [1,64] for verifier after potential stack reload. */
@@ -305,7 +305,21 @@ int gut_egress(struct __sk_buff *skb)
 
         iph->check = 0;
         __builtin_memcpy(&iph->saddr, &cfg->bind_ip, 4);
-        __builtin_memcpy(&iph->daddr, &cfg->peer_ip, 4);
+
+        /* Dynamic peer: read destination from peer_endpoint_map (learned by XDP ingress).
+         * Static peer: use cfg->peer_ip as before. */
+        if (cfg->dynamic_peer)
+        {
+            struct peer_endpoint *ep = bpf_map_lookup_elem(&peer_endpoint_map, &zero);
+            if (!ep || !ep->valid)
+                return TC_ACT_OK; /* no endpoint learned yet — drop silently */
+            __builtin_memcpy(&iph->daddr, &ep->ip4, 4);
+            udph->dest = bpf_htons(ep->port);
+        }
+        else
+        {
+            __builtin_memcpy(&iph->daddr, &cfg->peer_ip, 4);
+        }
 
         __u64 ip_csum = bpf_csum_diff(0, 0, (__be32 *)iph, sizeof(struct iphdr), 0);
         iph->check = csum_fold(ip_csum);

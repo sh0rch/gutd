@@ -101,11 +101,20 @@ userspace_only = true          # Crucial for RouterOS
 
 [peer]
 name = gut0
+address = 10.0.0.2/30         # Even IP = client role
 bind_ip = 172.16.1.2           # The veth IP
 peer_ip = 203.0.113.10         # Your remote gutd server IP
 ports = 41000                  # UDP obfuscation port
 key = 001122...
 ```
+
+> **Important:** In userspace mode, gutd forwards decapsulated packets to the
+> local WireGuard listener. By default it sends to `127.0.0.1:51820`, which
+> only works when WireGuard runs inside the same container/namespace.
+> On RouterOS the WireGuard interface lives on the router itself, so you must
+> set the `GUTD_WG_HOST` environment variable to the router's WG address reachable
+> from the container (e.g. `172.16.1.1:51820`). Set it via `/container/envs/add` even
+> when using a config file.
 
 #### Option B: Environment variables (no config file needed)
 
@@ -119,8 +128,10 @@ Pass all settings as env vars directly in the container definition. When `GUTD_P
 
 /container/mounts/add name=gutd_cfg src=disk1/gutd dst=/etc/gutd
 
+/container/envs/add name=gutd key=GUTD_WG_HOST value=172.16.1.1:51820
+
 /container/add file=disk1/gutd-ros-arm64-v2.X.X.tar interface=veth-gutd \
-    mounts=gutd_cfg root-dir=disk1/gutd-root \
+    mounts=gutd_cfg envlist=gutd root-dir=disk1/gutd-root \
     cmd="--config /etc/gutd/gutd.conf" logging=yes
 
 /container/start [find file~"gutd"]
@@ -132,10 +143,11 @@ Pass all settings as env vars directly in the container definition. When `GUTD_P
 
 /container/envs/add name=gutd key=GUTD_PEER_IP value=203.0.113.10
 /container/envs/add name=gutd key=GUTD_BIND_IP value=172.16.1.2
-/container/envs/add name=gutd key=GUTD_ADDRESS value=10.0.0.1/30
+/container/envs/add name=gutd key=GUTD_ADDRESS value=10.0.0.2/30
 /container/envs/add name=gutd key=GUTD_PORTS value=41000
 /container/envs/add name=gutd key=GUTD_KEY value=001122...
 /container/envs/add name=gutd key=GUTD_USERSPACE_ONLY value=true
+/container/envs/add name=gutd key=GUTD_WG_HOST value=172.16.1.1:51820
 
 /container/add file=disk1/gutd-ros-arm64-v2.X.X.tar interface=veth-gutd \
     envlist=gutd root-dir=disk1/gutd-root logging=yes
@@ -143,21 +155,92 @@ Pass all settings as env vars directly in the container definition. When `GUTD_P
 /container/start [find file~"gutd"]
 ```
 
-**5. WireGuard and NAT rules**
-Point your local WireGuard interface to the remote WireGuard server IP, but we must route this traffic into our `gutd` container using NAT.
+**5. WireGuard Configuration**
 
-If your WireGuard server is `10.200.0.1` and `gutd` is stripping to port `41000`:
+With `GUTD_WG_HOST` set to the router's WG listen address (`172.16.1.1:51820`), gutd forwards
+decapsulated WireGuard packets directly to the router's WireGuard interface.
+
+WireGuard on the router must send its outbound packets **to the gutd container**
+(not directly to the remote server), so gutd can obfuscate them. Set the WG peer
+endpoint to the container's veth IP and **any** of the `GUTD_PORTS` ports:
+
 ```routeros
-# Create local WireGuard interface
 /interface/wireguard/add name=wg0 listen-port=51820
-/interface/wireguard/peers/add interface=wg0 public-key="..." endpoint-address=10.200.0.1 endpoint-port=51820
+/interface/wireguard/peers/add interface=wg0 public-key="..." \
+    endpoint-address=172.16.1.2 endpoint-port=41000 \
+    allowed-address=0.0.0.0/0
 
-# Create a DNAT rule to intercept WireGuard traffic and send it to the container instead
-/ip/firewall/nat/add chain=dstnat dst-address=10.200.0.1 protocol=udp dst-port=51820 action=dst-nat to-addresses=172.16.1.2 to-ports=41000
-
-# Make sure the container can reach the internet
+# Container must reach the remote gutd server on the internet
 /ip/firewall/nat/add chain=srcnat src-address=172.16.1.0/24 action=masquerade
+
+# Forward ALL obfuscation ports from public interface to the container
+# The remote peer may send on any of these ports
+/ip/firewall/nat/add chain=dstnat protocol=udp dst-port=41000-41003 \
+    action=dst-nat to-addresses=172.16.1.2
 ```
+
+> **Multi-port:** When `ports = 41000,41001,41002,41003`, gutd listens on all
+> four ports. The remote server distributes inbound traffic across them for
+> obfuscation. Outbound traffic from gutd is also rotated across ports
+> (round-robin). The DNAT rule must cover the entire port range. WG only needs
+> one endpoint port — gutd accepts WireGuard traffic on any of them.
+>
+> **QUIC fidelity note:** A real QUIC connection uses a single source port
+> for its entire lifetime. Multi-port rotation makes the traffic look like
+> several parallel QUIC sessions — normal for browsers, but less "clean" than
+> a single connection. For maximum stealth, use `ports = 443` (single port).
+> Multi-port is useful for throughput diversity and evading per-flow rate limits.
+
+**Traffic flow:**
+```
+Outbound: WG(router) → 172.16.1.2:41000 (gutd) → obfuscate → remote:41000-41003 (rotated)
+Inbound:  remote → router:41000-41003 → DNAT → 172.16.1.2 (gutd) → deobfuscate → 172.16.1.1:51820 (WG)
+```
+
+## Dynamic Peer (Client behind NAT)
+
+When the client's IP is not known in advance (NAT, mobile, CGNAT), the **server**
+can learn the peer endpoint automatically from the first cryptographically
+validated inbound packet.
+
+**Server** config (`/etc/gutd/gutd.conf`):
+```ini
+[peer]
+name    = gut0
+address = 10.0.0.1/30        # odd IP = server role
+bind_ip = 0.0.0.0
+peer_ip = dynamic             # learn endpoint from first valid packet
+ports   = 41000
+key     = <shared key>
+```
+
+**Client** config (normal static peer_ip pointing to the server):
+```ini
+[peer]
+name    = gut0
+address = 10.0.0.2/30        # even IP = client role
+bind_ip = 0.0.0.0
+peer_ip = 203.0.113.1        # server's public IP
+ports   = 41000
+key     = <shared key>
+```
+
+Using environment variables on the server:
+```bash
+export GUTD_PEER_IP=dynamic
+export GUTD_BIND_IP=0.0.0.0
+export GUTD_ADDRESS=10.0.0.1/30
+export GUTD_PORTS=41000
+export GUTD_KEY=<shared key>
+sudo ./gutd
+```
+
+Notes:
+- In eBPF mode, `nic` is auto-detected from the default route when `peer_ip = dynamic`.
+- In userspace mode, packets that fail DCID/PPN verification are silently dropped
+  (anti-probing).
+- The server updates the learned endpoint on every valid packet, so the client
+  can roam between networks seamlessly.
 
 ## Relay Mode
 

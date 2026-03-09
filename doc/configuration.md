@@ -16,7 +16,7 @@ nic = eth0                # ingress NIC for XDP (auto-detected from default rout
 address = 10.0.0.1/30    # point-to-point IP on the veth (/30 or /31 only)
                           #   peer address auto-computed (.1<->.2)
 bind_ip = 0.0.0.0        # local bind IP (0.0.0.0 = auto from route src)
-peer_ip = 203.0.113.10
+peer_ip = 203.0.113.10    # remote peer IP (or "dynamic" — see below)
 ports = 41000,41001       # UDP ports (must match WG listen/endpoint ports)
 keepalive_drop_percent = 30
 # own_http3 = true        # eBPF XDP responder for active DPI probes on UDP ports
@@ -30,7 +30,7 @@ When `GUTD_PEER_IP` is set and no config file is passed via CLI, gutd reads all 
 
 | Env Var | Required | Default | Config Equivalent |
 |---|---|---|---|
-| `GUTD_PEER_IP` | **yes** | — | `peer_ip` |
+| `GUTD_PEER_IP` | **yes** | — | `peer_ip` (accepts `dynamic`) |
 | `GUTD_BIND_IP` | **yes** | — | `bind_ip` |
 | `GUTD_ADDRESS` | **yes** | — | `address` |
 | `GUTD_PORTS` | **yes** | — | `ports` |
@@ -52,6 +52,14 @@ When `GUTD_PEER_IP` is set and no config file is passed via CLI, gutd reads all 
 
 \* One of `GUTD_KEY`/`GUTD_SECRET`/`GUTD_CIPHER` **or** `GUTD_PASSPHRASE`/`GUTD_PHRASE` is required.
 
+### Userspace-only runtime variables
+
+These variables are only used in userspace proxy mode.
+
+| Env Var | Default | Description |
+|---|---|---|
+| `GUTD_WG_HOST` | `127.0.0.1:51820` | Address (`ip:port`) of the local WireGuard listener. In containers (e.g. RouterOS) set to the host/router IP and WG listen port reachable from the container |
+
 ### Runtime overrides (always checked, both modes)
 
 | Env Var | Description |
@@ -59,7 +67,7 @@ When `GUTD_PEER_IP` is set and no config file is passed via CLI, gutd reads all 
 | `GUTD_USERSPACE` | If set to any value, forces userspace proxy mode regardless of config |
 | `GUTD_FORCE_L4_CSUM` | Set to `0`/`false`/`no` to disable BPF inner L4 checksum (debug) |
 
-Minimal env-var example:
+Minimal env-var example (eBPF mode, requires root):
 
 ```bash
 export GUTD_PEER_IP=203.0.113.10
@@ -69,6 +77,65 @@ export GUTD_PORTS=41000
 export GUTD_KEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 sudo ./gutd
 ```
+
+Minimal env-var example (userspace mode — containers, RouterOS):
+
+```bash
+export GUTD_PEER_IP=203.0.113.10
+export GUTD_BIND_IP=172.16.1.2       # container's own IP
+export GUTD_ADDRESS=10.0.0.2/30
+export GUTD_PORTS=41000
+export GUTD_KEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+export GUTD_WG_HOST=172.16.1.1:51820   # router/host WG address (not 127.0.0.1!)
+./gutd
+```
+
+In userspace mode only 5 env vars are required: `GUTD_PEER_IP`, `GUTD_BIND_IP`,
+`GUTD_ADDRESS`, `GUTD_PORTS`, and a key (`GUTD_KEY` or `GUTD_PASSPHRASE`).
+eBPF-specific settings (`GUTD_NIC`, `GUTD_OWN_HTTP3`, `GUTD_DEFAULT_POLICY`, etc.)
+are ignored. Set `GUTD_WG_HOST` when WireGuard runs on the host, not inside the container.
+
+Dynamic peer env-var example (server side):
+
+```bash
+export GUTD_PEER_IP=dynamic
+export GUTD_BIND_IP=0.0.0.0
+export GUTD_ADDRESS=10.0.0.1/30
+export GUTD_PORTS=41000
+export GUTD_KEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+sudo ./gutd
+```
+
+## Dynamic Peer (NAT Traversal)
+
+When the remote peer is behind NAT and its IP is not known in advance, set:
+
+```ini
+peer_ip = dynamic
+```
+
+or via environment variable:
+
+```bash
+export GUTD_PEER_IP=dynamic
+```
+
+This is a **server-side** setting — the server must have a stable public IP.
+The client always uses a normal static `peer_ip` pointing to the server.
+
+How it works:
+
+- **eBPF mode**: XDP ingress validates each inbound packet by its QUIC DCID and PPN
+  (cryptographic proof of possession of the shared key). On success, the source
+  IP:port is written to a BPF map (`peer_endpoint_map`). TC egress reads the
+  learned endpoint from this map for outbound packets.
+- **Userspace mode**: the same DCID/PPN verification is performed in `quic_verify()`.
+  Packets that fail are silently dropped (anti-probing). On success, the sender
+  address is saved and used for all subsequent outbound traffic.
+
+No additional firewall rules are needed. Anti-probing remains active: packets
+that do not pass cryptographic validation are dropped (or answered with a QUIC
+Version Negotiation in eBPF mode).
 
 ## Key Generation
 

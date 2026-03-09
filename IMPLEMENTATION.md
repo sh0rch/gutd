@@ -45,7 +45,7 @@ Current transform:
 
 Primary peer parameters:
 
-- `bind_ip`, `peer_ip`, `ports`, `key`/`passphrase`, `keepalive_drop_percent`
+- `bind_ip`, `peer_ip` (or `dynamic`), `ports`, `key`/`passphrase`, `keepalive_drop_percent`
 
 Related files:
 

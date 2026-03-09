@@ -197,6 +197,12 @@ gutd distributes obfuscated packets across all listed ports (port striping) and 
 
 **Number of ports:** the more ports, the better traffic pattern diversity. 1–16 ports are supported. 4 ports (e.g. `41000,41001,41002,41003`) is a practical default.
 
+> **QUIC fidelity note:** A real QUIC connection uses a single source port for its
+> entire lifetime. Multi-port rotation makes the traffic look like several parallel
+> QUIC sessions — normal for browsers, but less "clean" than a single connection.
+> For maximum stealth against DPI, use a single port (e.g. `ports = 443`).
+> Multi-port is useful for throughput diversity and evading per-flow rate limits.
+
 ---
 
 ## WireGuard setup with gutd in Docker
@@ -334,7 +340,7 @@ See [examples/wireguard-relay.md](../examples/wireguard-relay.md) for the full r
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `GUTD_BIND_IP` | yes* | — | Local listen address (`0.0.0.0` or specific IP) |
-| `GUTD_PEER_IP` | yes* | — | Remote peer IP |
+| `GUTD_PEER_IP` | yes* | — | Remote peer IP (or `dynamic` for NAT traversal) |
 | `GUTD_ADDRESS` | yes* | — | Tunnel CIDR for this end (e.g. `10.99.0.1/30`) |
 | `GUTD_PORTS` | yes* | — | Comma-separated port list (e.g. `41000,41001`) |
 | `GUTD_KEY` | yes† | — | 64-char hex key |
