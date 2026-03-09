@@ -87,6 +87,11 @@ Using WinBox or SCP, upload this file to your router (e.g. into `disk1/` or `fla
 ```
 
 **3. Configure gutd**
+
+You can configure gutd either via a config file or entirely through environment variables.
+
+#### Option A: Config file
+
 Create a directory/file on your router to hold the configuration: `disk1/gutd/gutd.conf`
 *(You can edit this file from the RouterOS terminal using `/file/edit disk1/gutd/gutd.conf contents`)*
 
@@ -102,18 +107,39 @@ ports = 41000                  # UDP obfuscation port
 key = 001122...
 ```
 
+#### Option B: Environment variables (no config file needed)
+
+Pass all settings as env vars directly in the container definition. When `GUTD_PEER_IP` is set and no config file is passed, gutd reads everything from the environment. This avoids mounting a config file entirely.
+
 **4. Create and Start the Container**
+
+#### With config file (Option A)
 ```routeros
-# Allow container feature (requires reboot if not enabled)
 /system/device-mode/update container=yes
 
-# Create a mount point for the config file
 /container/mounts/add name=gutd_cfg src=disk1/gutd dst=/etc/gutd
 
-# Import the container from the tar file
-/container/add file=disk1/gutd-ros-arm64-v2.X.X.tar interface=veth-gutd mounts=gutd_cfg root-dir=disk1/gutd-root cmd="--config /etc/gutd/gutd.conf" logging=yes
+/container/add file=disk1/gutd-ros-arm64-v2.X.X.tar interface=veth-gutd \
+    mounts=gutd_cfg root-dir=disk1/gutd-root \
+    cmd="--config /etc/gutd/gutd.conf" logging=yes
 
-# Start the container (wait for it to extract first, status will change to "stopped")
+/container/start [find file~"gutd"]
+```
+
+#### With environment variables (Option B)
+```routeros
+/system/device-mode/update container=yes
+
+/container/envs/add name=gutd key=GUTD_PEER_IP value=203.0.113.10
+/container/envs/add name=gutd key=GUTD_BIND_IP value=172.16.1.2
+/container/envs/add name=gutd key=GUTD_ADDRESS value=10.0.0.1/30
+/container/envs/add name=gutd key=GUTD_PORTS value=41000
+/container/envs/add name=gutd key=GUTD_KEY value=001122...
+/container/envs/add name=gutd key=GUTD_USERSPACE_ONLY value=true
+
+/container/add file=disk1/gutd-ros-arm64-v2.X.X.tar interface=veth-gutd \
+    envlist=gutd root-dir=disk1/gutd-root logging=yes
+
 /container/start [find file~"gutd"]
 ```
 
