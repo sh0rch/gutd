@@ -80,3 +80,18 @@ sudo tcpdump -ni <iface> -vv -n 'udp port <gut_port>'
 
 The current wire format (fake QUIC) is not interoperable with historical v1 peers.
 Both sides must run compatible versions/config.
+
+## 9. Cross-Platform Support
+
+gutd is developed primarily for Linux but also builds and runs on **Windows**
+(userspace mode only). The wire format is identical across platforms — a Windows
+client can talk to a Linux server running eBPF mode and vice versa.
+
+- **Linux**: Full support — eBPF (TC/XDP) and userspace mode.
+- **Windows**: Userspace mode only. `userspace_only = true` is implied.
+  Installs as a Windows Service via `sc.exe`. No SIGHUP/SIGUSR1 signals;
+  Ctrl+C / Ctrl+Break handled via `SetConsoleCtrlHandler`.
+- **RouterOS (arm64)**: Userspace mode in a Docker container.
+
+Build target: `x86_64-pc-windows-gnu` (or `i686-pc-windows-gnu`) with
+`--no-default-features` to exclude eBPF dependencies.

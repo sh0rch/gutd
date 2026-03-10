@@ -1,19 +1,28 @@
-use gutd::{config, crypto, installer, reload, Result};
-use std::sync::atomic::{AtomicBool, Ordering};
+use gutd::{config, crypto, reload, Result};
 
 const VERSION: &str = env!("GUT_VERSION");
+#[cfg(target_family = "unix")]
 const DEFAULT_CONFIG: &str = "/etc/gutd.conf";
+#[cfg(target_family = "windows")]
+const DEFAULT_CONFIG: &str = "C:\\ProgramData\\gutd\\gutd.conf";
+#[cfg(target_family = "unix")]
 const DEFAULT_STAT_FILE: &str = "/run/gutd.stat";
+#[cfg(target_family = "windows")]
+const DEFAULT_STAT_FILE: &str = "C:\\ProgramData\\gutd\\gutd.stat";
 
-static PRINT_STATS: AtomicBool = AtomicBool::new(false);
-static EXIT_FLAG: AtomicBool = AtomicBool::new(false);
+#[cfg(target_family = "unix")]
+static PRINT_STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(target_family = "unix")]
 extern "C" fn handle_sigusr1(_: libc::c_int) {
+    use std::sync::atomic::Ordering;
     PRINT_STATS.store(true, Ordering::Relaxed);
 }
 
+#[cfg(target_family = "unix")]
 extern "C" fn handle_exit(_: libc::c_int) {
-    EXIT_FLAG.store(true, Ordering::Relaxed);
+    use std::sync::atomic::Ordering;
+    reload::EXIT_FLAG.store(true, Ordering::Relaxed);
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -21,14 +30,17 @@ extern "C" fn handle_exit(_: libc::c_int) {
 // ──────────────────────────────────────────────────────────────────
 
 #[allow(dead_code)]
-fn sd_notify(msg: &str) {
-    if let Ok(path) = std::env::var("NOTIFY_SOCKET") {
-        use std::os::unix::net::UnixDatagram;
-        let sock = match UnixDatagram::unbound() {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let _ = sock.send_to(msg.as_bytes(), &path);
+fn sd_notify(_msg: &str) {
+    #[cfg(target_family = "unix")]
+    {
+        if let Ok(path) = std::env::var("NOTIFY_SOCKET") {
+            use std::os::unix::net::UnixDatagram;
+            let sock = match UnixDatagram::unbound() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let _ = sock.send_to(_msg.as_bytes(), &path);
+        }
     }
 }
 
@@ -170,8 +182,8 @@ fn main() -> Result<()> {
     if let Some(subcmd) = args.get(1) {
         if !subcmd.starts_with('-') {
             match subcmd.as_str() {
-                "install" => installer::run_install(),
-                "uninstall" => installer::run_uninstall(),
+                "install" => gutd::installer::run_install(),
+                "uninstall" => gutd::installer::run_uninstall(),
                 "genkey" => return cmd_genkey(&args),
                 "status" => return cmd_status(&args),
                 "version" => {
@@ -308,10 +320,8 @@ fn cmd_genkey(args: &[String]) -> Result<()> {
         eprintln!("#   or:           passphrase = {phrase}");
     } else {
         let mut key = [0u8; 32];
-        let fd = std::fs::File::open("/dev/urandom")?;
-        use std::io::Read;
-        let mut reader = std::io::BufReader::new(fd);
-        reader.read_exact(&mut key)?;
+        getrandom::getrandom(&mut key)
+            .map_err(|e| format!("Failed to generate random key: {e}"))?;
         println!("{}", crypto::key_to_hex(&key));
         eprintln!("# Random 256-bit key");
         eprintln!("# Add to config:  key = {}", crypto::key_to_hex(&key));
@@ -361,9 +371,9 @@ fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<(
     let stat_file = config.runtime.stat_file.clone();
 
     // Signal handlers
+    reload::setup_signal_handler()?;
+    #[cfg(target_family = "unix")]
     unsafe {
-        reload::setup_signal_handler()?;
-
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_flags = libc::SA_RESTART;
 
@@ -374,16 +384,19 @@ fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<(
         libc::sigaction(libc::SIGINT, &raw const sa, std::ptr::null_mut());
         libc::sigaction(libc::SIGTERM, &raw const sa, std::ptr::null_mut());
     }
-    eprintln!("Signal handlers installed (SIGHUP=reload, SIGUSR1=stats, SIGINT/SIGTERM=exit)");
+    #[cfg(target_family = "windows")]
+    {
+        // On Windows, Ctrl+C sets EXIT_FLAG via the handler registered in reload module
+    }
+    eprintln!("Signal handlers installed");
 
     #[cfg(not(target_os = "linux"))]
-    {
-        return Err("TC eBPF mode is only supported on Linux".into());
-    }
+    return Err("TC eBPF mode is only supported on Linux. Use userspace_only = true.".into());
 
     #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
     {
         use gutd::tc::TcBpfManager;
+        use std::sync::atomic::Ordering;
 
         // Build a single-peer Config wrapper so the existing TcBpfManager::new
         // interface (which reads config.peer()) receives exactly one peer.
@@ -423,7 +436,7 @@ fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<(
             // Watchdog ping
             sd_notify("WATCHDOG=1");
 
-            if EXIT_FLAG.load(Ordering::Relaxed) {
+            if reload::EXIT_FLAG.load(Ordering::Relaxed) {
                 eprintln!("Received exit signal, shutting down...");
                 sd_notify("STOPPING=1");
                 break;
@@ -495,9 +508,9 @@ fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<(
         }
         print_bpf_stats(&managers);
         eprintln!("Exiting, BPF programs will be detached");
-    }
 
-    Ok(())
+        Ok(())
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -505,30 +518,43 @@ fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<(
 // ──────────────────────────────────────────────────────────────────
 
 fn print_usage() {
-    println!("gutd {VERSION} — Low-overhead IP-over-UDP obfuscation tunnel (BPF)");
+    println!("gutd {VERSION} — Low-overhead IP-over-UDP obfuscation tunnel");
     println!();
     println!("USAGE:");
     println!("    gutd [OPTIONS] [CONFIG_FILE]");
     println!("    gutd <SUBCOMMAND>");
     println!();
     println!("OPTIONS:");
-    println!("    -c, --config <FILE>  Path to configuration file [default: /etc/gutd.conf]");
+    println!("    -c, --config <FILE>  Path to configuration file [default: {DEFAULT_CONFIG}]");
     println!("    -v, --version        Print version information");
     println!("    -h, --help           Print this help message");
     println!();
     println!("SUBCOMMANDS:");
-    println!("    install              Install binary, config, and systemd/OpenRC service");
-    println!("    uninstall            Remove binary and service (config preserved)");
+    #[cfg(target_os = "linux")]
+    {
+        println!("    install              Install binary, config, and systemd/OpenRC service");
+        println!("    uninstall            Remove binary and service (config preserved)");
+    }
+    #[cfg(target_family = "windows")]
+    {
+        println!("    install              Install binary, config, and Windows Service");
+        println!("    uninstall            Remove binary and service (config preserved)");
+    }
     println!("    genkey               Generate random 256-bit key");
     println!("    genkey -p <TEXT>     Derive key from passphrase (HKDF-SHA256)");
-    println!("    status [STAT_FILE]   Show counters from stat file [default: /run/gutd.stat]");
+    println!(
+        "    status [STAT_FILE]   Show counters from stat file [default: {DEFAULT_STAT_FILE}]"
+    );
     println!("    version              Print version");
     println!("    help                 Print this help");
-    println!();
-    println!("SIGNALS:");
-    println!("    SIGHUP               Reload configuration");
-    println!("    SIGUSR1              Print BPF statistics");
-    println!("    SIGINT/SIGTERM       Graceful shutdown");
+    #[cfg(target_family = "unix")]
+    {
+        println!();
+        println!("SIGNALS:");
+        println!("    SIGHUP               Reload configuration");
+        println!("    SIGUSR1              Print BPF statistics");
+        println!("    SIGINT/SIGTERM       Graceful shutdown");
+    }
     println!();
     println!("SYSTEMD:");
     println!("    Type=notify with WatchdogSec=30");
@@ -539,5 +565,5 @@ fn print_usage() {
     println!("      key = <64 hex chars>           Raw 32-byte key");
     println!("      passphrase = <text>            Derived via HKDF-SHA256");
     println!();
-    println!("    gutd install creates /etc/gutd.conf with example config.");
+    println!("    gutd install creates {DEFAULT_CONFIG} with example config.");
 }
