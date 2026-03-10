@@ -43,9 +43,10 @@ Current transform:
 
 ## 5. Config and Control Plane
 
-Primary peer parameters:
+Primary peer parameters (only `peer_ip`, `ports`, `key`/`passphrase` are required):
 
-- `bind_ip`, `peer_ip` (or `dynamic`), `ports`, `key`/`passphrase`, `keepalive_drop_percent`
+- `peer_ip` (or `dynamic`), `ports`, `key`/`passphrase`
+- Optional: `bind_ip` (default `0.0.0.0`), `responder` (auto-inferred), `keepalive_drop_percent`
 
 Related files:
 

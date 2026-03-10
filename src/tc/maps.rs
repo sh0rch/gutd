@@ -56,7 +56,7 @@ pub struct GutConfig {
     pub dynamic_peer: u8,       // 1 = peer_ip unknown, learn from validated inbound packets
 }
 
-/// Dynamic peer endpoint — learned by XDP ingress, read by TC egress.
+/// Dynamic peer endpoint — stored in `client_map` (LRU_HASH, key=C_idx).
 /// Must match `struct peer_endpoint` in gut_common.h.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

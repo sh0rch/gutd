@@ -105,7 +105,8 @@ struct gut_config
 
 /* Dynamic peer endpoint — learned from validated inbound packets.
  * Updated by XDP ingress after DCID/PPN crypto-validation passes.
- * Read by TC egress to set outer IP dst + UDP dst port. */
+ * Read by TC egress to set outer IP dst + UDP dst port.
+ * In multi-client mode, keyed by WG receiver_index (C_idx). */
 struct peer_endpoint
 {
     __u32 ip4;    /* Last-seen IPv4 (network byte order), 0 if IPv6 */
@@ -170,15 +171,33 @@ struct
     __type(value, __u8[SCRATCH_SIZE]);
 } scratch_map SEC(".maps");
 
-/* Dynamic peer endpoint map — shared between XDP ingress (writer) and TC egress (reader).
- * Only used when gut_config.dynamic_peer == 1 (server mode, peer behind NAT). */
+/* Multi-client dynamic peer maps — used when gut_config.dynamic_peer == 1.
+ *
+ * client_map: WG client_index (C_idx) → peer_endpoint.
+ *   Written by XDP ingress after crypto-validation (Type 1: sender_index,
+ *   Type 4: bridged via session_map).
+ *   Read by TC egress to determine destination (Type 2/4: receiver_index = C_idx).
+ *
+ * session_map: WG server_index (S_idx) → C_idx.
+ *   Written by TC egress on Type 2 (response) where sender=S_idx, receiver=C_idx.
+ *   Read by XDP ingress on Type 4 where receiver=S_idx, to bridge back to C_idx.
+ *
+ * LRU automatically evicts stale entries on WG rekey (~120s). */
 struct
 {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 1024);
     __type(key, __u32);
     __type(value, struct peer_endpoint);
-} peer_endpoint_map SEC(".maps");
+} client_map SEC(".maps");
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);
+    __type(value, __u32);
+} session_map SEC(".maps");
 
 /* Compile-time ChaCha round count.  Override at build via -DCHACHA_ROUNDS=N.
  * Must match between sender and receiver BPF programs.

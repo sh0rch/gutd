@@ -38,33 +38,33 @@ maps without detaching hooks or recreating the veth pair.
 
 ## P2P Mode (Two Machines)
 
-**Machine A (10.0.0.1):**
+**Machine A** (responder / server):
 ```ini
 [peer]
-bind_ip = 0.0.0.0
+responder = true
 peer_ip = 10.0.0.2
 ports = 41000,41001,41002,41003
+key = <shared key>
 ```
 
-**Machine B (10.0.0.2):**
+**Machine B** (initiator / client):
 ```ini
 [peer]
-bind_ip = 0.0.0.0
 peer_ip = 10.0.0.1
 ports = 41000,41001,41002,41003
+key = <shared key>
 ```
 
-`bind_ip = 0.0.0.0` (or `::`) means "auto": gutd resolves the concrete source IP
-from `ip route get <peer_ip>` on the selected ingress NIC and writes that address
-into the outer header.
+Only `peer_ip`, `ports`, and `key` are required. `bind_ip` defaults to `0.0.0.0`
+(auto-detect source IP from routing table).
 
 Start on both machines:
 ```bash
 sudo ./gutd gutd.conf
 ```
 
-gutd creates the veth pair `gut0 <-> gut0_xdp` and assigns the address from the
-`address` field automatically. No manual `ip addr` commands are needed.
+gutd creates the veth pair `gut0 <-> gut0_xdp` and assigns addresses automatically.
+No manual `ip addr` commands are needed.
 
 ## RouterOS / MikroTik Container Setup
 
@@ -100,9 +100,7 @@ Create a directory/file on your router to hold the configuration: `disk1/gutd/gu
 userspace_only = true          # Crucial for RouterOS
 
 [peer]
-name = gut0
-address = 10.0.0.2/30         # Even IP = client role
-bind_ip = 172.16.1.2           # The veth IP
+bind_ip = 172.16.1.2           # The container veth IP
 peer_ip = 203.0.113.10         # Your remote gutd server IP
 ports = 41000                  # UDP obfuscation port
 key = 001122...
@@ -143,7 +141,6 @@ Pass all settings as env vars directly in the container definition. When `GUTD_P
 
 /container/envs/add name=gutd key=GUTD_PEER_IP value=203.0.113.10
 /container/envs/add name=gutd key=GUTD_BIND_IP value=172.16.1.2
-/container/envs/add name=gutd key=GUTD_ADDRESS value=10.0.0.2/30
 /container/envs/add name=gutd key=GUTD_PORTS value=41000
 /container/envs/add name=gutd key=GUTD_KEY value=001122...
 /container/envs/add name=gutd key=GUTD_USERSPACE_ONLY value=true
@@ -206,20 +203,16 @@ validated inbound packet.
 **Server** config (`/etc/gutd/gutd.conf`):
 ```ini
 [peer]
-name    = gut0
-address = 10.0.0.1/30        # odd IP = server role
-bind_ip = 0.0.0.0
 peer_ip = dynamic             # learn endpoint from first valid packet
 ports   = 41000
 key     = <shared key>
 ```
 
+`peer_ip = dynamic` automatically sets `responder = true`. No other fields required.
+
 **Client** config (normal static peer_ip pointing to the server):
 ```ini
 [peer]
-name    = gut0
-address = 10.0.0.2/30        # even IP = client role
-bind_ip = 0.0.0.0
 peer_ip = 203.0.113.1        # server's public IP
 ports   = 41000
 key     = <shared key>
@@ -228,8 +221,6 @@ key     = <shared key>
 Using environment variables on the server:
 ```bash
 export GUTD_PEER_IP=dynamic
-export GUTD_BIND_IP=0.0.0.0
-export GUTD_ADDRESS=10.0.0.1/30
 export GUTD_PORTS=41000
 export GUTD_KEY=<shared key>
 sudo ./gutd
@@ -244,8 +235,10 @@ Notes:
 
 ## Relay Mode
 
-**IMPORTANT**: To correctly spoof QUIC roles and avoid DPI detection, gutd must know if it's acting as a Server or Client. It determines this automatically by checking the last bit of its internal `address` (the `gut0` interface IP).
-**The SERVER's `gut0` IP MUST be odd (e.g. `10.254.0.1`), and the CLIENT's IP MUST be even (e.g. `10.254.0.2`).**
+gutd must know its QUIC role (server / client) to generate correct headers.
+The role is resolved automatically: `responder = true` or `peer_ip = dynamic`
+makes gutd act as QUIC server; otherwise it acts as QUIC client.  You can also
+set `responder = true/false` explicitly.
 
 In relay mode a separate machine accepts WireGuard connections from clients and
 forwards them through a gutd tunnel to the final server. This requires standard
