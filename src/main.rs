@@ -393,6 +393,9 @@ fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<(
     #[cfg(not(target_os = "linux"))]
     return Err("TC eBPF mode is only supported on Linux. Use userspace_only = true.".into());
 
+    #[cfg(all(target_os = "linux", not(feature = "tc_ebpf")))]
+    return Err("This build was compiled without eBPF support. Use userspace_only = true.".into());
+
     #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
     {
         use gutd::tc::TcBpfManager;
