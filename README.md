@@ -45,8 +45,6 @@ gutd genkey          # → prints 256-bit hex key
 # /etc/gutd/gutd.conf  (Linux)
 # C:\ProgramData\gutd\gutd.conf  (Windows)
 [peer]
-name       = gut0
-address    = 10.0.0.1/30     # .1 on server, .2 on client
 peer_ip    = 203.0.113.10    # remote peer public IP
 ports      = 41000
 key        = <output of gutd genkey>
