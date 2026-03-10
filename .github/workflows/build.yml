@@ -9,6 +9,9 @@ on:
         default: false
         description: "Build all architectures"
 
+permissions:
+  contents: read
+
 jobs:
   prepare-matrix:
     runs-on: ubuntu-latest
