@@ -58,6 +58,9 @@ jobs:
             if [[ "$f" == *.tar ]]; then
               base="${f%.tar}"
               NEW_NAME="${base}-${VERSION}.tar"
+            elif [[ "$f" == *.exe ]]; then
+              base="${f%.exe}"
+              NEW_NAME="${base}-${VERSION}.exe"
             else
               chmod +x "$f"
               if [ "$f" = "gutd-x86_64" ]; then
@@ -121,7 +124,7 @@ jobs:
 
           TC/XDP eBPF tunnel static musl binaries.
           
-          Supported architectures: `x86_64`, `aarch64`, `armv7`, `mips`, `mipsel`
+          Supported architectures: `x86_64`, `aarch64`, `armv7`, `mips`, `mipsel`, `windows-x86_64`
           
           ### Installation
           
@@ -166,6 +169,14 @@ jobs:
           wget https://github.com/sh0rch/gutd/releases/download/${{ steps.version.outputs.version }}/gutd-mipsel-${{ steps.version.outputs.version }} -O gutd
           chmod +x ./gutd
           ./gutd install
+          ```
+
+          **Windows (x86_64, userspace only)**
+          ```powershell
+          # Download gutd-windows-x86_64-${{ steps.version.outputs.version }}.exe
+          Rename-Item gutd-windows-x86_64-${{ steps.version.outputs.version }}.exe gutd.exe
+          .\gutd.exe install
+          net start gutd
           ```
 
           **SHA256:**
