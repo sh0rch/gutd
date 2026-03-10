@@ -14,7 +14,7 @@
 <sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. [See test logic and full logs](https://github.com/sh0rch/gutd/actions/runs/22830402403). Last updated: 2026-03-08 21:37</i></sub>
 <!-- INTEGRATION_TEST_RESULTS_END -->
 
-**gutd v2** transparently obfuscates WireGuard UDP traffic using a Linux TC/XDP eBPF datapath. On egress it wraps each packet in a fake QUIC Long Header with a fake SNI, adds variable padding and masks the payload with a ChaCha keystream. On ingress the XDP program strips the QUIC emulation and unmasks the packet before the kernel stack sees it. WireGuard is completely unaware of gutd. A **pure userspace mode** (Mio-based, wire-compatible with eBPF path) is available for older kernels, unprivileged containers, and MikroTik RouterOS.
+**gutd v2** transparently obfuscates WireGuard UDP traffic using a Linux TC/XDP eBPF datapath. On egress it wraps each packet in a fake QUIC Long Header with a fake SNI, adds variable padding and masks the payload with a ChaCha keystream. On ingress the XDP program strips the QUIC emulation and unmasks the packet before the kernel stack sees it. WireGuard is completely unaware of gutd. A **pure userspace mode** (Mio-based, wire-compatible with eBPF path) is available for older kernels, unprivileged containers, MikroTik RouterOS, and **Windows**.
 
 ## Features
 
@@ -27,6 +27,7 @@
 - Variable padding to obscure packet sizes
 - Hot reload via SIGHUP (BPF map update, no restart)
 - Pure userspace fallback mode (zero eBPF requirements, ~500 Mbps capable)
+- Cross-platform: Linux (eBPF + userspace), Windows (userspace), RouterOS (userspace)
 - Multi-peer support (one veth pair + BPF program per peer)
 - Static musl build, zero OS dependencies — runs in empty `scratch` containers
 - IPv4 and IPv6 outer transport
@@ -42,7 +43,8 @@ gutd genkey          # → prints 256-bit hex key
 ```
 
 ```ini
-# /etc/gutd/gutd.conf
+# /etc/gutd/gutd.conf  (Linux)
+# C:\ProgramData\gutd\gutd.conf  (Windows)
 [peer]
 name       = gut0
 address    = 10.0.0.1/30     # .1 on server, .2 on client
@@ -54,22 +56,30 @@ key        = <output of gutd genkey>
 ## Running
 
 ```bash
-# eBPF mode (default, requires root and kernel ≥ 5.2)
+# eBPF mode (default on Linux, requires root and kernel ≥ 5.2)
 sudo ./gutd /etc/gutd/gutd.conf
 
-# Pure userspace mode (no eBPF, no root on Linux with capabilities)
+# Pure userspace mode (Linux — no eBPF, no root with capabilities)
 GUTD_USERSPACE=1 ./gutd /etc/gutd/gutd.conf
 
-# Reload config without restart
+# Windows (always userspace, run as Administrator for install)
+gutd.exe gutd.conf
+
+# Reload config without restart (Linux)
 sudo kill -HUP $(pgrep gutd)
 ```
 
 ## Build
 
 ```bash
+# Linux (default, with eBPF)
 cargo build --release
-# or static musl binary:
+
+# Linux static musl binary
 ./build-musl.sh
+
+# Windows (userspace only, cross-compile from Linux)
+cargo build --release --target x86_64-pc-windows-gnu --no-default-features
 ```
 
 See [BUILD.md](BUILD.md) for cross-compilation and musl details.

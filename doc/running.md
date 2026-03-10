@@ -9,7 +9,7 @@
 # Show help
 ./gutd --help
 
-# Run with config
+# Run with config (Linux)
 sudo ./gutd gutd.conf
 
 # Run in pure userspace mode (no BPF load/mount required, no sudo on Linux if using capabilities)
@@ -18,12 +18,15 @@ GUTD_USERSPACE=1 ./gutd gutd.conf
 
 # Run with custom config path
 sudo ./gutd /etc/gutd/custom.conf
+
+# Windows (always userspace mode)
+gutd.exe gutd.conf
 ```
 
 ## Signals
 
 ```bash
-# Reload configuration (SIGHUP)
+# Reload configuration (SIGHUP) — Linux only
 sudo pkill -HUP gutd
 ```
 
@@ -35,6 +38,9 @@ sudo kill -HUP $(pgrep gutd)
 
 Reloads config from disk and pushes updated key/ports/policy into the running BPF
 maps without detaching hooks or recreating the veth pair.
+
+> **Note:** Hot reload via SIGHUP is only available on Linux. On Windows, stop
+> and restart the service to apply config changes.
 
 ## P2P Mode (Two Machines)
 
@@ -60,11 +66,61 @@ Only `peer_ip`, `ports`, and `key` are required. `bind_ip` defaults to `0.0.0.0`
 
 Start on both machines:
 ```bash
+# Linux
 sudo ./gutd gutd.conf
+
+# Windows
+gutd.exe gutd.conf
 ```
 
 gutd creates the veth pair `gut0 <-> gut0_xdp` and assigns addresses automatically.
 No manual `ip addr` commands are needed.
+
+## Windows
+
+gutd runs on Windows in **userspace mode only** (no eBPF). It is wire-compatible
+with Linux peers running either eBPF or userspace mode.
+
+### Running from Command Line
+
+```powershell
+# Run with config file
+gutd.exe gutd.conf
+
+# Run with custom path
+gutd.exe C:\ProgramData\gutd\gutd.conf
+```
+
+### Running as a Windows Service
+
+```powershell
+# Install (requires Administrator)
+gutd.exe install
+
+# Start / stop
+net start gutd
+net stop gutd
+
+# Uninstall
+gutd.exe uninstall
+```
+
+The service reads its config from `C:\ProgramData\gutd\gutd.conf`.
+
+### Default Paths (Windows)
+
+| Item | Path |
+|---|---|
+| Binary | `C:\Program Files\gutd\gutd.exe` |
+| Config | `C:\ProgramData\gutd\gutd.conf` |
+| Stats  | `C:\ProgramData\gutd\gutd.stat` |
+
+### Limitations on Windows
+
+- **No eBPF** — `userspace_only = true` is always implied.
+- **No SIGHUP** — config reload requires restarting the service (`net stop gutd && net start gutd`).
+- **No SIGUSR1** — stats are written periodically to `stat_file` (no on-demand dump).
+- BPF-specific settings (`nic`, `own_http3`, `default_policy`) are ignored.
 
 ## RouterOS / MikroTik Container Setup
 

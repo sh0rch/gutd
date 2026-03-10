@@ -1,0 +1,331 @@
+name: Windows & Cross-Platform Test (CI only)
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Job 1: Native Windows build + smoke test ──────────────────
+  windows-build:
+    name: Windows Build & Smoke Test
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-pc-windows-gnu
+
+    - name: Build (userspace only, no eBPF)
+      run: cargo build --release --target x86_64-pc-windows-gnu --no-default-features
+
+    - name: Smoke test (version + genkey)
+      shell: pwsh
+      run: |
+        $gutd = "target\x86_64-pc-windows-gnu\release\gutd.exe"
+        & $gutd --version
+        if ($LASTEXITCODE -ne 0) { Write-Error "gutd --version failed"; exit 1 }
+        $key = & $gutd genkey
+        if ($key.Length -ne 64) { Write-Error "genkey returned unexpected length: $($key.Length)"; exit 1 }
+        Write-Host "genkey OK: $($key.Substring(0,8))..."
+
+    - name: Config parse test
+      shell: pwsh
+      run: |
+        $gutd = "target\x86_64-pc-windows-gnu\release\gutd.exe"
+        $key = (& $gutd genkey).Trim()
+        $conf = @"
+        [global]
+        userspace_only = true
+
+        [peer]
+        peer_ip = 203.0.113.1
+        ports = 41000
+        key = $key
+        "@
+        $conf | Out-File -Encoding utf8 test.conf
+
+        # gutd will fail to connect (no peer) but should parse config OK
+        $proc = Start-Process -FilePath $gutd -ArgumentList "--config","test.conf" `
+          -NoNewWindow -PassThru -RedirectStandardError err.txt -RedirectStandardOutput out.txt
+        Start-Sleep -Seconds 3
+        if (!$proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Seconds 1
+        $err = Get-Content err.txt -Raw -ErrorAction SilentlyContinue
+        $out = Get-Content out.txt -Raw -ErrorAction SilentlyContinue
+        Write-Host "STDOUT: $out"
+        Write-Host "STDERR: $err"
+        $combined = "$out $err"
+        if ($combined -match "parse error|unknown section|missing required|panicked") {
+          Write-Error "Config parsing failed"
+          exit 1
+        }
+        Write-Host "Config parsing OK"
+
+    - name: Upload Windows binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: gutd-windows-x86_64
+        path: target/x86_64-pc-windows-gnu/release/gutd.exe
+        retention-days: 1
+
+  # ── Job 2: Userspace ↔ Userspace WireGuard tunnel ─────────────
+  #    Both sides run in pure userspace mode (= Windows code path).
+  #    Proves that two Windows peers can tunnel WireGuard traffic.
+  userspace-tunnel:
+    name: Userspace ↔ Userspace (Win-Win compat)
+    runs-on: ubuntu-22.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev wireguard-tools
+
+    - name: Build
+      run: cargo build --release
+
+    - name: Userspace-to-userspace WireGuard tunnel test
+      run: |
+        set -e
+        GUTD=./target/release/gutd
+        KEY=$(openssl rand -hex 32)
+
+        # ── Namespaces + transport veth ──
+        sudo ip netns add us1
+        sudo ip netns add us2
+        sudo ip link add veth1 type veth peer name veth2
+        sudo ip link set veth1 netns us1
+        sudo ip link set veth2 netns us2
+        sudo ip netns exec us1 bash -c 'ip link set lo up; ip link set veth1 up; ip addr add 10.0.0.1/24 dev veth1'
+        sudo ip netns exec us2 bash -c 'ip link set lo up; ip link set veth2 up; ip addr add 10.0.0.2/24 dev veth2'
+
+        echo "=== Transport connectivity ==="
+        sudo ip netns exec us1 ping -c1 -W2 10.0.0.2
+
+        # ── WireGuard keys ──
+        WG_SERVER_PRIV=$(wg genkey); WG_SERVER_PUB=$(echo "$WG_SERVER_PRIV" | wg pubkey)
+        WG_CLIENT_PRIV=$(wg genkey); WG_CLIENT_PUB=$(echo "$WG_CLIENT_PRIV" | wg pubkey)
+
+        # ── gutd configs (both userspace) ──
+        cat > /tmp/us1.conf <<CONF
+        [global]
+        userspace_only = true
+        [peer]
+        responder = true
+        bind_ip = 10.0.0.1
+        peer_ip = 10.0.0.2
+        ports = 41000
+        key = ${KEY}
+        CONF
+
+        cat > /tmp/us2.conf <<CONF
+        [global]
+        userspace_only = true
+        [peer]
+        bind_ip = 10.0.0.2
+        peer_ip = 10.0.0.1
+        ports = 41000
+        key = ${KEY}
+        CONF
+
+        # ── Start gutd (userspace) in each namespace ──
+        sudo ip netns exec us1 env GUTD_WG_HOST=127.0.0.1:51820 \
+          $GUTD --config /tmp/us1.conf > /tmp/gutd-us1.log 2>&1 &
+        G1=$!; sleep 1
+        sudo ip netns exec us2 env GUTD_WG_HOST=127.0.0.1:51820 \
+          $GUTD --config /tmp/us2.conf > /tmp/gutd-us2.log 2>&1 &
+        G2=$!; sleep 1
+
+        for pid in $G1 $G2; do
+          if ! kill -0 $pid 2>/dev/null; then
+            echo "FAIL: gutd pid $pid died"
+            cat /tmp/gutd-us1.log /tmp/gutd-us2.log
+            exit 1
+          fi
+        done
+        echo "OK: both gutd userspace instances running"
+
+        # ── WireGuard interfaces ──
+        # Server (us1): listens on 127.0.0.1:51820
+        sudo ip netns exec us1 ip link add wg0 type wireguard
+        sudo ip netns exec us1 ip addr add 10.200.0.1/24 dev wg0
+        printf '[Interface]\nPrivateKey = %s\nListenPort = 51820\n\n[Peer]\nPublicKey = %s\nAllowedIPs = 10.200.0.2/32\n' \
+          "$WG_SERVER_PRIV" "$WG_CLIENT_PUB" | sudo ip netns exec us1 wg setconf wg0 /dev/stdin
+        sudo ip netns exec us1 ip link set wg0 up
+
+        # Client (us2): endpoint = local gutd proxy (10.0.0.2:41000)
+        sudo ip netns exec us2 ip link add wg0 type wireguard
+        sudo ip netns exec us2 ip addr add 10.200.0.2/24 dev wg0
+        printf '[Interface]\nPrivateKey = %s\nListenPort = 51821\n\n[Peer]\nPublicKey = %s\nEndpoint = 10.0.0.2:41000\nAllowedIPs = 10.200.0.0/24\nPersistentKeepalive = 5\n' \
+          "$WG_CLIENT_PRIV" "$WG_SERVER_PUB" | sudo ip netns exec us2 wg setconf wg0 /dev/stdin
+        sudo ip netns exec us2 ip link set wg0 up
+
+        sleep 5
+        echo "=== WireGuard status ==="
+        sudo ip netns exec us1 wg show wg0
+        sudo ip netns exec us2 wg show wg0
+
+        # ── Ping test ──
+        echo "=== Ping through userspace gutd tunnel ==="
+        PING_OUT=$(sudo ip netns exec us2 ping -c5 -i0.3 -W3 10.200.0.1 2>&1) || true
+        echo "$PING_OUT"
+        if echo "$PING_OUT" | grep -q '0% packet loss'; then
+          echo "PING: SUCCESS"
+        else
+          echo "PING: FAIL"
+          echo "--- gutd us1 log ---"; cat /tmp/gutd-us1.log
+          echo "--- gutd us2 log ---"; cat /tmp/gutd-us2.log
+          sudo kill $G1 $G2 2>/dev/null || true
+          sudo ip netns del us1 us2 2>/dev/null || true
+          exit 1
+        fi
+
+        # ── Cleanup ──
+        sudo kill $G1 $G2 2>/dev/null || true
+        sleep 0.3
+        sudo kill -9 $G1 $G2 2>/dev/null || true
+        wait $G1 $G2 2>/dev/null || true
+        sudo ip netns del us1 2>/dev/null || true
+        sudo ip netns del us2 2>/dev/null || true
+
+        echo "=== USERSPACE TUNNEL TEST PASSED ==="
+
+  # ── Job 3: eBPF server ↔ Userspace client (Linux ↔ Win) ──────
+  #    Server runs in eBPF mode (TC/XDP), client in userspace mode.
+  #    Proves a Windows client can tunnel to a Linux eBPF server.
+  cross-compat:
+    name: eBPF ↔ Userspace (Linux-Win compat)
+    runs-on: ubuntu-22.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev wireguard-tools
+
+    - name: Build
+      run: cargo build --release
+
+    - name: eBPF-server to userspace-client WireGuard tunnel test
+      run: |
+        set -e
+        GUTD=./target/release/gutd
+        KEY=$(openssl rand -hex 32)
+
+        sudo mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
+
+        # ── Namespaces + transport veth ──
+        sudo ip netns add ebpf_ns
+        sudo ip netns add user_ns
+        sudo ip link add veth1 type veth peer name veth2
+        sudo ip link set veth1 netns ebpf_ns
+        sudo ip link set veth2 netns user_ns
+        sudo ip netns exec ebpf_ns bash -c 'ip link set lo up; ip link set veth1 up; ip addr add 10.0.0.1/24 dev veth1'
+        sudo ip netns exec user_ns bash -c 'ip link set lo up; ip link set veth2 up; ip addr add 10.0.0.2/24 dev veth2'
+
+        # Limit GSO for eBPF side
+        sudo ip netns exec ebpf_ns ip link set dev veth1 gso_max_size 1492 2>/dev/null || true
+        sudo ip netns exec user_ns ip link set dev veth2 gso_max_size 1492 2>/dev/null || true
+
+        echo "=== Transport connectivity ==="
+        sudo ip netns exec ebpf_ns ping -c1 -W2 10.0.0.2
+
+        # ── WireGuard keys ──
+        WG_SERVER_PRIV=$(wg genkey); WG_SERVER_PUB=$(echo "$WG_SERVER_PRIV" | wg pubkey)
+        WG_CLIENT_PRIV=$(wg genkey); WG_CLIENT_PUB=$(echo "$WG_CLIENT_PRIV" | wg pubkey)
+
+        # ── gutd configs ──
+        # Server: eBPF mode (TC/XDP)
+        cat > /tmp/ebpf.conf <<CONF
+        [peer]
+        name = gut1
+        nic = veth1
+        address = 192.168.99.1/30
+        bind_ip = 10.0.0.1
+        peer_ip = 10.0.0.2
+        ports = 41000
+        key = ${KEY}
+        responder = true
+        CONF
+
+        # Client: userspace mode (= Windows)
+        cat > /tmp/user.conf <<CONF
+        [global]
+        userspace_only = true
+        [peer]
+        bind_ip = 10.0.0.2
+        peer_ip = 10.0.0.1
+        ports = 41000
+        key = ${KEY}
+        CONF
+
+        # ── Start gutd ──
+        sudo ip netns exec ebpf_ns $GUTD --config /tmp/ebpf.conf > /tmp/gutd-ebpf.log 2>&1 &
+        G_EBPF=$!; sleep 2
+        sudo ip netns exec user_ns env GUTD_WG_HOST=127.0.0.1:51820 \
+          $GUTD --config /tmp/user.conf > /tmp/gutd-user.log 2>&1 &
+        G_USER=$!; sleep 1
+
+        for label_pid in "eBPF:$G_EBPF" "Userspace:$G_USER"; do
+          label=${label_pid%%:*}; pid=${label_pid##*:}
+          if ! kill -0 $pid 2>/dev/null; then
+            echo "FAIL: gutd $label (pid $pid) died"
+            cat /tmp/gutd-ebpf.log /tmp/gutd-user.log
+            exit 1
+          fi
+        done
+        echo "OK: gutd eBPF + userspace running"
+
+        # ── WireGuard interfaces ──
+        # Server (ebpf_ns): listens on WG port, traffic arrives via gut1 veth
+        sudo ip netns exec ebpf_ns ip link add wg0 type wireguard
+        sudo ip netns exec ebpf_ns ip addr add 10.200.0.1/24 dev wg0
+        printf '[Interface]\nPrivateKey = %s\nListenPort = 51820\n\n[Peer]\nPublicKey = %s\nAllowedIPs = 10.200.0.2/32\n' \
+          "$WG_SERVER_PRIV" "$WG_CLIENT_PUB" | sudo ip netns exec ebpf_ns wg setconf wg0 /dev/stdin
+        sudo ip netns exec ebpf_ns ip link set wg0 up
+
+        # Client (user_ns): endpoint = local gutd proxy
+        sudo ip netns exec user_ns ip link add wg0 type wireguard
+        sudo ip netns exec user_ns ip addr add 10.200.0.2/24 dev wg0
+        printf '[Interface]\nPrivateKey = %s\nListenPort = 51821\n\n[Peer]\nPublicKey = %s\nEndpoint = 10.0.0.2:41000\nAllowedIPs = 10.200.0.0/24\nPersistentKeepalive = 5\n' \
+          "$WG_CLIENT_PRIV" "$WG_SERVER_PUB" | sudo ip netns exec user_ns wg setconf wg0 /dev/stdin
+        sudo ip netns exec user_ns ip link set wg0 up
+
+        sleep 5
+        echo "=== WireGuard status ==="
+        sudo ip netns exec ebpf_ns wg show wg0
+        sudo ip netns exec user_ns wg show wg0
+
+        # ── Ping test ──
+        echo "=== Ping through cross-compat tunnel (userspace client → eBPF server) ==="
+        PING_OUT=$(sudo ip netns exec user_ns ping -c5 -i0.3 -W3 10.200.0.1 2>&1) || true
+        echo "$PING_OUT"
+        if echo "$PING_OUT" | grep -q '0% packet loss'; then
+          echo "PING: SUCCESS"
+        else
+          echo "PING: FAIL"
+          echo "--- gutd eBPF log ---"; cat /tmp/gutd-ebpf.log
+          echo "--- gutd userspace log ---"; cat /tmp/gutd-user.log
+          sudo kill $G_EBPF $G_USER 2>/dev/null || true
+          sudo ip netns del ebpf_ns user_ns 2>/dev/null || true
+          exit 1
+        fi
+
+        # ── Cleanup ──
+        sudo kill $G_EBPF $G_USER 2>/dev/null || true
+        sleep 0.3
+        sudo kill -9 $G_EBPF $G_USER 2>/dev/null || true
+        wait $G_EBPF $G_USER 2>/dev/null || true
+        sudo ip netns del ebpf_ns 2>/dev/null || true
+        sudo ip netns del user_ns 2>/dev/null || true
+
+        echo "=== CROSS-COMPAT TUNNEL TEST PASSED ==="
