@@ -17,6 +17,9 @@ on:
       - 'src/tun.rs'
       - 'build.rs'
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
