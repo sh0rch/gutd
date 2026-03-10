@@ -86,7 +86,7 @@ pub fn load_config(path: &str) -> Result<Config> {
 ///
 /// Optional (with defaults):
 /// - `GUTD_ADDRESS`            — WireGuard tunnel address with prefix (e.g. `10.0.0.1/30`);
-///                               auto-generated if omitted
+///   auto-generated if omitted
 /// - `GUTD_RESPONDER`          — `true`/`false` override; inferred from address or dynamic_peer
 /// - `GUTD_NAME`               — peer name              [default: `gut0`]
 /// - `GUTD_MTU`                — inner MTU               [default: `1492`]
