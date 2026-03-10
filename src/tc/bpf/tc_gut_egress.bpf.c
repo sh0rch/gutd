@@ -158,6 +158,40 @@ int gut_egress(struct __sk_buff *skb)
     __u32 wg_idx = 0;
     __builtin_memcpy(&wg_idx, wg_head + (wg_type == 1 ? 4 : 8), 4);
 
+    /* ── Multi-client dynamic peer: session bridging & routing ─────
+     * TC egress sees raw (unmasked) WG on the veth.
+     *   Type 1 (init): sender_index [4..8] only.  In dynamic_peer server mode
+     *     the server should not initiate rekeys — drop; client will re-initiate.
+     *   Type 2 (resp): sender=S_idx [4..8], receiver=C_idx [8..12].
+     *     Build bridge: session_map[S_idx] = C_idx so XDP ingress can map
+     *     future Type 4 packets (keyed by S_idx on ingress) back to C_idx.
+     *   Type 4 (data): receiver=C_idx [4..8] — direct lookup in client_map.
+     *
+     * Note: wg_idx (used for DCID) reads bytes[8..12] for non-Type-1, which is
+     * correct for DCID matching but NOT for routing.  Type 4 receiver_index lives
+     * at bytes[4..8], so we extract a separate c_idx for the client_map lookup.
+     */
+    __u32 c_idx = wg_idx; /* correct for Type 2: bytes[8..12] = receiver_index = C_idx */
+    if (cfg->dynamic_peer)
+    {
+        if (wg_type == 1)
+            return TC_ACT_OK; /* drop server-initiated rekey; client will retry */
+
+        if (wg_type == 4)
+        {
+            /* Type 4: receiver_index at bytes[4..8] = C_idx */
+            __builtin_memcpy(&c_idx, wg_head + 4, 4);
+        }
+
+        if (wg_type == 2)
+        {
+            __u32 s_idx = 0;
+            __builtin_memcpy(&s_idx, wg_head + 4, 4); /* sender_index = S_idx */
+            /* c_idx = wg_idx = wg_head[8..12] = receiver_index = C_idx for Type 2 */
+            bpf_map_update_elem(&session_map, &s_idx, &c_idx, BPF_ANY);
+        }
+    }
+
     // Extract Protected Packet Number (PPN) from unused 47th block keystream
     __u32 ppn = ks47[10];
 
@@ -306,11 +340,12 @@ int gut_egress(struct __sk_buff *skb)
         iph->check = 0;
         __builtin_memcpy(&iph->saddr, &cfg->bind_ip, 4);
 
-        /* Dynamic peer: read destination from peer_endpoint_map (learned by XDP ingress).
-         * Static peer: use cfg->peer_ip as before. */
+        /* Dynamic peer: read destination from client_map keyed by c_idx.
+         * For Type 2, c_idx = wg_idx = bytes[8..12] = receiver_index.
+         * For Type 4, c_idx = bytes[4..8] = receiver_index (extracted above). */
         if (cfg->dynamic_peer)
         {
-            struct peer_endpoint *ep = bpf_map_lookup_elem(&peer_endpoint_map, &zero);
+            struct peer_endpoint *ep = bpf_map_lookup_elem(&client_map, &c_idx);
             if (!ep || !ep->valid)
                 return TC_ACT_OK; /* no endpoint learned yet — drop silently */
             __builtin_memcpy(&iph->daddr, &ep->ip4, 4);

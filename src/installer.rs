@@ -136,9 +136,8 @@ fn example_config() -> &'static str {
 name = gut0                 # veth pair name (gut0 ↔ gut0_xdp)
 # mtu = 1492                # Managed automatically
 # nic = eth0                # physical NIC for XDP (auto-detected if omitted)
-address = 10.0.0.1/30       # IP address on veth. SERVER MUST HAVE ODD IP (e.g. .1), CLIENT EVEN (e.g. .2)
-
-bind_ip = 0.0.0.0
+# responder = true           # QUIC server role; auto from dynamic_peer if not set
+# bind_ip = 0.0.0.0         # default: 0.0.0.0 (auto)
 peer_ip = 203.0.113.10
 ports = 41000
 keepalive_drop_percent = 30
