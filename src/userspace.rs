@@ -164,6 +164,81 @@ fn quic_encap(
 
     Some(quic_hdr_len + orig_len + pad_len)
 }
+/// Verify DCID and PPN in QUIC header match the crypto-derived values.
+/// Returns `true` if the packet is authentic GUT traffic.
+fn quic_verify(
+    buf: &[u8],
+    orig_len: usize,
+    key: &[u32; 12],
+    feistel_rk: &[u32; 4],
+    rounds: u8,
+) -> bool {
+    if orig_len < GUT_QUIC_SHORT_HEADER_SIZE + 16 {
+        return false;
+    }
+
+    let first_byte = buf[0];
+    let quic_hdr_len = if (first_byte & 0xC0) == 0xC0 {
+        GUT_QUIC_LONG_HEADER_SIZE
+    } else if (first_byte & 0x40) == 0x40 {
+        GUT_QUIC_SHORT_HEADER_SIZE
+    } else {
+        return false;
+    };
+
+    if orig_len < quic_hdr_len + 32 {
+        return false;
+    }
+
+    let pad_byte = buf[quic_hdr_len - 1];
+    let ballast_len = if (pad_byte & 0x40) != 0 {
+        ((pad_byte & 0x3F) as usize) + 1
+    } else {
+        0
+    };
+
+    let wg_off = quic_hdr_len;
+    let wg_len = orig_len - quic_hdr_len;
+    if ballast_len > wg_len {
+        return false;
+    }
+    let actual_wg_len = wg_len - ballast_len;
+    if actual_wg_len < 32 {
+        return false;
+    }
+
+    // Compute nonce from masked WG payload (nonce bytes 16..32 are NOT masked by ks47[0..16])
+    let nonce = wg_nonce32(&buf[wg_off..wg_off + actual_wg_len]);
+
+    let ks47 = chacha_block_fast(key, 47, nonce, rounds);
+    let ks47_b: [u8; 64] = unsafe { std::mem::transmute(ks47) };
+
+    // Temporarily decrypt first 16 bytes to get wg_type and wg_idx
+    let mut hdr = [0u8; 16];
+    hdr.copy_from_slice(&buf[wg_off..wg_off + 16]);
+    xor16(&mut hdr, &ks47_b[0..16]);
+
+    let wg_type = hdr[0] & 0x1F;
+    let wg_idx = if wg_type == 1 {
+        u32::from_le_bytes(hdr[4..8].try_into().unwrap())
+    } else {
+        u32::from_le_bytes(hdr[8..12].try_into().unwrap())
+    };
+
+    let expected_dcid = feistel32(wg_idx, feistel_rk);
+    let expected_ppn = ks47[10];
+
+    if quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
+        let pkt_dcid = u32::from_le_bytes(buf[1..5].try_into().unwrap());
+        let pkt_ppn = u32::from_le_bytes(buf[5..9].try_into().unwrap());
+        pkt_dcid == expected_dcid && pkt_ppn == expected_ppn
+    } else {
+        let pkt_dcid = u32::from_le_bytes(buf[6..10].try_into().unwrap());
+        let pkt_ppn = u32::from_le_bytes(buf[26..30].try_into().unwrap());
+        pkt_dcid == expected_dcid && pkt_ppn == expected_ppn
+    }
+}
+
 fn quic_decap(
     buf: &mut [u8],
     orig_len: usize,
@@ -263,18 +338,32 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         is_server
     );
 
-    let wg_port_str = env::var("WG_PORT").unwrap_or_else(|_| "51820".to_string());
-    let wg_port: u16 = wg_port_str.parse()?;
-    let wg_addr: SocketAddr = format!("127.0.0.1:{}", wg_port_str).parse()?;
+    let wg_host_str = env::var("GUTD_WG_HOST").unwrap_or_else(|_| "127.0.0.1:51820".to_string());
+    let wg_addr: SocketAddr = wg_host_str.parse()?;
+    let wg_port: u16 = wg_addr.port();
 
     // Optional override for where to send egress traffic
     let peer_ip_str = env::var("GUTD_PEER_IP").unwrap_or_else(|_| peer.peer_ip.to_string());
+    let dynamic_peer = peer.dynamic_peer
+        || peer_ip_str.eq_ignore_ascii_case("dynamic")
+        || peer_ip_str == "0.0.0.0";
     // For ports, use the first one from config
     let peer_port = peer.ports.first().copied().unwrap_or(41000);
-    let remote_peer_addr: SocketAddr = format!("{}:{}", peer_ip_str, peer_port).parse()?;
+    let remote_peer_addr: Option<SocketAddr> = if dynamic_peer {
+        None
+    } else {
+        Some(format!("{}:{}", peer_ip_str, peer_port).parse()?)
+    };
+
+    // Dynamic peer: learned from first validated inbound packet
+    let mut learned_peer_addr: Option<SocketAddr> = None;
 
     println!("Forwarding INGRESS to local WireGuard at {}", wg_addr);
-    println!("Forwarding EGRESS to remote Peer at {}", remote_peer_addr);
+    if let Some(ref addr) = remote_peer_addr {
+        println!("Forwarding EGRESS to remote Peer at {}", addr);
+    } else {
+        println!("Forwarding EGRESS to dynamic peer (will learn from first inbound packet)");
+    }
 
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(1024);
@@ -309,10 +398,14 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         return Err("Could not bind to any external ports".into());
     }
 
+    // Ordered list of ext socket tokens for round-robin port rotation
+    let ext_tokens: Vec<Token> = ext_sockets.keys().copied().collect();
+    let mut ext_rr_idx: usize = 0;
+
     let mut buf = [0u8; 65536];
 
     // For sending back to WG clients with the right ephemeral source port
-    let std_local = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let std_local = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
     let _ = std_local.set_nonblocking(true);
 
     let mut local_socket = UdpSocket::from_std(std_local);
@@ -335,18 +428,22 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         Ok((size, src)) => {
                             last_wg_client_addr = Some(src);
                             // It's EGRESS traffic from local WG
-                            if let Some(new_size) = quic_encap(
-                                &mut buf,
-                                size,
-                                &key_init,
-                                &feistel_rk,
-                                rounds,
-                                is_server,
-                                src.port(),
-                                wg_port,
-                            ) {
-                                if let Some(ext_sock) = ext_sockets.values().next() {
-                                    let _ = ext_sock.send_to(&buf[..new_size], remote_peer_addr);
+                            if let Some(egress_dest) = remote_peer_addr.or(learned_peer_addr) {
+                                if let Some(new_size) = quic_encap(
+                                    &mut buf,
+                                    size,
+                                    &key_init,
+                                    &feistel_rk,
+                                    rounds,
+                                    is_server,
+                                    src.port(),
+                                    wg_port,
+                                ) {
+                                    let tok = ext_tokens[ext_rr_idx % ext_tokens.len()];
+                                    ext_rr_idx = ext_rr_idx.wrapping_add(1);
+                                    if let Some(ext_sock) = ext_sockets.get(&tok) {
+                                        let _ = ext_sock.send_to(&buf[..new_size], egress_dest);
+                                    }
                                 }
                             }
                         }
@@ -362,6 +459,14 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                             let first_byte = buf[0];
                             if (first_byte & 0xC0) == 0xC0 || (first_byte & 0x40) == 0x40 {
                                 // INGRESS traffic (QUIC) from Remote Peer
+                                // Verify DCID/PPN before processing — reject unauthentic packets
+                                if !quic_verify(&buf, size, &key_init, &feistel_rk, rounds) {
+                                    continue;
+                                }
+                                // Dynamic peer: learn endpoint from validated packet
+                                if dynamic_peer {
+                                    learned_peer_addr = Some(src);
+                                }
                                 if let Some((new_size, _wg_sport, _wg_dport)) =
                                     quic_decap(&mut buf, size, &key_init, &feistel_rk, rounds)
                                 {
@@ -379,17 +484,19 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 // It could be WG traffic sent explicitly to the external socket!
                                 // (If WG was configured to point to 127.0.0.1:41000 instead of ephemeral local_socket)
                                 last_wg_client_addr = Some(src);
-                                if let Some(new_size) = quic_encap(
-                                    &mut buf,
-                                    size,
-                                    &key_init,
-                                    &feistel_rk,
-                                    rounds,
-                                    is_server,
-                                    src.port(),
-                                    wg_port,
-                                ) {
-                                    let _ = ext_socket.send_to(&buf[..new_size], remote_peer_addr);
+                                if let Some(egress_dest) = remote_peer_addr.or(learned_peer_addr) {
+                                    if let Some(new_size) = quic_encap(
+                                        &mut buf,
+                                        size,
+                                        &key_init,
+                                        &feistel_rk,
+                                        rounds,
+                                        is_server,
+                                        src.port(),
+                                        wg_port,
+                                    ) {
+                                        let _ = ext_socket.send_to(&buf[..new_size], egress_dest);
+                                    }
                                 }
                             }
                         }

@@ -6,7 +6,7 @@
 #
 # Used via Cross.toml — built automatically by `cross` on first run.
 
-ARG BASE_IMAGE
+ARG BASE_IMAGE=scratch
 ARG SYSROOT_PLATFORM=linux/amd64
 ARG IS_MIPS=false
 

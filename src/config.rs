@@ -54,6 +54,7 @@ pub struct PeerConfig {
     pub address: String,
     pub bind_ip: IpAddr,
     pub peer_ip: IpAddr,
+    pub dynamic_peer: bool,
     pub ports: Vec<u16>,
     pub key: [u8; 32],
     pub keepalive_drop_percent: u8,
@@ -98,9 +99,17 @@ pub fn load_config_from_env() -> Result<Config> {
         std::env::var(name).map_err(|_| format!("Required env var {name} is not set").into())
     };
 
-    let peer_ip: IpAddr = getenv("GUTD_PEER_IP")?
-        .parse()
-        .map_err(|e| format!("GUTD_PEER_IP: invalid IP address: {e}"))?;
+    let peer_ip_str = getenv("GUTD_PEER_IP")?;
+    let (peer_ip, dynamic_peer) = if peer_ip_str.trim().eq_ignore_ascii_case("dynamic") {
+        // Dynamic peer mode: server doesn't know peer IP in advance.
+        // Use 0.0.0.0 as placeholder; BPF will learn the real endpoint.
+        (IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), true)
+    } else {
+        let ip: IpAddr = peer_ip_str
+            .parse()
+            .map_err(|e| format!("GUTD_PEER_IP: invalid IP address: {e}"))?;
+        (ip, false)
+    };
 
     let bind_ip: IpAddr = getenv("GUTD_BIND_IP")?
         .parse()
@@ -203,6 +212,7 @@ pub fn load_config_from_env() -> Result<Config> {
             address,
             bind_ip,
             peer_ip,
+            dynamic_peer,
             ports,
             key,
             keepalive_drop_percent,
@@ -222,6 +232,7 @@ struct PeerBuilder {
     address: Option<String>,
     bind_ip: Option<IpAddr>,
     peer_ip: Option<IpAddr>,
+    dynamic_peer: bool,
     ports: Option<Vec<u16>>,
     key: Option<[u8; 32]>,
     passphrase: Option<String>,
@@ -239,6 +250,7 @@ impl Default for PeerBuilder {
             address: None,
             bind_ip: None,
             peer_ip: None,
+            dynamic_peer: false,
             ports: None,
             key: None,
             passphrase: None,
@@ -254,7 +266,11 @@ impl PeerBuilder {
             .address
             .ok_or_else(|| format!("address not set in [peer] (name={})", self.name))?;
         let bind_ip = self.bind_ip.ok_or("bind_ip not set")?;
-        let peer_ip = self.peer_ip.ok_or("peer_ip not set")?;
+        let peer_ip = if self.dynamic_peer {
+            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        } else {
+            self.peer_ip.ok_or("peer_ip not set")?
+        };
         let ports = self.ports.ok_or("ports not set")?;
         let key = match (self.key, self.passphrase) {
             (Some(k), _) => k,
@@ -282,6 +298,7 @@ impl PeerBuilder {
             address,
             bind_ip,
             peer_ip,
+            dynamic_peer: self.dynamic_peer,
             ports,
             key,
             keepalive_drop_percent: self.keepalive_drop_percent,
@@ -369,7 +386,13 @@ fn parse_config(content: &str) -> Result<Config> {
                             };
                         }
                         "bind_ip" => b.bind_ip = Some(value.parse()?),
-                        "peer_ip" => b.peer_ip = Some(value.parse()?),
+                        "peer_ip" => {
+                            if value.eq_ignore_ascii_case("dynamic") {
+                                b.dynamic_peer = true;
+                            } else {
+                                b.peer_ip = Some(value.parse()?);
+                            }
+                        }
                         "ports" => {
                             let parsed: Result<Vec<u16>> = value
                                 .split(',')
@@ -580,5 +603,28 @@ ports = 41001
 key = ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100
 ";
         assert!(parse_config(content).is_err());
+    }
+
+    #[test]
+    fn test_parse_config_dynamic_peer() {
+        let content = r"
+[global]
+outer_mtu = 1500
+
+[peer]
+name = gut0
+mtu = 1400
+address = 10.0.0.1/30
+bind_ip = 192.168.1.1
+peer_ip = dynamic
+ports = 41000,41001
+key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+";
+        let config = parse_config(content).unwrap();
+        assert!(config.peer().dynamic_peer);
+        assert_eq!(
+            config.peer().peer_ip,
+            "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
+        );
     }
 }
