@@ -49,7 +49,24 @@ gh workflow run integration-test.yml
 
 ---
 
-### 4. release.yml -- Release Pipeline (tag/manual)
+### 4. windows-test.yml -- Windows & Cross-Platform Test (automatic)
+
+**Triggers:** Called by ci.yml, manual dispatch
+**Time:** ~5-8 min
+
+**Jobs:**
+- `windows-build`: Build `gutd.exe` on `windows-latest` (MinGW/GNU), smoke test (--version, genkey, config parse)
+- `userspace-tunnel`: Two userspace gutd instances + WireGuard ping test in Linux namespaces (validates Windows ↔ Windows wire compatibility)
+- `cross-compat`: eBPF server + userspace client + WireGuard ping test (validates Linux eBPF ↔ Windows userspace wire compatibility)
+
+**Manual run:**
+```bash
+gh workflow run windows-test.yml
+```
+
+---
+
+### 5. release.yml -- Release Pipeline (tag/manual)
 
 **Triggers:** Push tag `v*.*.*`, manual dispatch
 **Time:** ~10-15 min
@@ -62,7 +79,7 @@ gh workflow run integration-test.yml
 
 ---
 
-### 5. build.yml / unit-tests.yml -- Reusable workflows
+### 6. build.yml / unit-tests.yml -- Reusable workflows
 
 Called by other workflows. Not triggered directly.
 
@@ -77,7 +94,10 @@ Push/PR code
  ci.yml (5-7 min)
     +-- cargo test
     +-- musl build
-    \-- config verify
+    +-- config verify
+    +-- windows build + smoke test
+    +-- userspace tunnel test
+    +-- eBPF ↔ userspace cross-compat
     
 TC/XDP code changed?
     |

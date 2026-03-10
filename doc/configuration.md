@@ -18,7 +18,9 @@ Full reference with all defaults shown:
 # outer_mtu = 1500          # outer link MTU; runtime: max(route_pmtu, iface_mtu, outer_mtu)
 # stats_interval = 5        # write /run/gutd.stat every N seconds (0 = off)
 # userspace_only = false    # set to true to force Mio userspace proxy instead of eBPF
-# stat_file = /run/gutd.stat
+#                           # (always true on Windows)
+# stat_file = /run/gutd.stat  # Linux default
+# stat_file = C:\ProgramData\gutd\gutd.stat  # Windows default
 
 [peer]
 # name = gut0               # veth pair name: gut0 <-> gut0_xdp  [default: gut0]
@@ -70,6 +72,10 @@ When `GUTD_PEER_IP` is set and no config file is passed via CLI, gutd reads all 
 | `GUTD_STAT_FILE` | no | `/run/gutd.stat` | `stat_file` |
 
 \* One of `GUTD_KEY`/`GUTD_SECRET`/`GUTD_CIPHER` **or** `GUTD_PASSPHRASE`/`GUTD_PHRASE` is required.
+
+> **Windows note:** Default `stat_file` is `C:\ProgramData\gutd\gutd.stat`.
+> Default config path is `C:\ProgramData\gutd\gutd.conf`.
+> eBPF-specific variables (`GUTD_NIC`, `GUTD_OWN_HTTP3`, `GUTD_DEFAULT_POLICY`) are ignored.
 
 ### Userspace-only runtime variables
 
