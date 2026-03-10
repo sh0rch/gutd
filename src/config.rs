@@ -55,6 +55,7 @@ pub struct PeerConfig {
     pub bind_ip: IpAddr,
     pub peer_ip: IpAddr,
     pub dynamic_peer: bool,
+    pub responder: bool,
     pub ports: Vec<u16>,
     pub key: [u8; 32],
     pub keepalive_drop_percent: u8,
@@ -78,13 +79,15 @@ pub fn load_config(path: &str) -> Result<Config> {
 /// Build a [`Config`] entirely from environment variables — no file needed.
 ///
 /// Required:
-/// - `GUTD_PEER_IP`   — remote peer IP address
+/// - `GUTD_PEER_IP`   — remote peer IP address (or `dynamic`)
 /// - `GUTD_BIND_IP`  — local bind IP (use `0.0.0.0` for auto-detect)
-/// - `GUTD_ADDRESS`  — WireGuard tunnel address with prefix (e.g. `10.0.0.1/30`)
 /// - `GUTD_PORTS`    — comma-separated port list (e.g. `41000,41001,41002,41003`)
 /// - `GUTD_KEY`      — 64-char hex key **or** `GUTD_PASSPHRASE` — plain-text passphrase
 ///
 /// Optional (with defaults):
+/// - `GUTD_ADDRESS`            — WireGuard tunnel address with prefix (e.g. `10.0.0.1/30`);
+///   auto-generated if omitted
+/// - `GUTD_RESPONDER`          — `true`/`false` override; inferred from address or dynamic_peer
 /// - `GUTD_NAME`               — peer name              [default: `gut0`]
 /// - `GUTD_MTU`                — inner MTU               [default: `1492`]
 /// - `GUTD_OUTER_MTU`          — outer/physical MTU      [default: `1500`]
@@ -111,11 +114,46 @@ pub fn load_config_from_env() -> Result<Config> {
         (ip, false)
     };
 
-    let bind_ip: IpAddr = getenv("GUTD_BIND_IP")?
-        .parse()
-        .map_err(|e| format!("GUTD_BIND_IP: invalid IP address: {e}"))?;
+    let bind_ip: IpAddr = std::env::var("GUTD_BIND_IP")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            s.parse()
+                .map_err(|e| format!("GUTD_BIND_IP: invalid IP address: {e}"))
+        })
+        .transpose()?
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
 
-    let address = getenv("GUTD_ADDRESS")?;
+    let address_opt: Option<String> = std::env::var("GUTD_ADDRESS")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+
+    let responder_opt: Option<bool> = std::env::var("GUTD_RESPONDER")
+        .ok()
+        .map(|v| v == "true" || v == "1");
+
+    // Resolve responder: explicit > address parity > dynamic_peer
+    let responder = if let Some(r) = responder_opt {
+        r
+    } else if let Some(ref addr) = address_opt {
+        let ip_part = addr.split('/').next().unwrap_or("");
+        let parts: Vec<&str> = ip_part.split('.').collect();
+        if parts.len() == 4 {
+            parts[3].parse::<u8>().unwrap_or(0) & 1 == 1
+        } else {
+            false
+        }
+    } else {
+        dynamic_peer
+    };
+
+    let address = address_opt.unwrap_or_else(|| {
+        if responder {
+            "10.47.0.1/30".to_string()
+        } else {
+            "10.47.0.2/30".to_string()
+        }
+    });
 
     let ports_str = getenv("GUTD_PORTS")?;
     let ports: Vec<u16> = ports_str
@@ -213,6 +251,7 @@ pub fn load_config_from_env() -> Result<Config> {
             bind_ip,
             peer_ip,
             dynamic_peer,
+            responder,
             ports,
             key,
             keepalive_drop_percent,
@@ -233,6 +272,7 @@ struct PeerBuilder {
     bind_ip: Option<IpAddr>,
     peer_ip: Option<IpAddr>,
     dynamic_peer: bool,
+    responder: Option<bool>,
     ports: Option<Vec<u16>>,
     key: Option<[u8; 32]>,
     passphrase: Option<String>,
@@ -251,6 +291,7 @@ impl Default for PeerBuilder {
             bind_ip: None,
             peer_ip: None,
             dynamic_peer: false,
+            responder: None,
             ports: None,
             key: None,
             passphrase: None,
@@ -261,11 +302,40 @@ impl Default for PeerBuilder {
 }
 
 impl PeerBuilder {
-    fn build(self, outer_mtu: u16) -> Result<PeerConfig> {
-        let address = self
-            .address
-            .ok_or_else(|| format!("address not set in [peer] (name={})", self.name))?;
-        let bind_ip = self.bind_ip.ok_or("bind_ip not set")?;
+    fn build(self, outer_mtu: u16, peer_index: usize) -> Result<PeerConfig> {
+        // Resolve responder role:
+        //   1. Explicit `responder = true/false` wins
+        //   2. If address is set, derive from last-octet parity (odd = responder)
+        //   3. dynamic_peer implies responder (server side)
+        //   4. Default: initiator (false)
+        let responder = if let Some(r) = self.responder {
+            r
+        } else if let Some(ref addr) = self.address {
+            let ip_part = addr.split('/').next().unwrap_or("");
+            let parts: Vec<&str> = ip_part.split('.').collect();
+            if parts.len() == 4 {
+                parts[3].parse::<u8>().unwrap_or(0) & 1 == 1
+            } else {
+                false
+            }
+        } else {
+            self.dynamic_peer
+        };
+
+        // Auto-generate veth address if not specified.
+        // Each peer gets its own /30 block: 10.47.0.{idx*4+1}/30 or .{idx*4+2}/30
+        let address = self.address.unwrap_or_else(|| {
+            let base = peer_index * 4;
+            if responder {
+                format!("10.47.0.{}/30", base + 1)
+            } else {
+                format!("10.47.0.{}/30", base + 2)
+            }
+        });
+
+        let bind_ip = self
+            .bind_ip
+            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
         let peer_ip = if self.dynamic_peer {
             IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
         } else {
@@ -299,6 +369,7 @@ impl PeerBuilder {
             bind_ip,
             peer_ip,
             dynamic_peer: self.dynamic_peer,
+            responder,
             ports,
             key,
             keepalive_drop_percent: self.keepalive_drop_percent,
@@ -321,8 +392,9 @@ fn parse_config(content: &str) -> Result<Config> {
     let mut current_builder: Option<PeerBuilder> = None;
     let mut current_section = "";
 
-    let finalize_peer =
-        |builder: PeerBuilder, outer_mtu: u16| -> Result<PeerConfig> { builder.build(outer_mtu) };
+    let finalize_peer = |builder: PeerBuilder, outer_mtu: u16, idx: usize| -> Result<PeerConfig> {
+        builder.build(outer_mtu, idx)
+    };
 
     for line in content.lines() {
         let line = line.trim();
@@ -335,7 +407,8 @@ fn parse_config(content: &str) -> Result<Config> {
             if section == "peer" {
                 // Finalize the previous [peer] block, if any.
                 if let Some(builder) = current_builder.take() {
-                    peers.push(finalize_peer(builder, outer_mtu)?);
+                    let idx = peers.len();
+                    peers.push(finalize_peer(builder, outer_mtu, idx)?);
                 }
                 current_builder = Some(PeerBuilder::default());
             }
@@ -429,6 +502,9 @@ fn parse_config(content: &str) -> Result<Config> {
                         "own_http3" => {
                             b.own_http3 = value == "true" || value == "1";
                         }
+                        "responder" => {
+                            b.responder = Some(value == "true" || value == "1");
+                        }
                         _ => {}
                     }
                 }
@@ -439,7 +515,8 @@ fn parse_config(content: &str) -> Result<Config> {
 
     // Finalize last [peer] block.
     if let Some(builder) = current_builder.take() {
-        peers.push(finalize_peer(builder, outer_mtu)?);
+        let idx = peers.len();
+        peers.push(finalize_peer(builder, outer_mtu, idx)?);
     }
 
     if peers.is_empty() {
@@ -622,9 +699,72 @@ key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 ";
         let config = parse_config(content).unwrap();
         assert!(config.peer().dynamic_peer);
+        assert!(config.peer().responder); // 10.0.0.1 → odd → responder
         assert_eq!(
             config.peer().peer_ip,
             "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn test_responder_explicit_true() {
+        let content = r"
+[peer]
+name = gut0
+bind_ip = 0.0.0.0
+peer_ip = dynamic
+ports = 41000
+responder = true
+key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+";
+        let config = parse_config(content).unwrap();
+        assert!(config.peer().responder);
+        assert_eq!(config.peer().address, "10.47.0.1/30");
+    }
+
+    #[test]
+    fn test_responder_inferred_from_dynamic_peer() {
+        let content = r"
+[peer]
+name = gut0
+bind_ip = 0.0.0.0
+peer_ip = dynamic
+ports = 41000
+key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+";
+        let config = parse_config(content).unwrap();
+        assert!(config.peer().responder);
+        assert_eq!(config.peer().address, "10.47.0.1/30");
+    }
+
+    #[test]
+    fn test_initiator_default_no_address() {
+        let content = r"
+[peer]
+name = gut0
+bind_ip = 0.0.0.0
+peer_ip = 203.0.113.10
+ports = 41000
+key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+";
+        let config = parse_config(content).unwrap();
+        assert!(!config.peer().responder);
+        assert_eq!(config.peer().address, "10.47.0.2/30");
+    }
+
+    #[test]
+    fn test_responder_from_address_parity() {
+        let content = r"
+[peer]
+name = gut0
+bind_ip = 0.0.0.0
+peer_ip = 203.0.113.10
+address = 10.0.0.1/30
+ports = 41000
+key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+";
+        let config = parse_config(content).unwrap();
+        assert!(config.peer().responder); // .1 is odd
+        assert_eq!(config.peer().address, "10.0.0.1/30");
     }
 }

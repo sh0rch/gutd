@@ -179,35 +179,51 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             return -1;
     }
 
-    /* ── Dynamic peer endpoint learning ──────────────────────────────
-     * When dynamic_peer==1 (server mode, peer behind NAT), record the
-     * real source IP:port of this crypto-validated packet so TC egress
-     * knows where to send replies. */
+    /* ── Dynamic peer endpoint learning (multi-client) ──────────────
+     * When dynamic_peer==1, learn which external IP:port belongs to each
+     * WG client by looking at the WG index fields:
+     *   Type 1 (init):  sender_index [4..8]  = C_idx (client chose it)
+     *   Type 4 (data):  receiver_index [4..8] = S_idx → bridge via session_map → C_idx
+     *
+     * Note: wg_idx reads bytes[8..12] for non-Type-1 (correct for DCID matching),
+     * but receiver_index for Type 4 lives at bytes[4..8].  We extract separately. */
     if (cfg->dynamic_peer)
     {
-        struct peer_endpoint *ep = bpf_map_lookup_elem(&peer_endpoint_map, &zero);
-        if (ep)
+        __u32 client_idx = 0;
+        if (wg_type == 1)
         {
+            /* Type 1: sender_index at wg[4..8] = C_idx directly */
+            client_idx = wg_idx; /* already read from wg+4 for type 1 */
+        }
+        else if (wg_type == 4)
+        {
+            /* Type 4: receiver_index at wg[4..8] = S_idx on server ingress.
+             * Bridge S_idx → C_idx via session_map (populated by TC egress Type 2). */
+            __u32 s_idx = 0;
+            __builtin_memcpy(&s_idx, wg + 4, 4);
+            __u32 *cidx_p = bpf_map_lookup_elem(&session_map, &s_idx);
+            if (cidx_p)
+                client_idx = *cidx_p;
+        }
+
+        if (client_idx != 0)
+        {
+            struct peer_endpoint ep = {};
             if (ipver == 4)
             {
                 struct iphdr *src_iph = (void *)((__u8 *)data + ip_off);
                 if ((void *)(src_iph + 1) <= data_end)
-                {
-                    ep->ip4 = src_iph->saddr;
-                    __builtin_memset(ep->ip6, 0, 16);
-                }
+                    ep.ip4 = src_iph->saddr;
             }
             else
             {
                 struct ipv6hdr *src_ip6h = (void *)((__u8 *)data + ip_off);
                 if ((void *)(src_ip6h + 1) <= data_end)
-                {
-                    ep->ip4 = 0;
-                    __builtin_memcpy(ep->ip6, &src_ip6h->saddr, 16);
-                }
+                    __builtin_memcpy(ep.ip6, &src_ip6h->saddr, 16);
             }
-            ep->port = bpf_ntohs(udph->source);
-            ep->valid = 1;
+            ep.port = bpf_ntohs(udph->source);
+            ep.valid = 1;
+            bpf_map_update_elem(&client_map, &client_idx, &ep, BPF_ANY);
         }
     }
 

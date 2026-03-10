@@ -321,17 +321,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let rounds: u8 = 4;
     let feistel_rk = compute_feistel_rk(&key, rounds);
 
-    let addr = &peer.address;
-    let is_server = {
-        let parts: Vec<&str> = addr.split('/').collect();
-        let ip_parts: Vec<&str> = parts[0].split('.').collect();
-        if ip_parts.len() == 4 {
-            let last_octet: u8 = ip_parts[3].parse().unwrap_or(0);
-            (last_octet & 1) == 1
-        } else {
-            false
-        }
-    };
+    let is_server = peer.responder;
 
     println!(
         "Starting gutd-userspace proxy (MIO event loop). is_server={}",
@@ -355,14 +345,17 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         Some(format!("{}:{}", peer_ip_str, peer_port).parse()?)
     };
 
-    // Dynamic peer: learned from first validated inbound packet
-    let mut learned_peer_addr: Option<SocketAddr> = None;
+    // Dynamic peer: multi-client maps (keyed by WG index)
+    //   client_map: C_idx → learned SocketAddr
+    //   session_map: S_idx → C_idx (bridged on Type 2 egress)
+    let mut client_map: HashMap<u32, SocketAddr> = HashMap::new();
+    let mut session_map: HashMap<u32, u32> = HashMap::new();
 
     println!("Forwarding INGRESS to local WireGuard at {}", wg_addr);
     if let Some(ref addr) = remote_peer_addr {
         println!("Forwarding EGRESS to remote Peer at {}", addr);
     } else {
-        println!("Forwarding EGRESS to dynamic peer (will learn from first inbound packet)");
+        println!("Forwarding EGRESS to dynamic peer (will learn from inbound packets)");
     }
 
     let mut poll = Poll::new()?;
@@ -428,7 +421,37 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         Ok((size, src)) => {
                             last_wg_client_addr = Some(src);
                             // It's EGRESS traffic from local WG
-                            if let Some(egress_dest) = remote_peer_addr.or(learned_peer_addr) {
+                            // Multi-client routing: determine destination by WG index
+                            let egress_dest = if !dynamic_peer {
+                                remote_peer_addr
+                            } else {
+                                if size < 4 {
+                                    None
+                                } else {
+                                    let wg_type = buf[0] & 0x1F;
+                                    if wg_type == 1 {
+                                        // Server-initiated rekey: no receiver_index to route.
+                                        // Drop — client will re-initiate.
+                                        None
+                                    } else if wg_type == 2 && size >= 12 {
+                                        // Type 2: sender=S_idx[4..8], receiver=C_idx[8..12]
+                                        let s_idx =
+                                            u32::from_le_bytes(buf[4..8].try_into().unwrap());
+                                        let c_idx =
+                                            u32::from_le_bytes(buf[8..12].try_into().unwrap());
+                                        session_map.insert(s_idx, c_idx);
+                                        client_map.get(&c_idx).copied()
+                                    } else if wg_type == 4 && size >= 8 {
+                                        // Type 4: receiver=C_idx[4..8]
+                                        let c_idx =
+                                            u32::from_le_bytes(buf[4..8].try_into().unwrap());
+                                        client_map.get(&c_idx).copied()
+                                    } else {
+                                        None
+                                    }
+                                }
+                            };
+                            if let Some(dest) = egress_dest {
                                 if let Some(new_size) = quic_encap(
                                     &mut buf,
                                     size,
@@ -442,7 +465,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                     let tok = ext_tokens[ext_rr_idx % ext_tokens.len()];
                                     ext_rr_idx = ext_rr_idx.wrapping_add(1);
                                     if let Some(ext_sock) = ext_sockets.get(&tok) {
-                                        let _ = ext_sock.send_to(&buf[..new_size], egress_dest);
+                                        let _ = ext_sock.send_to(&buf[..new_size], dest);
                                     }
                                 }
                             }
@@ -463,13 +486,29 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 if !quic_verify(&buf, size, &key_init, &feistel_rk, rounds) {
                                     continue;
                                 }
-                                // Dynamic peer: learn endpoint from validated packet
-                                if dynamic_peer {
-                                    learned_peer_addr = Some(src);
-                                }
+                                // Dynamic peer: learn endpoint from validated packet (multi-client)
+                                // We decap first, then parse WG type/index from the inner payload.
                                 if let Some((new_size, _wg_sport, _wg_dport)) =
                                     quic_decap(&mut buf, size, &key_init, &feistel_rk, rounds)
                                 {
+                                    if dynamic_peer && new_size >= 8 {
+                                        let wg_type = buf[0] & 0x1F;
+                                        if wg_type == 1 {
+                                            // Type 1: sender_index[4..8] = C_idx
+                                            let c_idx =
+                                                u32::from_le_bytes(buf[4..8].try_into().unwrap());
+                                            if c_idx != 0 {
+                                                client_map.insert(c_idx, src);
+                                            }
+                                        } else if wg_type == 4 {
+                                            // Type 4: receiver_index[4..8] = S_idx → session_map → C_idx
+                                            let s_idx =
+                                                u32::from_le_bytes(buf[4..8].try_into().unwrap());
+                                            if let Some(&c_idx) = session_map.get(&s_idx) {
+                                                client_map.insert(c_idx, src);
+                                            }
+                                        }
+                                    }
                                     if is_server {
                                         let _ = local_socket.send_to(&buf[..new_size], wg_addr);
                                     } else {
@@ -484,7 +523,28 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 // It could be WG traffic sent explicitly to the external socket!
                                 // (If WG was configured to point to 127.0.0.1:41000 instead of ephemeral local_socket)
                                 last_wg_client_addr = Some(src);
-                                if let Some(egress_dest) = remote_peer_addr.or(learned_peer_addr) {
+                                let egress_dest = if !dynamic_peer {
+                                    remote_peer_addr
+                                } else if size >= 12 {
+                                    let wg_type = buf[0] & 0x1F;
+                                    if wg_type == 2 {
+                                        let s_idx =
+                                            u32::from_le_bytes(buf[4..8].try_into().unwrap());
+                                        let c_idx =
+                                            u32::from_le_bytes(buf[8..12].try_into().unwrap());
+                                        session_map.insert(s_idx, c_idx);
+                                        client_map.get(&c_idx).copied()
+                                    } else if wg_type == 4 && size >= 8 {
+                                        let c_idx =
+                                            u32::from_le_bytes(buf[4..8].try_into().unwrap());
+                                        client_map.get(&c_idx).copied()
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+                                if let Some(dest) = egress_dest {
                                     if let Some(new_size) = quic_encap(
                                         &mut buf,
                                         size,
@@ -495,7 +555,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                         src.port(),
                                         wg_port,
                                     ) {
-                                        let _ = ext_socket.send_to(&buf[..new_size], egress_dest);
+                                        let _ = ext_socket.send_to(&buf[..new_size], dest);
                                     }
                                 }
                             }
