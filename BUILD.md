@@ -45,6 +45,26 @@ target/musl/gutd   # final static binary (x86_64-unknown-linux-musl)
 
 The binary is stripped and optionally compressed with UPX if available in the image.
 
+## Windows Build (Cross-Compile)
+
+Windows supports **userspace mode only** (no eBPF). Cross-compile from Linux:
+
+```bash
+# Install the target (once)
+rustup target add x86_64-pc-windows-gnu
+
+# Build without eBPF features
+cargo build --release --target x86_64-pc-windows-gnu --no-default-features
+```
+
+Binary: `target/x86_64-pc-windows-gnu/release/gutd.exe`
+
+32-bit build:
+```bash
+rustup target add i686-pc-windows-gnu
+cargo build --release --target i686-pc-windows-gnu --no-default-features
+```
+
 ## Development Build
 
 ```bash
@@ -64,6 +84,8 @@ cargo test           # unit tests
 
 ## Install
 
+### Linux
+
 ```bash
 # Installs binary, writes /etc/gutd.conf, creates systemd/OpenRC service
 sudo ./target/release/gutd install
@@ -71,3 +93,24 @@ sudo ./target/release/gutd install
 # Remove binary and service (config is preserved)
 sudo ./target/release/gutd uninstall
 ```
+
+### Windows
+
+Run Command Prompt or PowerShell **as Administrator**:
+
+```powershell
+# Installs to C:\Program Files\gutd\gutd.exe,
+# writes example config to C:\ProgramData\gutd\gutd.conf,
+# registers "gutd" Windows Service (manual start, stopped)
+gutd.exe install
+
+# Start / stop the service
+net start gutd
+net stop gutd
+
+# Remove service and binary (config is preserved)
+gutd.exe uninstall
+```
+
+The Windows service is registered with `start= demand` (manual). Use
+`sc config gutd start= auto` to enable automatic startup at boot.
