@@ -4,6 +4,9 @@ on:
   workflow_call:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   # ── Job 1: Native Windows build + smoke test ──────────────────
   windows-build:
