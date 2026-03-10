@@ -239,32 +239,46 @@ impl TcBpfManager {
     /// Attaches TC egress on `<ifname>` (encap+mask) and XDP on NIC (decap+unmask+devmap redirect).
     #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
     pub fn new(ifname: &str, config: &Config) -> Result<Self> {
-        let ingress_ifname =
-            if let Some(nic) = config.peer().nic.clone().filter(|s| !s.trim().is_empty()) {
-                nic
-            } else if let Some(peer_ifname) = Self::route_get_info(config.peer().peer_ip)
-                .ok()
-                .and_then(|info| info.dev)
-            {
+        let ingress_ifname = if let Some(nic) =
+            config.peer().nic.clone().filter(|s| !s.trim().is_empty())
+        {
+            nic
+        } else if config.peer().dynamic_peer {
+            // Dynamic peer: can't route-lookup 0.0.0.0; use default route.
+            if let Some(default_ifname) = Self::default_route_ifname() {
                 eprintln!(
-                    "  Ingress NIC auto-detected from route to peer {}: {}",
-                    config.peer().peer_ip,
-                    peer_ifname
-                );
-                peer_ifname
-            } else if let Some(default_ifname) = Self::default_route_ifname() {
-                eprintln!(
-                    "  Ingress NIC auto-detected from default route: {}",
+                    "  Ingress NIC auto-detected from default route (dynamic peer): {}",
                     default_ifname
                 );
                 default_ifname
             } else {
-                eprintln!(
-                    "  WARNING: could not auto-detect ingress NIC; falling back to {}",
-                    ifname
+                return Err(
+                    "dynamic_peer: cannot auto-detect ingress NIC. Set 'nic' explicitly.".into(),
                 );
-                ifname.to_string()
-            };
+            }
+        } else if let Some(peer_ifname) = Self::route_get_info(config.peer().peer_ip)
+            .ok()
+            .and_then(|info| info.dev)
+        {
+            eprintln!(
+                "  Ingress NIC auto-detected from route to peer {}: {}",
+                config.peer().peer_ip,
+                peer_ifname
+            );
+            peer_ifname
+        } else if let Some(default_ifname) = Self::default_route_ifname() {
+            eprintln!(
+                "  Ingress NIC auto-detected from default route: {}",
+                default_ifname
+            );
+            default_ifname
+        } else {
+            eprintln!(
+                "  WARNING: could not auto-detect ingress NIC; falling back to {}",
+                ifname
+            );
+            ifname.to_string()
+        };
 
         let kernel_version = Self::check_kernel_version()?;
         if kernel_version < (5, 2, 0) {
@@ -1128,7 +1142,13 @@ impl TcBpfManager {
         gut_config.egress_ifindex = Self::get_ifindex(ingress_ifname)? as u32;
         gut_config.tun_ifindex = Self::get_ifindex(tun_ifname)? as u32;
         gut_config.src_mac = Self::read_iface_mac(ingress_ifname)?;
-        gut_config.dst_mac = Self::resolve_peer_mac(config.peer().peer_ip, ingress_ifname)?;
+        if config.peer().dynamic_peer {
+            // Dynamic peer: can't ARP for unknown peer. Use default gateway MAC.
+            gut_config.dst_mac = Self::resolve_default_gateway_mac(ingress_ifname, None)
+                .ok_or("dynamic_peer: cannot resolve default gateway MAC on ingress NIC")?;
+        } else {
+            gut_config.dst_mac = Self::resolve_peer_mac(config.peer().peer_ip, ingress_ifname)?;
+        }
         gut_config.tun_mac = Self::read_iface_mac(tun_ifname).unwrap_or([0; 6]);
 
         // Set default XDP action from config.
@@ -1228,6 +1248,12 @@ impl TcBpfManager {
                      (compute_p2p_peer failed: {e})"
                 );
             }
+        }
+
+        // Dynamic peer mode flag
+        if config.peer().dynamic_peer {
+            gut_config.dynamic_peer = 1;
+            eprintln!("  Dynamic peer mode: endpoint will be learned from inbound packets");
         }
 
         Ok(gut_config)
@@ -1405,5 +1431,82 @@ mod tests {
     fn test_gut_v1_protocol() {
         eprintln!("GUT v1 Protocol - TC eBPF fast path enabled");
         eprintln!("Wire format: QUIC Wrapper");
+    }
+
+    /// Open all BPF skeletons (ELF parsing, BTF validation, map definitions).
+    /// Runs without privileges. If CAP_BPF is available, also runs the kernel
+    /// verifier via `load()`.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+    fn test_bpf_verifier() {
+        use libbpf_rs::skel::{OpenSkel, SkelBuilder};
+        use std::mem::MaybeUninit;
+
+        let names = [
+            "tc_gut_egress (v4)",
+            "tc_gut_egress (v6)",
+            "xdp_gut_ingress",
+        ];
+        let mut kernel_verified = 0usize;
+
+        // --- tc_gut_egress v4 ---
+        {
+            let obj = Box::leak(Box::new(MaybeUninit::uninit()));
+            let open = super::tc_gut_egress::TcGutEgressSkelBuilder::default()
+                .open(obj)
+                .expect("tc_gut_egress (v4) open failed");
+            match open.load() {
+                Ok(_) => {
+                    eprintln!("  {} — open + verifier PASS", names[0]);
+                    kernel_verified += 1;
+                }
+                Err(e) if e.to_string().to_lowercase().contains("perm") => {
+                    eprintln!("  {} — open PASS, verifier skipped (no CAP_BPF)", names[0]);
+                }
+                Err(e) => panic!("{} verifier FAILED: {e}", names[0]),
+            }
+        }
+
+        // --- tc_gut_egress v6 ---
+        {
+            let obj = Box::leak(Box::new(MaybeUninit::uninit()));
+            let open = super::tc_gut_egress_v6::TcGutEgressSkelBuilder::default()
+                .open(obj)
+                .expect("tc_gut_egress (v6) open failed");
+            match open.load() {
+                Ok(_) => {
+                    eprintln!("  {} — open + verifier PASS", names[1]);
+                    kernel_verified += 1;
+                }
+                Err(e) if e.to_string().to_lowercase().contains("perm") => {
+                    eprintln!("  {} — open PASS, verifier skipped (no CAP_BPF)", names[1]);
+                }
+                Err(e) => panic!("{} verifier FAILED: {e}", names[1]),
+            }
+        }
+
+        // --- xdp_gut_ingress ---
+        {
+            let obj = Box::leak(Box::new(MaybeUninit::uninit()));
+            let open = super::xdp_gut_ingress::XdpGutIngressSkelBuilder::default()
+                .open(obj)
+                .expect("xdp_gut_ingress open failed");
+            match open.load() {
+                Ok(_) => {
+                    eprintln!("  {} — open + verifier PASS", names[2]);
+                    kernel_verified += 1;
+                }
+                Err(e) if e.to_string().to_lowercase().contains("perm") => {
+                    eprintln!("  {} — open PASS, verifier skipped (no CAP_BPF)", names[2]);
+                }
+                Err(e) => panic!("{} verifier FAILED: {e}", names[2]),
+            }
+        }
+
+        if kernel_verified == names.len() {
+            eprintln!("All {} BPF programs passed kernel verifier", names.len());
+        } else {
+            eprintln!("ELF/BTF validation passed. Run with sudo for full kernel verifier check.");
+        }
     }
 }

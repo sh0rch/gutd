@@ -53,6 +53,19 @@ pub struct GutConfig {
     pub tun_local_ip6: [u8; 16], // Local veth IPv6 (zero if v4 only)
     pub tun_peer_ip6: [u8; 16], // Remote veth peer IPv6 (zero if v4 only)
     pub own_http3: u8,          // Whether to respond to active DPI probes via XDP_TX
+    pub dynamic_peer: u8,       // 1 = peer_ip unknown, learn from validated inbound packets
+}
+
+/// Dynamic peer endpoint — learned by XDP ingress, read by TC egress.
+/// Must match `struct peer_endpoint` in gut_common.h.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PeerEndpoint {
+    pub ip4: u32,
+    pub ip6: [u8; 16],
+    pub port: u16,
+    pub valid: u8,
+    pub _pad: u8,
 }
 
 impl GutConfig {
@@ -97,6 +110,7 @@ impl GutConfig {
             tun_local_ip6: [0u8; 16],
             tun_peer_ip6: [0u8; 16],
             own_http3: 1,
+            dynamic_peer: 0,
         };
 
         for (i, &port) in ports.iter().enumerate().take(MAX_PORTS) {
@@ -162,7 +176,7 @@ fn compute_chacha_init(key: &[u8; 32]) -> [u32; 12] {
     init
 }
 
-const _: [(); 254] = [(); std::mem::size_of::<GutConfig>()];
+const _: [(); 255] = [(); std::mem::size_of::<GutConfig>()];
 const _: [(); 56] = [(); std::mem::size_of::<GutStats>()];
 
 impl GutStats {
