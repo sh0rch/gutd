@@ -61,10 +61,10 @@ fn quic_encap(
     };
 
     let mut wg_idx = 0u32;
-    if wg_type == 1 && orig_len >= 8 {
-        wg_idx = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-    } else if orig_len >= 12 {
+    if wg_type == 2 && orig_len >= 12 {
         wg_idx = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+    } else if orig_len >= 8 {
+        wg_idx = u32::from_le_bytes(buf[4..8].try_into().unwrap());
     }
 
     let nonce = wg_nonce32(&buf[..orig_len]);
@@ -219,10 +219,10 @@ fn quic_verify(
     xor16(&mut hdr, &ks47_b[0..16]);
 
     let wg_type = hdr[0] & 0x1F;
-    let wg_idx = if wg_type == 1 {
-        u32::from_le_bytes(hdr[4..8].try_into().unwrap())
-    } else {
+    let wg_idx = if wg_type == 2 {
         u32::from_le_bytes(hdr[8..12].try_into().unwrap())
+    } else {
+        u32::from_le_bytes(hdr[4..8].try_into().unwrap())
     };
 
     let expected_dcid = feistel32(wg_idx, feistel_rk);
