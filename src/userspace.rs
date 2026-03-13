@@ -50,14 +50,16 @@ fn quic_encap(
     }
 
     let wg_type = buf[0] & 0x1F;
-    let quic_hdr_len = if is_server {
+    let quic_hdr_len = if wg_type == 3 {
+        // Cookie Reply → QUIC Retry long header (must never be dropped)
+        GUT_QUIC_LONG_HEADER_SIZE
+    } else if is_server {
         GUT_QUIC_SHORT_HEADER_SIZE
+    } else if wg_type == 1 {
+        // Client handshake init → QUIC Initial long header
+        GUT_QUIC_LONG_HEADER_SIZE
     } else {
-        if wg_type == 1 {
-            GUT_QUIC_LONG_HEADER_SIZE
-        } else {
-            GUT_QUIC_SHORT_HEADER_SIZE
-        }
+        GUT_QUIC_SHORT_HEADER_SIZE
     };
 
     let mut wg_idx = 0u32;
@@ -117,7 +119,8 @@ fn quic_encap(
         buf[5..9].copy_from_slice(&ppn.to_le_bytes());
         buf[9..13].copy_from_slice(&enc_ports.to_le_bytes());
     } else {
-        buf[0] = 0xC0; // Initial
+        // 0xC0 = QUIC Initial (client Type 1), 0xF0 = QUIC Retry (Cookie Reply Type 3)
+        buf[0] = if wg_type == 3 { 0xF0 } else { 0xC0 };
         buf[1] = 0x6b;
         buf[2] = 0x33;
         buf[3] = 0x43;
@@ -454,6 +457,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                     if wg_type == 1 {
                                         // Server-initiated rekey: no receiver_index to route.
                                         // Drop — client will re-initiate.
+                                        eprintln!("[gutd] dropping server-initiated Type 1 rekey (dynamic mode)");
                                         None
                                     } else if wg_type == 2 && size >= 12 {
                                         // Type 2: sender=S_idx[4..8], receiver=C_idx[8..12]
@@ -462,6 +466,12 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                         let c_idx =
                                             u32::from_le_bytes(buf[8..12].try_into().unwrap());
                                         session_map.insert(s_idx, c_idx);
+                                        client_map.get(&c_idx).copied()
+                                    } else if wg_type == 3 && size >= 8 {
+                                        // Type 3 (Cookie Reply): receiver=C_idx[4..8]
+                                        // Critical for handshake completion under rate-limiting
+                                        let c_idx =
+                                            u32::from_le_bytes(buf[4..8].try_into().unwrap());
                                         client_map.get(&c_idx).copied()
                                     } else if wg_type == 4 && size >= 8 {
                                         // Type 4: receiver=C_idx[4..8]
@@ -489,6 +499,14 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                     if let Some(ext_sock) = ext_sockets.get(&tok) {
                                         let _ = ext_sock.send_to(&buf[..new_size], dest);
                                     }
+                                }
+                            } else if dynamic_peer && size >= 1 {
+                                let wg_type = buf[0] & 0x1F;
+                                if wg_type != 1 {
+                                    eprintln!(
+                                        "[gutd] egress: no route for WG type {} (size={}, client_map={})",
+                                        wg_type, size, client_map.len()
+                                    );
                                 }
                             }
                         }
@@ -554,11 +572,9 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 // Learn WG's current address so we always reply to the right port,
                                 // including after reconnects where WG may use a different source port.
                                 if !is_server {
-                                    // Only update on Type 1 (new handshake) to avoid stale overwrite
+                                    // Update on Type 1 (new handshake) always; otherwise only if unknown
                                     let wg_type = if size >= 1 { buf[0] & 0x1F } else { 0 };
-                                    if wg_type == 1 {
-                                        learned_wg_addr = Some(src);
-                                    } else if learned_wg_addr.is_none() {
+                                    if wg_type == 1 || learned_wg_addr.is_none() {
                                         learned_wg_addr = Some(src);
                                     }
                                 }
@@ -572,6 +588,11 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                         let c_idx =
                                             u32::from_le_bytes(buf[8..12].try_into().unwrap());
                                         session_map.insert(s_idx, c_idx);
+                                        client_map.get(&c_idx).copied()
+                                    } else if wg_type == 3 && size >= 8 {
+                                        // Type 3 (Cookie Reply): receiver=C_idx[4..8]
+                                        let c_idx =
+                                            u32::from_le_bytes(buf[4..8].try_into().unwrap());
                                         client_map.get(&c_idx).copied()
                                     } else if wg_type == 4 && size >= 8 {
                                         let c_idx =

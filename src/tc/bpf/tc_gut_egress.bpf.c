@@ -116,7 +116,12 @@ int gut_egress(struct __sk_buff *skb)
 
     __u8 is_server = is_quic_server(cfg);
     __u32 quic_hdr_len;
-    if (is_server)
+    if (wg_type == 3)
+    {
+        /* Cookie Reply → QUIC Retry long header (must never be dropped) */
+        quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
+    }
+    else if (is_server)
     {
         quic_hdr_len = GUT_QUIC_SHORT_HEADER_SIZE;
     }
@@ -280,7 +285,8 @@ int gut_egress(struct __sk_buff *skb)
     {
         if ((__u8 *)quic + GUT_QUIC_LONG_HEADER_SIZE > (__u8 *)data_end)
             return TC_ACT_OK;
-        quic[0] = 0xC0; // Initial
+        /* 0xC0 = QUIC Initial (client Type 1), 0xF0 = QUIC Retry (Cookie Reply Type 3) */
+        quic[0] = (wg_type == 3) ? 0xF0 : 0xC0;
 
         __u32 time_noise = feistel32((__u32)bpf_ktime_get_ns(), cfg->feistel_rk);
         __u8 *noise_b = (__u8 *)&time_noise;

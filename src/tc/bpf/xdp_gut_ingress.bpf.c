@@ -108,10 +108,15 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     {
         quic_hdr_len = GUT_QUIC_SHORT_HEADER_SIZE;
     }
+    else if (wg[0] == 0xF0)
+    {
+        /* QUIC Retry = Cookie Reply (WG Type 3) — accept on both sides */
+        quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
+    }
     else if (wg[0] >= 0xC0)
     {
         if (!is_quic_server(cfg))
-            return -1; // Client does not accept Long Headers
+            return -1; // Client does not accept Initial Long Headers
         quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
     }
     else
