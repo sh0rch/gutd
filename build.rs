@@ -5,7 +5,7 @@ fn main() {
     let version = std::env::var("GUT_VERSION")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| get_git_version())
+        .or_else(get_git_version)
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
 
     println!("cargo:rustc-env=GUT_VERSION={version}");
