@@ -29,3 +29,8 @@ dockerfile.build-args = { BASE_IMAGE = "ghcr.io/cross-rs/mipsel-unknown-linux-mu
 dockerfile.file    = "docker/Dockerfile.cross"
 dockerfile.context = "."
 dockerfile.build-args = { BASE_IMAGE = "ghcr.io/cross-rs/mips-unknown-linux-musl:edge", SYSROOT_PLATFORM = "linux/amd64", IS_MIPS = "true" }
+
+[build.env]
+passthrough = [
+    "GUT_VERSION"
+]
