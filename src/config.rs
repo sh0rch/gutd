@@ -61,6 +61,7 @@ pub struct PeerConfig {
     pub keepalive_drop_percent: u8,
     pub outer_mtu: u16,
     pub own_http3: bool,
+    pub wg_host: String,
 }
 
 /// Global runtime settings (from config file [global] section or CLI).
@@ -257,6 +258,8 @@ pub fn load_config_from_env() -> Result<Config> {
             keepalive_drop_percent,
             outer_mtu,
             own_http3,
+            wg_host: std::env::var("GUTD_WG_HOST")
+                .unwrap_or_else(|_| "127.0.0.1:51820".to_string()),
         }],
     })
 }
@@ -278,6 +281,7 @@ struct PeerBuilder {
     passphrase: Option<String>,
     keepalive_drop_percent: u8,
     own_http3: bool,
+    wg_host: Option<String>,
 }
 
 impl Default for PeerBuilder {
@@ -297,6 +301,7 @@ impl Default for PeerBuilder {
             passphrase: None,
             keepalive_drop_percent: 30,
             own_http3: true,
+            wg_host: None,
         }
     }
 }
@@ -375,6 +380,9 @@ impl PeerBuilder {
             keepalive_drop_percent: self.keepalive_drop_percent,
             outer_mtu,
             own_http3: self.own_http3,
+            wg_host: self
+                .wg_host
+                .unwrap_or_else(|| "127.0.0.1:51820".to_string()),
         })
     }
 }
@@ -498,6 +506,13 @@ fn parse_config(content: &str) -> Result<Config> {
                                 return Err("keepalive_drop_percent must be in range 0..100".into());
                             }
                             b.keepalive_drop_percent = parsed;
+                        }
+                        "wg_host" | "wg_port" => {
+                            if key_name == "wg_port" {
+                                b.wg_host = Some(format!("127.0.0.1:{}", value));
+                            } else {
+                                b.wg_host = Some(value.to_string());
+                            }
                         }
                         "own_http3" => {
                             b.own_http3 = value == "true" || value == "1";

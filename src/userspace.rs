@@ -328,7 +328,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         is_server
     );
 
-    let wg_host_str = env::var("GUTD_WG_HOST").unwrap_or_else(|_| "127.0.0.1:51820".to_string());
+    let wg_host_str = env::var("GUTD_WG_HOST").unwrap_or_else(|_| peer.wg_host.clone());
     let wg_addr: SocketAddr = wg_host_str.parse()?;
     let wg_port: u16 = wg_addr.port();
 
@@ -366,7 +366,13 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
 
     for &port in &peer.ports {
         let ext_addr = SocketAddr::new(peer.bind_ip, port);
-        let std_sock = std::net::UdpSocket::bind(ext_addr).unwrap();
+        let std_sock = match std::net::UdpSocket::bind(ext_addr) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Warning: Failed to bind to {}: {}", ext_addr, e);
+                continue;
+            }
+        };
         let _ = std_sock.set_nonblocking(true);
         #[cfg(target_family = "unix")]
         let _ = std::os::unix::io::AsRawFd::as_raw_fd(&std_sock);
