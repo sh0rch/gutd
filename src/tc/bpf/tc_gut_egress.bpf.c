@@ -332,6 +332,14 @@ int gut_egress(struct __sk_buff *skb)
      *   0x40 | raw     = has ballast; actual len = (raw & 0x3F) + 1 → [1..64] */
     quic[quic_hdr_len - 1] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
 
+    /* Noise mode: XOR first 6 bytes with bytes [6..12] to hide QUIC signatures */
+    if (cfg->obfs_noise)
+    {
+#pragma unroll
+        for (int i = 0; i < 6; i++)
+            quic[i] ^= quic[6 + i];
+    }
+
     if (ipver == 4)
     {
         iph = (void *)((__u8 *)data + 14);

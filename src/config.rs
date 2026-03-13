@@ -45,6 +45,15 @@ pub enum XdpDefaultPolicy {
     Drop,
 }
 
+/// Obfuscation mode: how GUT packets appear on the wire.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ObfsMode {
+    /// Packets look like QUIC (default).
+    Quic,
+    /// QUIC signatures masked — packets look like random UDP.
+    Noise,
+}
+
 #[derive(Clone)]
 pub struct PeerConfig {
     pub name: String,
@@ -62,6 +71,7 @@ pub struct PeerConfig {
     pub outer_mtu: u16,
     pub own_http3: bool,
     pub wg_host: String,
+    pub obfs: ObfsMode,
 }
 
 /// Global runtime settings (from config file [global] section or CLI).
@@ -227,6 +237,16 @@ pub fn load_config_from_env() -> Result<Config> {
     let own_http3 = std::env::var("GUTD_OWN_HTTP3")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(true);
+    let obfs = match std::env::var("GUTD_OBFS")
+        .unwrap_or_else(|_| "quic".to_string())
+        .as_str()
+    {
+        "quic" => ObfsMode::Quic,
+        "noise" => ObfsMode::Noise,
+        other => {
+            return Err(format!("GUTD_OBFS: unknown value '{other}', expected quic|noise").into())
+        }
+    };
     let stats_interval: u32 = std::env::var("GUTD_STATS_INTERVAL")
         .unwrap_or_else(|_| "5".to_string())
         .parse()
@@ -260,6 +280,7 @@ pub fn load_config_from_env() -> Result<Config> {
             own_http3,
             wg_host: std::env::var("GUTD_WG_HOST")
                 .unwrap_or_else(|_| "127.0.0.1:51820".to_string()),
+            obfs,
         }],
     })
 }
@@ -282,6 +303,7 @@ struct PeerBuilder {
     keepalive_drop_percent: u8,
     own_http3: bool,
     wg_host: Option<String>,
+    obfs: ObfsMode,
 }
 
 impl Default for PeerBuilder {
@@ -302,6 +324,7 @@ impl Default for PeerBuilder {
             keepalive_drop_percent: 30,
             own_http3: true,
             wg_host: None,
+            obfs: ObfsMode::Quic,
         }
     }
 }
@@ -383,6 +406,7 @@ impl PeerBuilder {
             wg_host: self
                 .wg_host
                 .unwrap_or_else(|| "127.0.0.1:51820".to_string()),
+            obfs: self.obfs,
         })
     }
 }
@@ -519,6 +543,18 @@ fn parse_config(content: &str) -> Result<Config> {
                         }
                         "responder" => {
                             b.responder = Some(value == "true" || value == "1");
+                        }
+                        "obfs" => {
+                            b.obfs = match value {
+                                "quic" => ObfsMode::Quic,
+                                "noise" => ObfsMode::Noise,
+                                _ => {
+                                    return Err(format!(
+                                        "Invalid obfs value: {value} (expected quic|noise)"
+                                    )
+                                    .into())
+                                }
+                            };
                         }
                         _ => {}
                     }

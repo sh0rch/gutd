@@ -101,6 +101,7 @@ struct gut_config
     __u8 tun_peer_ip6[16];       /* Remote veth peer IPv6 (zero if v4 only) */
     __u8 own_http3;              /* Respond to DPI probes via XDP_TX (1=yes) */
     __u8 dynamic_peer;           /* 1 = peer_ip unknown, learn from validated inbound packets */
+    __u8 obfs_noise;             /* 1 = noise mode: XOR quic[0..6] with quic[6..12] to hide QUIC signatures */
 } __attribute__((packed));
 
 /* Dynamic peer endpoint — learned from validated inbound packets.
