@@ -519,9 +519,10 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                         let _ = local_socket.send_to(&buf[..new_size], wg_addr);
                                     } else {
                                         if let Some(addr) = last_wg_client_addr {
-                                            let _ = local_socket.send_to(&buf[..new_size], addr);
+                                            // Send back using ext_socket so WireGuard sees the correct source port
+                                            let _ = ext_socket.send_to(&buf[..new_size], addr);
                                         } else {
-                                            let _ = local_socket.send_to(&buf[..new_size], wg_addr);
+                                            let _ = ext_socket.send_to(&buf[..new_size], wg_addr);
                                         }
                                     }
                                 }
