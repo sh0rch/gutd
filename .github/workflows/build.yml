@@ -115,15 +115,17 @@ jobs:
 
     - uses: dtolnay/rust-toolchain@stable
       with:
-        targets: x86_64-pc-windows-gnu
+        targets: x86_64-pc-windows-msvc
 
     - name: Build
-      run: cargo build --release --target x86_64-pc-windows-gnu --no-default-features
+      env:
+        RUSTFLAGS: "-C target-feature=+crt-static"
+      run: cargo build --release --target x86_64-pc-windows-msvc --no-default-features --config profile.release.lto="fat"
 
     - name: Smoke test
       shell: pwsh
       run: |
-        $gutd = "target\x86_64-pc-windows-gnu\release\gutd.exe"
+        $gutd = "target\x86_64-pc-windows-msvc\release\gutd.exe"
         & $gutd --version
         if ($LASTEXITCODE -ne 0) { Write-Error "gutd --version failed"; exit 1 }
         $key = & $gutd genkey
@@ -133,12 +135,12 @@ jobs:
     - name: Rename binary
       shell: pwsh
       run: |
-        Copy-Item "target\x86_64-pc-windows-gnu\release\gutd.exe" "target\x86_64-pc-windows-gnu\release\gutd-windows-x86_64.exe"
+        Copy-Item "target\x86_64-pc-windows-msvc\release\gutd.exe" "target\x86_64-pc-windows-msvc\release\gutd-windows-x86_64.exe"
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: gutd-windows-x86_64
-        path: target/x86_64-pc-windows-gnu/release/gutd-windows-x86_64.exe
+        path: target/x86_64-pc-windows-msvc/release/gutd-windows-x86_64.exe
         retention-days: 1
 
