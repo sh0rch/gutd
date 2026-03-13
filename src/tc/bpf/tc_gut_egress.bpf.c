@@ -338,7 +338,6 @@ int gut_egress(struct __sk_buff *skb)
         udph->dest = bpf_htons(tunnel_port);
 
         iph->check = 0;
-        __builtin_memcpy(&iph->saddr, &cfg->bind_ip, 4);
 
         /* Dynamic peer: read destination from client_map keyed by c_idx.
          * For Type 2, c_idx = wg_idx = bytes[8..12] = receiver_index.
@@ -348,11 +347,25 @@ int gut_egress(struct __sk_buff *skb)
             struct peer_endpoint *ep = bpf_map_lookup_elem(&client_map, &c_idx);
             if (!ep || !ep->valid)
                 return TC_ACT_OK; /* no endpoint learned yet — drop silently */
+
+            if (ep->server_ip4 != 0)
+            {
+                __builtin_memcpy(&iph->saddr, &ep->server_ip4, 4);
+            }
+            else
+            {
+                __builtin_memcpy(&iph->saddr, &cfg->bind_ip, 4);
+            }
             __builtin_memcpy(&iph->daddr, &ep->ip4, 4);
             udph->dest = bpf_htons(ep->port);
+            if (ep->server_port != 0)
+            {
+                udph->source = bpf_htons(ep->server_port);
+            }
         }
         else
         {
+            __builtin_memcpy(&iph->saddr, &cfg->bind_ip, 4);
             __builtin_memcpy(&iph->daddr, &cfg->peer_ip, 4);
         }
 
@@ -362,6 +375,63 @@ int gut_egress(struct __sk_buff *skb)
         udph->check = 0;
         __u32 csum = 0;
         csum = bpf_csum_diff(0, 0, &iph->saddr, 8, csum); // saddr and daddr are contiguous
+        __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
+        csum = bpf_csum_diff(0, 0, &ph, 4, csum);
+
+        void *udp_start = (void *)udph;
+        __u32 payload_len = bpf_ntohs(udph->len); // length of UDP header + payload
+        csum = calc_payload_csum(udp_start, data_end, payload_len, csum);
+
+        __u16 final_csum = csum_fold(csum);
+        udph->check = final_csum ? final_csum : 0xFFFF; // apply pseudo header and payload csum
+    }
+    else if (ipver == 6)
+    {
+        struct ipv6hdr *ip6h = (void *)((__u8 *)data + 14);
+        udph = (void *)((__u8 *)data + 14 + 40);
+
+        __u32 new_udp_len = wg_len + quic_hdr_len + pad_len + sizeof(struct udphdr);
+
+        ip6h->payload_len = bpf_htons(new_udp_len);
+        udph->len = bpf_htons(new_udp_len);
+
+        udph->source = bpf_htons(tunnel_port);
+        udph->dest = bpf_htons(tunnel_port);
+
+        if (cfg->dynamic_peer)
+        {
+            struct peer_endpoint *ep = bpf_map_lookup_elem(&client_map, &c_idx);
+            if (!ep || !ep->valid)
+                return TC_ACT_OK; /* no endpoint learned yet — drop silently */
+
+            // Check if server_ip6 is not all zeros
+            __u64 s6_1 = ((__u64 *)ep->server_ip6)[0];
+            __u64 s6_2 = ((__u64 *)ep->server_ip6)[1];
+            if (s6_1 != 0 || s6_2 != 0)
+            {
+                __builtin_memcpy(&ip6h->saddr, ep->server_ip6, 16);
+            }
+            else
+            {
+                __builtin_memcpy(&ip6h->saddr, cfg->bind_ip6, 16);
+            }
+
+            __builtin_memcpy(&ip6h->daddr, ep->ip6, 16);
+            udph->dest = bpf_htons(ep->port);
+            if (ep->server_port != 0)
+            {
+                udph->source = bpf_htons(ep->server_port);
+            }
+        }
+        else
+        {
+            __builtin_memcpy(&ip6h->saddr, cfg->bind_ip6, 16);
+            __builtin_memcpy(&ip6h->daddr, cfg->peer_ip6, 16);
+        }
+
+        udph->check = 0;
+        __u32 csum = 0;
+        csum = bpf_csum_diff(0, 0, (__be32 *)&ip6h->saddr, 32, csum); // saddr and daddr are contiguous
         __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
         csum = bpf_csum_diff(0, 0, &ph, 4, csum);
 
