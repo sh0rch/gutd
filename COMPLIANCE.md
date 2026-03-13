@@ -1,4 +1,4 @@
-# GUT v1 Compliance Checklist (Current Repository)
+# GUT Compliance Checklist (Current Repository)
 
 This checklist tracks what the current code actually implements.
 
@@ -70,4 +70,4 @@ sudo tcpdump -ni <iface> -vv -n 'udp port <gut_port>'
 
 ## 7. Known Compatibility Note
 
-This payload-only WG layout is not interoperable with old nonce/pkt_id/cookie wire peers.
+The current QUIC-encapsulated wire format is not interoperable with legacy nonce/pkt_id/cookie peers.
