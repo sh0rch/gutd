@@ -60,6 +60,7 @@ All per-packet processing runs entirely in the kernel BPF programs.
 gutd provides **traffic obfuscation, not encryption**.
 
 - Masking with ChaCha prevents passive DPI signature matching
+- Optional `obfs=noise` mode hides QUIC signatures, making packets appear as random UDP
 - An active attacker who knows the key can unmask traffic
 - WireGuard itself provides the cryptographic security layer
 - gutd is designed to be run *underneath* WireGuard, not instead of it

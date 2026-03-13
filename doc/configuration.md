@@ -32,9 +32,19 @@ peer_ip = 203.0.113.10      # remote peer IP (or "dynamic" — see below)
 ports = 41000,41001         # UDP ports (must match WG listen/endpoint ports)
 # keepalive_drop_percent = 30
 # own_http3 = true           # eBPF XDP responder for active DPI probes
+# obfs = quic                # obfuscation mode: quic (default) or noise (random UDP)
 key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 # passphrase = my-secret     # alternative to key (HKDF-SHA256 derived)
 ```
+
+### Obfuscation mode
+
+The `obfs` key controls how gutd-encapsulated packets look on the wire:
+
+- **`quic`** (default) — packets carry a recognizable QUIC Long Header with a fake SNI. Effective against WireGuard-specific DPI, but packets are identifiable as QUIC.
+- **`noise`** — additionally masks the first bytes of the QUIC header so that packets appear as random UDP traffic. Useful when QUIC itself is blocked or throttled.
+
+Both sides of the tunnel must use the same `obfs` mode.
 
 ### Responder role
 
@@ -67,6 +77,7 @@ When `GUTD_PEER_IP` is set and no config file is passed via CLI, gutd reads all 
 | `GUTD_DEFAULT_POLICY` | no | `allow` | `default_policy` |
 | `GUTD_KEEPALIVE_DROP_PCT` | no | `30` | `keepalive_drop_percent` |
 | `GUTD_OWN_HTTP3` | no | `true` | `own_http3` |
+| `GUTD_OBFS` | no | `quic` | `obfs` (`quic` or `noise`) |
 | `GUTD_USERSPACE_ONLY` | no | `false` | `userspace_only` |
 | `GUTD_STATS_INTERVAL` | no | `5` | `stats_interval` |
 | `GUTD_STAT_FILE` | no | `/run/gutd.stat` | `stat_file` |

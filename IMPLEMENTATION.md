@@ -47,6 +47,7 @@ Primary peer parameters (only `peer_ip`, `ports`, `key`/`passphrase` are require
 
 - `peer_ip` (or `dynamic`), `ports`, `key`/`passphrase`
 - Optional: `bind_ip` (default `0.0.0.0`), `responder` (auto-inferred), `keepalive_drop_percent`
+- Optional: `obfs` (`quic` default, `noise` for random-UDP appearance). Env: `GUTD_OBFS`
 
 Related files:
 
