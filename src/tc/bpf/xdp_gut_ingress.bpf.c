@@ -141,7 +141,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     __u8 wg_type = wg[0] & 0x1F;
 
     __u32 wg_idx = 0;
-    if (wg_type == 1)
+    if (wg_type == 1 || wg_type >= 3)
     {
         __builtin_memcpy(&wg_idx, wg + 4, 4);
     }
@@ -190,7 +190,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     if (cfg->dynamic_peer)
     {
         __u32 client_idx = 0;
-        if (wg_type == 1)
+        if (wg_type == 1 || wg_type >= 3)
         {
             /* Type 1: sender_index at wg[4..8] = C_idx directly */
             client_idx = wg_idx; /* already read from wg+4 for type 1 */
@@ -243,11 +243,11 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     int ports_ok;
     if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
     {
-        ports_ok = (bpf_xdp_load_bytes(ctx, wg_off + 9, &enc_ports, 4) == 0);
+        ports_ok = 1; __builtin_memcpy(&enc_ports, quic + 9, 4);
     }
     else
     {
-        ports_ok = (bpf_xdp_load_bytes(ctx, wg_off + 30, &enc_ports, 4) == 0);
+        ports_ok = 1; __builtin_memcpy(&enc_ports, quic + 30, 4);
     }
     __u32 plain_ports = feistel32_inv(enc_ports, cfg->feistel_rk) ^ FEISTEL_SALT_PORTS;
     __be16 inner_sport_ne = ports_ok ? bpf_htons((__u16)(plain_ports >> 16)) : 0;
