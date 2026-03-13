@@ -351,11 +351,26 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let mut client_map: HashMap<u32, SocketAddr> = HashMap::new();
     let mut session_map: HashMap<u32, u32> = HashMap::new();
 
-    println!("Forwarding INGRESS to local WireGuard at {}", wg_addr);
-    if let Some(ref addr) = remote_peer_addr {
-        println!("Forwarding EGRESS to remote Peer at {}", addr);
+    if is_server {
+        // Server: wg_addr is where we PUSH decapsulated packets (WG daemon listens there)
+        println!(
+            "Local WireGuard daemon at {} (server will push decapped packets there)",
+            wg_addr
+        );
     } else {
-        println!("Forwarding EGRESS to dynamic peer (will learn from inbound packets)");
+        // Client: wg_addr.port() = server's WG ListenPort, embedded in QUIC enc_ports.
+        // XDP on the server restores this as udp->dest, delivering to the right WG port.
+        // The client's own WG address is learned automatically from incoming packets.
+        // Configure: wg_host = <any>:<SERVER_WG_LISTENPORT>  (e.g. 127.0.0.1:51820)
+        println!(
+            "Server WireGuard listen port: {} (encoded in QUIC headers so XDP delivers to correct port)",
+            wg_addr.port()
+        );
+    }
+    if let Some(ref addr) = remote_peer_addr {
+        println!("Remote peer: {}", addr);
+    } else {
+        println!("Remote peer: dynamic (learned from inbound QUIC packets)");
     }
 
     let mut poll = Poll::new()?;
@@ -412,8 +427,10 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     poll.registry()
         .register(&mut local_socket, local_token, Interest::READABLE)?;
 
-    // We remember the WG client ephemeral ports
-    let mut last_wg_client_addr: Option<SocketAddr> = None;
+    // Client mode: WG tells us its address on the first packet it sends to ext_socket.
+    // Updated on every new handshake (Type 1) → reconnects always work.
+    // Server mode: wg_addr from config is authoritative (MikroTik, Linux WG daemon etc.)
+    let mut learned_wg_addr: Option<SocketAddr> = None;
 
     loop {
         let _ = poll.poll(&mut events, None);
@@ -425,7 +442,6 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                 loop {
                     match local_socket.recv_from(&mut buf) {
                         Ok((size, src)) => {
-                            last_wg_client_addr = Some(src);
                             // It's EGRESS traffic from local WG
                             // Multi-client routing: determine destination by WG index
                             let egress_dest = if !dynamic_peer {
@@ -516,19 +532,36 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                         }
                                     }
                                     if is_server {
+                                        // Server: forward decapped packet to local WireGuard daemon
                                         let _ = local_socket.send_to(&buf[..new_size], wg_addr);
                                     } else {
-                                        if let Some(addr) = last_wg_client_addr {
-                                            let _ = local_socket.send_to(&buf[..new_size], addr);
-                                        } else {
-                                            let _ = local_socket.send_to(&buf[..new_size], wg_addr);
-                                        }
+                                        // Client: send back from ext_socket to WG's actual address.
+                                        // Use learned address (updated on every new handshake) so
+                                        // reconnects work even if WG changes its source port.
+                                        // Sending from ext_socket prevents WG endpoint roaming.
+                                        let dest = learned_wg_addr.unwrap_or(wg_addr);
+                                        let _ = ext_socket.send_to(&buf[..new_size], dest);
                                     }
                                 }
                             } else {
-                                // It could be WG traffic sent explicitly to the external socket!
-                                // (If WG was configured to point to 127.0.0.1:41000 instead of ephemeral local_socket)
-                                last_wg_client_addr = Some(src);
+                                // Prevent treating server's unreachable/error packets as WG egress
+                                if let Some(peer_addr) = remote_peer_addr {
+                                    if src.ip() == peer_addr.ip() && !is_server {
+                                        continue;
+                                    }
+                                }
+                                // Non-QUIC on ext_socket = WG traffic (Endpoint = 127.0.0.1:ext_port).
+                                // Learn WG's current address so we always reply to the right port,
+                                // including after reconnects where WG may use a different source port.
+                                if !is_server {
+                                    // Only update on Type 1 (new handshake) to avoid stale overwrite
+                                    let wg_type = if size >= 1 { buf[0] & 0x1F } else { 0 };
+                                    if wg_type == 1 {
+                                        learned_wg_addr = Some(src);
+                                    } else if learned_wg_addr.is_none() {
+                                        learned_wg_addr = Some(src);
+                                    }
+                                }
                                 let egress_dest = if !dynamic_peer {
                                     remote_peer_addr
                                 } else if size >= 12 {
