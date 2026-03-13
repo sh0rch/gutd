@@ -34,6 +34,13 @@ fn xor16(p: &mut [u8], k: &[u8]) {
     }
 }
 
+/// Noise mode: XOR first 6 bytes with bytes [6..12] to hide QUIC signatures.
+fn noise_mask(buf: &mut [u8]) {
+    for i in 0..6 {
+        buf[i] ^= buf[6 + i];
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn quic_encap(
     buf: &mut [u8],
@@ -44,6 +51,7 @@ fn quic_encap(
     is_server: bool,
     wg_sport: u16,
     wg_dport: u16,
+    noise: bool,
 ) -> Option<usize> {
     if orig_len < 16 {
         return None;
@@ -165,21 +173,58 @@ fn quic_encap(
         };
     }
 
+    // Noise mode: XOR first 6 bytes with bytes [6..12] to hide QUIC signatures
+    if noise {
+        noise_mask(buf);
+    }
+
     Some(quic_hdr_len + orig_len + pad_len)
 }
 /// Verify DCID and PPN in QUIC header match the crypto-derived values.
 /// Returns `true` if the packet is authentic GUT traffic.
+/// In noise mode, unmasking is applied to the first 6 bytes in-place on success;
+/// on failure, the original bytes are restored.
 fn quic_verify(
+    buf: &mut [u8],
+    orig_len: usize,
+    key: &[u32; 12],
+    feistel_rk: &[u32; 4],
+    rounds: u8,
+    noise: bool,
+) -> bool {
+    if orig_len < GUT_QUIC_SHORT_HEADER_SIZE + 16 {
+        return false;
+    }
+
+    // Noise mode: save first 6 bytes, unmask, restore on failure
+    let saved = if noise {
+        let mut s = [0u8; 6];
+        s.copy_from_slice(&buf[..6]);
+        noise_mask(buf);
+        Some(s)
+    } else {
+        None
+    };
+
+    let verify_result = quic_verify_inner(buf, orig_len, key, feistel_rk, rounds);
+
+    // On failure in noise mode, restore original bytes
+    if !verify_result {
+        if let Some(s) = saved {
+            buf[..6].copy_from_slice(&s);
+        }
+    }
+
+    verify_result
+}
+
+fn quic_verify_inner(
     buf: &[u8],
     orig_len: usize,
     key: &[u32; 12],
     feistel_rk: &[u32; 4],
     rounds: u8,
 ) -> bool {
-    if orig_len < GUT_QUIC_SHORT_HEADER_SIZE + 16 {
-        return false;
-    }
-
     let first_byte = buf[0];
     let quic_hdr_len = if (first_byte & 0xC0) == 0xC0 {
         GUT_QUIC_LONG_HEADER_SIZE
@@ -325,10 +370,16 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let feistel_rk = compute_feistel_rk(&key, rounds);
 
     let is_server = peer.responder;
+    let noise = match std::env::var("GUTD_OBFS").as_deref() {
+        Ok("noise") => true,
+        Ok(_) => peer.obfs == crate::config::ObfsMode::Noise,
+        Err(_) => peer.obfs == crate::config::ObfsMode::Noise,
+    };
 
     println!(
-        "Starting gutd-userspace proxy (MIO event loop). is_server={}",
-        is_server
+        "Starting gutd-userspace proxy (MIO event loop). is_server={} obfs={}",
+        is_server,
+        if noise { "noise" } else { "quic" }
     );
 
     let wg_host_str = env::var("GUTD_WG_HOST").unwrap_or_else(|_| peer.wg_host.clone());
@@ -493,6 +544,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                     is_server,
                                     src.port(),
                                     wg_port,
+                                    noise,
                                 ) {
                                     let tok = ext_tokens[ext_rr_idx % ext_tokens.len()];
                                     ext_rr_idx = ext_rr_idx.wrapping_add(1);
@@ -519,13 +571,34 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                 loop {
                     match ext_socket.recv_from(&mut buf) {
                         Ok((size, src)) => {
-                            let first_byte = buf[0];
-                            if (first_byte & 0xC0) == 0xC0 || (first_byte & 0x40) == 0x40 {
-                                // INGRESS traffic (QUIC) from Remote Peer
-                                // Verify DCID/PPN before processing — reject unauthentic packets
-                                if !quic_verify(&buf, size, &key_init, &feistel_rk, rounds) {
-                                    continue;
-                                }
+                            // Determine if this is inbound GUT traffic or local WG egress.
+                            // In quic mode: check QUIC first-byte pattern.
+                            // In noise mode: first byte is masked, so try quic_verify
+                            //   (which unmaskes in-place) — success = GUT ingress.
+                            let is_gut_ingress = if noise {
+                                size >= GUT_QUIC_SHORT_HEADER_SIZE + 16
+                                    && quic_verify(
+                                        &mut buf,
+                                        size,
+                                        &key_init,
+                                        &feistel_rk,
+                                        rounds,
+                                        true,
+                                    )
+                            } else {
+                                let first_byte = buf[0];
+                                ((first_byte & 0xC0) == 0xC0 || (first_byte & 0x40) == 0x40)
+                                    && quic_verify(
+                                        &mut buf,
+                                        size,
+                                        &key_init,
+                                        &feistel_rk,
+                                        rounds,
+                                        false,
+                                    )
+                            };
+                            if is_gut_ingress {
+                                // INGRESS traffic (GUT) from Remote Peer — already verified
                                 // Dynamic peer: learn endpoint from validated packet (multi-client)
                                 // We decap first, then parse WG type/index from the inner payload.
                                 if let Some((new_size, _wg_sport, _wg_dport)) =
@@ -614,6 +687,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                         is_server,
                                         src.port(),
                                         wg_port,
+                                        noise,
                                     ) {
                                         let _ = ext_socket.send_to(&buf[..new_size], dest);
                                     }

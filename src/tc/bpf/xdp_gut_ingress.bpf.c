@@ -103,6 +103,16 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     if (wg_len < WG_MIN_PACKET || wg + WG_MIN_PACKET > (__u8 *)data_end || wg + wg_len > (__u8 *)data_end)
         return -1;
 
+    /* Noise mode: unmask first 6 bytes in-place (XOR with bytes [6..12]) */
+    if (cfg->obfs_noise)
+    {
+        if (wg + 12 > (__u8 *)data_end)
+            return -1;
+#pragma unroll
+        for (int i = 0; i < 6; i++)
+            wg[i] ^= wg[6 + i];
+    }
+
     __u32 quic_hdr_len = 0;
     if (wg[0] == 0x40)
     {

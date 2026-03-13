@@ -1285,6 +1285,12 @@ impl TcBpfManager {
             eprintln!("  Dynamic peer mode: endpoint will be learned from inbound packets");
         }
 
+        // Obfuscation mode
+        if config.peer().obfs == crate::config::ObfsMode::Noise {
+            gut_config.obfs_noise = 1;
+            eprintln!("  Obfuscation mode: noise (QUIC signatures masked)");
+        }
+
         Ok(gut_config)
     }
 
