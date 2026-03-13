@@ -156,7 +156,10 @@ int gut_egress(struct __sk_buff *skb)
 
     // Extract index before masking for stable connection IDs
     __u32 wg_idx = 0;
-    if (wg_type == 2) __builtin_memcpy(&wg_idx, wg_head + 8, 4); else __builtin_memcpy(&wg_idx, wg_head + 4, 4);
+    if (wg_type == 2)
+        __builtin_memcpy(&wg_idx, wg_head + 8, 4);
+    else
+        __builtin_memcpy(&wg_idx, wg_head + 4, 4);
 
     /* ── Multi-client dynamic peer: session bridging & routing ─────
      * TC egress sees raw (unmasked) WG on the veth.
@@ -346,7 +349,10 @@ int gut_egress(struct __sk_buff *skb)
         {
             struct peer_endpoint *ep = bpf_map_lookup_elem(&client_map, &c_idx);
             if (!ep || !ep->valid)
+            {
+                bpf_debug("TC: drop wg_type=%u c_idx=%u: no entry in client_map", wg_type, c_idx);
                 return TC_ACT_OK; /* no endpoint learned yet — drop silently */
+            }
 
             if (ep->server_ip4 != 0)
             {
@@ -402,7 +408,10 @@ int gut_egress(struct __sk_buff *skb)
         {
             struct peer_endpoint *ep = bpf_map_lookup_elem(&client_map, &c_idx);
             if (!ep || !ep->valid)
+            {
+                bpf_debug("TC: drop wg_type=%u c_idx=%u: no entry in client_map (IPv6)", wg_type, c_idx);
                 return TC_ACT_OK; /* no endpoint learned yet — drop silently */
+            }
 
             // Check if server_ip6 is not all zeros
             __u64 s6_1 = ((__u64 *)ep->server_ip6)[0];

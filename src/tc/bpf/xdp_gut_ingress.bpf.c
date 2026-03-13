@@ -231,6 +231,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             ep.server_port = bpf_ntohs(udph->dest);
             ep.valid = 1;
             bpf_map_update_elem(&client_map, &client_idx, &ep, BPF_ANY);
+            bpf_debug("XDP: client_map[%u] updated wg_type=%u port=%u", client_idx, wg_type, ep.port);
         }
     }
 
