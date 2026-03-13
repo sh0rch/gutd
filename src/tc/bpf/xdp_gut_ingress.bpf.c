@@ -195,9 +195,9 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             /* Type 1: sender_index at wg[4..8] = C_idx directly */
             client_idx = wg_idx; /* already read from wg+4 for type 1 */
         }
-        else if (wg_type == 4)
+        else if (wg_type == 4 || wg_type == 3)
         {
-            /* Type 4: receiver_index at wg[4..8] = S_idx on server ingress.
+            /* Type 3/4: receiver_index at wg[4..8] = S_idx on server ingress.
              * Bridge S_idx → C_idx via session_map (populated by TC egress Type 2). */
             __u32 s_idx = 0;
             __builtin_memcpy(&s_idx, wg + 4, 4);

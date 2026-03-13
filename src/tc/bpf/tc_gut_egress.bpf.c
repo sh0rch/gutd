@@ -177,9 +177,9 @@ int gut_egress(struct __sk_buff *skb)
         if (wg_type == 1)
             return TC_ACT_OK; /* drop server-initiated rekey; client will retry */
 
-        if (wg_type == 4)
+        if (wg_type == 4 || wg_type == 3)
         {
-            /* Type 4: receiver_index at bytes[4..8] = C_idx */
+            /* Type 3/4: receiver_index at bytes[4..8] = C_idx */
             __builtin_memcpy(&c_idx, wg_head + 4, 4);
         }
 

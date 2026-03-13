@@ -250,7 +250,7 @@ pub fn run_install() -> ! {
     }
 
     // Print summary
-    let version = env!("CARGO_PKG_VERSION");
+    let version = env!("GUT_VERSION");
     println!();
     println!("gutd {version} installed successfully");
     println!("─────────────────────────────────────────────");
@@ -496,7 +496,7 @@ pub fn run_install() -> ! {
     }
 
     // Print summary
-    let version = env!("CARGO_PKG_VERSION");
+    let version = env!("GUT_VERSION");
     println!();
     println!("gutd {version} installed successfully");
     println!("─────────────────────────────────────────────");

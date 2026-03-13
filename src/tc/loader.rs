@@ -187,6 +187,30 @@ impl EgressSkel {
         matches!(self, Self::V6(_))
     }
 
+    fn get_map_fd(&self, name: &str) -> Option<std::os::unix::io::BorrowedFd<'_>> {
+        use std::os::unix::io::AsFd;
+        match self {
+            Self::V4(s) => match name {
+                "client_map" => Some(s.maps.client_map.as_fd()),
+                "session_map" => Some(s.maps.session_map.as_fd()),
+                "config_map" => Some(s.maps.config_map.as_fd()),
+                "counters_map" => Some(s.maps.counters_map.as_fd()),
+                "stats_map" => Some(s.maps.stats_map.as_fd()),
+                "scratch_map" => Some(s.maps.scratch_map.as_fd()),
+                _ => None,
+            },
+            Self::V6(s) => match name {
+                "client_map" => Some(s.maps.client_map.as_fd()),
+                "session_map" => Some(s.maps.session_map.as_fd()),
+                "config_map" => Some(s.maps.config_map.as_fd()),
+                "counters_map" => Some(s.maps.counters_map.as_fd()),
+                "stats_map" => Some(s.maps.stats_map.as_fd()),
+                "scratch_map" => Some(s.maps.scratch_map.as_fd()),
+                _ => None,
+            },
+        }
+    }
+
     fn lookup_stats(
         &self,
         key: &[u8],
@@ -378,23 +402,28 @@ impl TcBpfManager {
         let skel_builder_ingress = xdp_gut_ingress::XdpGutIngressSkelBuilder::default();
         let open_ingress: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
             Box::leak(Box::new(MaybeUninit::uninit()));
-        let ingress_skel = skel_builder_ingress.open(open_ingress)?.load()?;
 
-        ingress_skel.maps.config_map.update(
-            &0u32.to_ne_bytes(),
-            unsafe {
-                std::slice::from_raw_parts(
-                    (&gut_config as *const GutConfig).cast::<u8>(),
-                    std::mem::size_of::<GutConfig>(),
-                )
-            },
-            MapFlags::ANY,
-        )?;
-        ingress_skel.maps.counters_map.update(
-            &0u32.to_ne_bytes(),
-            &1u32.to_ne_bytes(),
-            MapFlags::ANY,
-        )?;
+        let mut open_skel = skel_builder_ingress.open(open_ingress)?;
+        if let Some(fd) = egress_skel.get_map_fd("client_map") {
+            open_skel.maps.client_map.reuse_fd(fd)?;
+        }
+        if let Some(fd) = egress_skel.get_map_fd("session_map") {
+            open_skel.maps.session_map.reuse_fd(fd)?;
+        }
+        if let Some(fd) = egress_skel.get_map_fd("config_map") {
+            open_skel.maps.config_map.reuse_fd(fd)?;
+        }
+        if let Some(fd) = egress_skel.get_map_fd("counters_map") {
+            open_skel.maps.counters_map.reuse_fd(fd)?;
+        }
+        if let Some(fd) = egress_skel.get_map_fd("stats_map") {
+            open_skel.maps.stats_map.reuse_fd(fd)?;
+        }
+        if let Some(fd) = egress_skel.get_map_fd("scratch_map") {
+            open_skel.maps.scratch_map.reuse_fd(fd)?;
+        }
+
+        let ingress_skel = open_skel.load()?;
 
         // Populate devmap with veth_xdp ifindex
         let veth_xdp_ifindex = Self::get_ifindex(&veth_xdp_name)? as u32;
