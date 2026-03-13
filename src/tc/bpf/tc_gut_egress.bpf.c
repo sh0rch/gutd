@@ -156,7 +156,7 @@ int gut_egress(struct __sk_buff *skb)
 
     // Extract index before masking for stable connection IDs
     __u32 wg_idx = 0;
-    __builtin_memcpy(&wg_idx, wg_head + (wg_type == 1 ? 4 : 8), 4);
+    if (wg_type == 2) __builtin_memcpy(&wg_idx, wg_head + 8, 4); else __builtin_memcpy(&wg_idx, wg_head + 4, 4);
 
     /* ── Multi-client dynamic peer: session bridging & routing ─────
      * TC egress sees raw (unmasked) WG on the veth.
