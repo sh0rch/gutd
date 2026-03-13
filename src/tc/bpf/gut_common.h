@@ -109,11 +109,15 @@ struct gut_config
  * In multi-client mode, keyed by WG receiver_index (C_idx). */
 struct peer_endpoint
 {
-    __u32 ip4;    /* Last-seen IPv4 (network byte order), 0 if IPv6 */
-    __u8 ip6[16]; /* Last-seen IPv6 (network byte order), zero if IPv4 */
-    __u16 port;   /* Last-seen UDP source port (host byte order) */
-    __u8 valid;   /* 1 = endpoint learned, 0 = not yet */
-    __u8 _pad;    /* alignment */
+    __u32 ip4;           /* Last-seen IPv4 source (client) */
+    __u8 ip6[16];        /* Last-seen IPv6 source (client) */
+    __u16 port;          /* Last-seen UDP source port (client) */
+    __u16 _pad_port;     /* alignment */
+    __u32 server_ip4;    /* Last-seen IPv4 dest (server) */
+    __u8 server_ip6[16]; /* Last-seen IPv6 dest (server) */
+    __u16 server_port;   /* Last-seen UDP dest port (server) */
+    __u8 valid;          /* 1 = endpoint learned, 0 = not yet */
+    __u8 _pad;           /* alignment */
 };
 
 /* Per-CPU statistics */

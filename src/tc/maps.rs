@@ -64,6 +64,10 @@ pub struct PeerEndpoint {
     pub ip4: u32,
     pub ip6: [u8; 16],
     pub port: u16,
+    pub _pad_port: u16,
+    pub server_ip4: u32,
+    pub server_ip6: [u8; 16],
+    pub server_port: u16,
     pub valid: u8,
     pub _pad: u8,
 }

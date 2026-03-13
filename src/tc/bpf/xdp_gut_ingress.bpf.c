@@ -213,15 +213,22 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             {
                 struct iphdr *src_iph = (void *)((__u8 *)data + ip_off);
                 if ((void *)(src_iph + 1) <= data_end)
+                {
                     ep.ip4 = src_iph->saddr;
+                    ep.server_ip4 = src_iph->daddr;
+                }
             }
             else
             {
                 struct ipv6hdr *src_ip6h = (void *)((__u8 *)data + ip_off);
                 if ((void *)(src_ip6h + 1) <= data_end)
+                {
                     __builtin_memcpy(ep.ip6, &src_ip6h->saddr, 16);
+                    __builtin_memcpy(ep.server_ip6, &src_ip6h->daddr, 16);
+                }
             }
             ep.port = bpf_ntohs(udph->source);
+            ep.server_port = bpf_ntohs(udph->dest);
             ep.valid = 1;
             bpf_map_update_elem(&client_map, &client_idx, &ep, BPF_ANY);
         }
