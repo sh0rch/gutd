@@ -1,4 +1,4 @@
-# gutd v2 — WireGuard Traffic Obfuscator (TC/XDP eBPF over QUIC)
+# gutd v2 — WireGuard Traffic Obfuscator (TC/XDP eBPF)
 
 [![CI](https://github.com/sh0rch/gutd/actions/workflows/ci.yml/badge.svg)](https://github.com/sh0rch/gutd/actions/workflows/ci.yml)
 [![Release](https://github.com/sh0rch/gutd/actions/workflows/release.yml/badge.svg?event=push)](https://github.com/sh0rch/gutd/actions/workflows/release.yml)
