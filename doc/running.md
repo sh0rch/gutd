@@ -162,9 +162,12 @@ ports = 41000                  # UDP obfuscation port
 key = 001122...
 ```
 
-> **Important:** In userspace mode, gutd forwards decapsulated packets to the
-> local WireGuard listener. By default it sends to `127.0.0.1:51820`, which
-> only works when WireGuard runs inside the same container/namespace.
+> **Important:** In userspace mode, gutd uses a separate WG-facing socket bound
+> to `GUTD_WG_HOST`. On the **server side** (responder=true), gutd sends
+> decapsulated packets to this address. On the **client side** (responder=false),
+> gutd binds its local socket to this address — the WG peer Endpoint must point here.
+> By default `GUTD_WG_HOST` is `127.0.0.1:51820`, which only works when WireGuard
+> runs inside the same container/namespace.
 > On RouterOS the WireGuard interface lives on the router itself, so you must
 > set the `GUTD_WG_HOST` environment variable to the router's WG address reachable
 > from the container (e.g. `172.16.1.1:51820`). Set it via `/container/envs/add` even
@@ -213,41 +216,35 @@ Pass all settings as env vars directly in the container definition. When `GUTD_P
 With `GUTD_WG_HOST` set to the router's WG listen address (`172.16.1.1:51820`), gutd forwards
 decapsulated WireGuard packets directly to the router's WireGuard interface.
 
-WireGuard on the router must send its outbound packets **to the gutd container**
-(not directly to the remote server), so gutd can obfuscate them. Set the WG peer
-endpoint to the container's veth IP and **any** of the `GUTD_PORTS` ports:
+In userspace mode, gutd binds a separate WG-facing socket to `GUTD_WG_HOST`.
+WireGuard on the router must send its outbound packets **to the gutd container's
+`GUTD_WG_HOST` address** (not directly to the remote server), so gutd can
+obfuscate them. Set the WG peer endpoint to the container's veth IP and WG port:
 
 ```routeros
 /interface/wireguard/add name=wg0 listen-port=51820
 /interface/wireguard/peers/add interface=wg0 public-key="..." \
-    endpoint-address=172.16.1.2 endpoint-port=41000 \
+    endpoint-address=172.16.1.2 endpoint-port=51820 \
     allowed-address=0.0.0.0/0
 
 # Container must reach the remote gutd server on the internet
 /ip/firewall/nat/add chain=srcnat src-address=172.16.1.0/24 action=masquerade
 
-# Forward ALL obfuscation ports from public interface to the container
-# The remote peer may send on any of these ports
-/ip/firewall/nat/add chain=dstnat protocol=udp dst-port=41000-41003 \
+# Forward the obfuscation port from public interface to the container
+/ip/firewall/nat/add chain=dstnat protocol=udp dst-port=41000 \
     action=dst-nat to-addresses=172.16.1.2
 ```
 
-> **Multi-port:** When `ports = 41000,41001,41002,41003`, gutd listens on all
-> four ports. The remote server distributes inbound traffic across them for
-> obfuscation. Outbound traffic from gutd is also rotated across ports
-> (round-robin). The DNAT rule must cover the entire port range. WG only needs
-> one endpoint port — gutd accepts WireGuard traffic on any of them.
->
-> **QUIC fidelity note:** A real QUIC connection uses a single source port
-> for its entire lifetime. Multi-port rotation makes the traffic look like
-> several parallel QUIC sessions — normal for browsers, but less "clean" than
-> a single connection. For maximum stealth, use `ports = 443` (single port).
-> Multi-port is useful for throughput diversity and evading per-flow rate limits.
+> **Port separation (v2.5+):** In userspace mode, gutd uses two sockets:
+> an **external socket** on `GUTD_PORTS` (e.g. 41000) for obfuscated GUT traffic,
+> and a **local socket** on `GUTD_WG_HOST` (e.g. 51820) for plain WireGuard traffic.
+> The WG peer endpoint must point to the `GUTD_WG_HOST` port, **not** the GUT port.
+> In eBPF mode, port striping is handled at the BPF level across all listed ports.
 
-**Traffic flow:**
+**Traffic flow (userspace):**
 ```
-Outbound: WG(router) → 172.16.1.2:41000 (gutd) → obfuscate → remote:41000-41003 (rotated)
-Inbound:  remote → router:41000-41003 → DNAT → 172.16.1.2 (gutd) → deobfuscate → 172.16.1.1:51820 (WG)
+Outbound: WG(router) → 172.16.1.2:51820 (gutd local) → obfuscate → remote:41000 (gutd ext)
+Inbound:  remote → router:41000 → DNAT → 172.16.1.2 (gutd ext) → deobfuscate → 172.16.1.1:51820 (WG)
 ```
 
 ## Dynamic Peer (Client behind NAT)

@@ -151,6 +151,7 @@ docker run -d --name gutd_relay \
     -e GUTD_KEY="$GUTD_KEY" \
     -e GUTD_NIC=eth0 \
     -e GUTD_USERSPACE_ONLY=true \
+    -e GUTD_WG_HOST=0.0.0.0:$WG_PORT \
     "$IMAGE"
 # ── Wait for gutd to be ready ─────────────────────────────────────
 wait_ready() {
@@ -211,10 +212,9 @@ EOF
 cat > /tmp/wg-docker-client.conf <<EOF
 [Interface]
 PrivateKey = $WG_CLI_PRIV
-ListenPort = $WG_PORT
 [Peer]
 PublicKey = $WG_SRV_PUB
-Endpoint = 127.0.0.1:41000
+Endpoint = 127.0.0.1:$WG_PORT
 AllowedIPs = 10.200.0.0/24
 PersistentKeepalive = 5
 EOF

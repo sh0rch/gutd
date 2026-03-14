@@ -46,7 +46,7 @@ WireGuard  (receives a normal WireGuard UDP packet)
 
 ## Userspace Daemon
 
-gutd (userspace) only handles startup and control:
+In **eBPF mode**, gutd (userspace) only handles startup and control:
 - Creates the veth pair and assigns the tunnel address
 - Loads and attaches the BPF programs
 - Initialises BPF maps (key, ports, peer IP, MAC addresses)
@@ -54,6 +54,25 @@ gutd (userspace) only handles startup and control:
 - Tears down the veth pair on exit
 
 All per-packet processing runs entirely in the kernel BPF programs.
+
+In **userspace mode** (`GUTD_USERSPACE=1`, Windows, RouterOS), gutd runs a
+dual-thread UDP proxy that performs packet processing directly:
+
+- **Egress thread** (`gutd-egress`): blocking `recv_from` on the WG-facing
+  local socket → QUIC encapsulation + ChaCha masking → `send_to` on the
+  external socket toward the remote peer.
+- **Ingress thread** (`gutd-ingress`): blocking `recv_from` on the external
+  socket → QUIC verify + decapsulation → `send_to` on the local socket toward
+  the WireGuard daemon.
+
+Two separate sockets are used:
+- **External socket** — binds to `ports[0]` (e.g. 41000) for obfuscated GUT traffic.
+- **Local socket** — WG-facing:
+  - Client (responder=false): binds to `GUTD_WG_HOST` — the WG client sets its Endpoint here.
+  - Server (responder=true): ephemeral port — sends decapsulated packets to `GUTD_WG_HOST`.
+
+The learned WG peer address (client mode) is shared between threads via a
+lock-free `AtomicU64`. Dynamic peer routing maps use `Arc<Mutex<HashMap>>`.
 
 ## Security
 

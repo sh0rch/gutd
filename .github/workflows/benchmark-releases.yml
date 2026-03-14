@@ -282,7 +282,7 @@ jobs:
         sudo ip netns exec ns2 wg setconf wg0 /tmp/wg-server.conf
         sudo ip netns exec ns2 ip link set wg0 mtu 1420 up
 
-        printf '[Interface]\nPrivateKey = %s\n\n[Peer]\nPublicKey = %s\nEndpoint = 127.0.0.1:41000\nAllowedIPs = 10.200.0.0/24\nPersistentKeepalive = 5\n' \
+        printf '[Interface]\nPrivateKey = %s\n\n[Peer]\nPublicKey = %s\nEndpoint = 127.0.0.1:51820\nAllowedIPs = 10.200.0.0/24\nPersistentKeepalive = 5\n' \
           "$WG_CLIENT_PRIV" "$WG_SERVER_PUB" > /tmp/wg-client-tunnel.conf
         sudo ip netns exec ns1 ip link add wg0 type wireguard
         sudo ip netns exec ns1 ip addr add 10.200.0.1/24 dev wg0
