@@ -14,7 +14,6 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = "1.0"
 getrandom = "0.2"
-mio = { version = "1.1.1", features = ["os-poll", "net"] }
 
 [target.'cfg(target_family = "unix")'.dependencies]
 libc = "0.2"

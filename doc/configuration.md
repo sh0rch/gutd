@@ -94,7 +94,7 @@ These variables are only used in userspace proxy mode.
 
 | Env Var | Default | Description |
 |---|---|---|
-| `GUTD_WG_HOST` | `127.0.0.1:51820` | Address (`ip:port`) of the local WireGuard listener. In containers (e.g. RouterOS) set to the host/router IP and WG listen port reachable from the container |
+| `GUTD_WG_HOST` | `127.0.0.1:51820` | `ip:port` for the WG-facing socket. **Client mode** (responder=false): gutd binds its local socket to this address — set the WG client Endpoint to this address. **Server mode** (responder=true): gutd sends decapsulated packets to this address — set it to the WG server listen address. In containers (e.g. RouterOS) set to the host/router IP and WG listen port reachable from the container |
 
 ### Runtime overrides (always checked, both modes)
 

@@ -139,7 +139,7 @@ jobs:
         sudo ip netns exec us1 env GUTD_WG_HOST=127.0.0.1:51820 \
           $GUTD --config /tmp/us1.conf > /tmp/gutd-us1.log 2>&1 &
         G1=$!; sleep 1
-        sudo ip netns exec us2 env GUTD_WG_HOST=127.0.0.1:51820 \
+        sudo ip netns exec us2 env GUTD_WG_HOST=0.0.0.0:51820 \
           $GUTD --config /tmp/us2.conf > /tmp/gutd-us2.log 2>&1 &
         G2=$!; sleep 1
 
@@ -160,10 +160,10 @@ jobs:
           "$WG_SERVER_PRIV" "$WG_CLIENT_PUB" | sudo ip netns exec us1 wg setconf wg0 /dev/stdin
         sudo ip netns exec us1 ip link set wg0 up
 
-        # Client (us2): endpoint = local gutd proxy (10.0.0.2:41000)
+        # Client (us2): endpoint = local gutd proxy (127.0.0.1:51820 = wg_port)
         sudo ip netns exec us2 ip link add wg0 type wireguard
         sudo ip netns exec us2 ip addr add 10.200.0.2/24 dev wg0
-        printf '[Interface]\nPrivateKey = %s\nListenPort = 51821\n\n[Peer]\nPublicKey = %s\nEndpoint = 10.0.0.2:41000\nAllowedIPs = 10.200.0.0/24\nPersistentKeepalive = 5\n' \
+        printf '[Interface]\nPrivateKey = %s\nListenPort = 51821\n\n[Peer]\nPublicKey = %s\nEndpoint = 10.0.0.2:51820\nAllowedIPs = 10.200.0.0/24\nPersistentKeepalive = 5\n' \
           "$WG_CLIENT_PRIV" "$WG_SERVER_PUB" | sudo ip netns exec us2 wg setconf wg0 /dev/stdin
         sudo ip netns exec us2 ip link set wg0 up
 
@@ -271,7 +271,7 @@ jobs:
         # ── Start gutd ──
         sudo ip netns exec ebpf_ns $GUTD --config /tmp/ebpf.conf > /tmp/gutd-ebpf.log 2>&1 &
         G_EBPF=$!; sleep 2
-        sudo ip netns exec user_ns env GUTD_WG_HOST=127.0.0.1:51820 \
+        sudo ip netns exec user_ns env GUTD_WG_HOST=0.0.0.0:51820 \
           $GUTD --config /tmp/user.conf > /tmp/gutd-user.log 2>&1 &
         G_USER=$!; sleep 1
 
@@ -293,10 +293,10 @@ jobs:
           "$WG_SERVER_PRIV" "$WG_CLIENT_PUB" | sudo ip netns exec ebpf_ns wg setconf wg0 /dev/stdin
         sudo ip netns exec ebpf_ns ip link set wg0 up
 
-        # Client (user_ns): endpoint = local gutd proxy
+        # Client (user_ns): endpoint = local gutd proxy (wg_port)
         sudo ip netns exec user_ns ip link add wg0 type wireguard
         sudo ip netns exec user_ns ip addr add 10.200.0.2/24 dev wg0
-        printf '[Interface]\nPrivateKey = %s\nListenPort = 51821\n\n[Peer]\nPublicKey = %s\nEndpoint = 10.0.0.2:41000\nAllowedIPs = 10.200.0.0/24\nPersistentKeepalive = 5\n' \
+        printf '[Interface]\nPrivateKey = %s\nListenPort = 51821\n\n[Peer]\nPublicKey = %s\nEndpoint = 10.0.0.2:51820\nAllowedIPs = 10.200.0.0/24\nPersistentKeepalive = 5\n' \
           "$WG_CLIENT_PRIV" "$WG_SERVER_PUB" | sudo ip netns exec user_ns wg setconf wg0 /dev/stdin
         sudo ip netns exec user_ns ip link set wg0 up
 

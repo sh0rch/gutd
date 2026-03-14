@@ -1,8 +1,8 @@
-use mio::net::UdpSocket;
-use mio::{Events, Interest, Poll, Token};
 use std::collections::HashMap;
 use std::env;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::proto::feistel::{feistel32, feistel32_inv, FEISTEL_SALT_PORTS};
@@ -11,6 +11,94 @@ use crate::proto::mask_balanced::{chacha_block, chacha_block_fast, chacha_init};
 const GUT_QUIC_SHORT_HEADER_SIZE: usize = 14;
 const GUT_QUIC_LONG_HEADER_SIZE: usize = 100;
 const BALLAST_THRESHOLD: usize = 220;
+const SOCKET_BUF_SIZE: usize = 4 * 1024 * 1024; // 4 MiB send/recv buffer
+
+// Pack/unpack SocketAddr (IPv4 only) into u64 for lock-free sharing.
+// Layout: [32-bit IP][16-bit port][16-bit zero]
+fn sockaddr_to_u64(addr: SocketAddr) -> u64 {
+    match addr {
+        SocketAddr::V4(v4) => {
+            let ip = u32::from_be_bytes(v4.ip().octets());
+            ((ip as u64) << 32) | ((v4.port() as u64) << 16)
+        }
+        SocketAddr::V6(_) => 0,
+    }
+}
+
+fn u64_to_sockaddr(val: u64) -> Option<SocketAddr> {
+    if val == 0 {
+        return None;
+    }
+    let ip = ((val >> 32) & 0xFFFF_FFFF) as u32;
+    let port = ((val >> 16) & 0xFFFF) as u16;
+    let octets = ip.to_be_bytes();
+    Some(SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            octets[0], octets[1], octets[2], octets[3],
+        )),
+        port,
+    ))
+}
+
+/// Best-effort SO_SNDBUF + SO_RCVBUF increase.
+fn tune_udp_buffers(_sock: &UdpSocket) {
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = _sock.as_raw_fd();
+        unsafe {
+            let size = SOCKET_BUF_SIZE as libc::c_int;
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    #[cfg(target_family = "windows")]
+    {
+        use std::os::windows::io::AsRawSocket;
+        const SOL_SOCKET_WIN: i32 = 0xFFFF;
+        const SO_SNDBUF_WIN: i32 = 0x1001;
+        const SO_RCVBUF_WIN: i32 = 0x1002;
+        extern "system" {
+            fn setsockopt(
+                s: usize,
+                level: i32,
+                optname: i32,
+                optval: *const u8,
+                optlen: i32,
+            ) -> i32;
+        }
+        let fd = _sock.as_raw_socket() as usize;
+        let size = SOCKET_BUF_SIZE as i32;
+        unsafe {
+            setsockopt(
+                fd,
+                SOL_SOCKET_WIN,
+                SO_SNDBUF_WIN,
+                &size as *const i32 as *const u8,
+                std::mem::size_of::<i32>() as i32,
+            );
+            setsockopt(
+                fd,
+                SOL_SOCKET_WIN,
+                SO_RCVBUF_WIN,
+                &size as *const i32 as *const u8,
+                std::mem::size_of::<i32>() as i32,
+            );
+        }
+    }
+}
 
 fn wg_nonce32(wg: &[u8]) -> u32 {
     if wg.len() < 32 {
@@ -377,7 +465,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     };
 
     println!(
-        "Starting gutd-userspace proxy (MIO event loop). is_server={} obfs={}",
+        "Starting gutd-userspace proxy (dual-thread). is_server={} obfs={}",
         is_server,
         if noise { "noise" } else { "quic" }
     );
@@ -391,7 +479,6 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let dynamic_peer = peer.dynamic_peer
         || peer_ip_str.eq_ignore_ascii_case("dynamic")
         || peer_ip_str == "0.0.0.0";
-    // For ports, use the first one from config
     let peer_port = peer.ports.first().copied().unwrap_or(41000);
     let remote_peer_addr: Option<SocketAddr> = if dynamic_peer {
         None
@@ -399,306 +486,160 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         Some(format!("{}:{}", peer_ip_str, peer_port).parse()?)
     };
 
-    // Dynamic peer: multi-client maps (keyed by WG index)
-    //   client_map: C_idx → learned SocketAddr
-    //   session_map: S_idx → C_idx (bridged on Type 2 egress)
-    let mut client_map: HashMap<u32, SocketAddr> = HashMap::new();
-    let mut session_map: HashMap<u32, u32> = HashMap::new();
+    // ext_socket: GUT traffic to/from remote peer (first configured port).
+    let ext_addr = SocketAddr::new(peer.bind_ip, peer.ports[0]);
+    let ext_socket = Arc::new(UdpSocket::bind(ext_addr)?);
+    tune_udp_buffers(&ext_socket);
+    println!("Listening (ext) on {}", ext_addr);
 
-    if is_server {
-        // Server: wg_addr is where we PUSH decapsulated packets (WG daemon listens there)
-        println!(
-            "Local WireGuard daemon at {} (server will push decapped packets there)",
-            wg_addr
-        );
+    // local_socket: WG-facing socket.
+    // Client: binds to wg_addr (WG Endpoint = wg_addr).
+    // Server: ephemeral port — WG daemon already owns wg_addr.
+    let local_bind: SocketAddr = if !is_server {
+        wg_addr
     } else {
-        // Client: wg_addr.port() = server's WG ListenPort, embedded in QUIC enc_ports.
-        // XDP on the server restores this as udp->dest, delivering to the right WG port.
-        // The client's own WG address is learned automatically from incoming packets.
-        // Configure: wg_host = <any>:<SERVER_WG_LISTENPORT>  (e.g. 127.0.0.1:51820)
-        println!(
-            "Server WireGuard listen port: {} (encoded in QUIC headers so XDP delivers to correct port)",
-            wg_addr.port()
-        );
-    }
-    if let Some(ref addr) = remote_peer_addr {
-        println!("Remote peer: {}", addr);
-    } else {
-        println!("Remote peer: dynamic (learned from inbound QUIC packets)");
-    }
+        SocketAddr::new(peer.bind_ip, 0)
+    };
+    let local_socket = Arc::new(UdpSocket::bind(local_bind)?);
+    tune_udp_buffers(&local_socket);
+    println!("Local WG-facing socket on {}", local_bind);
 
-    let mut poll = Poll::new()?;
-    let mut events = Events::with_capacity(1024);
+    // Lock-free shared WG peer address (client mode: egress writes, ingress reads)
+    let shared_wg_peer = Arc::new(AtomicU64::new(0));
 
-    let mut ext_sockets = HashMap::new();
-    let mut current_token_id = 0;
+    // Shared maps for dynamic_peer routing (egress reads client_map, ingress writes it; vice versa for session_map)
+    let client_map: Arc<Mutex<HashMap<u32, SocketAddr>>> = Arc::new(Mutex::new(HashMap::new()));
+    let session_map: Arc<Mutex<HashMap<u32, u32>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    for &port in &peer.ports {
-        let ext_addr = SocketAddr::new(peer.bind_ip, port);
-        let std_sock = match std::net::UdpSocket::bind(ext_addr) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Warning: Failed to bind to {}: {}", ext_addr, e);
-                continue;
-            }
-        };
-        let _ = std_sock.set_nonblocking(true);
-        #[cfg(target_family = "unix")]
-        let _ = std::os::unix::io::AsRawFd::as_raw_fd(&std_sock);
-        /* we'll use libc if available later, for now ignore OS limits for std_sock */
+    // ── Thread 1: EGRESS (WG → encap → remote peer) ──────────────────
+    let egress_ext = Arc::clone(&ext_socket);
+    let egress_local = Arc::clone(&local_socket);
+    let egress_wg_peer = Arc::clone(&shared_wg_peer);
+    let egress_client_map = Arc::clone(&client_map);
+    let egress_session_map = Arc::clone(&session_map);
+    let egress_handle = std::thread::Builder::new()
+        .name("gutd-egress".into())
+        .spawn(move || {
+            let mut buf = [0u8; 65536];
 
-        match Ok::<_, std::io::Error>(mio::net::UdpSocket::from_std(std_sock)) {
-            Ok(mut socket) => {
-                let token = Token(current_token_id);
-                current_token_id += 1;
-                poll.registry()
-                    .register(&mut socket, token, Interest::READABLE)?;
-                ext_sockets.insert(token, socket);
-                println!("Listening on port: {}", ext_addr);
-            }
-            Err(e) => {
-                eprintln!("Warning: Failed to bind to {}: {}", ext_addr, e);
-            }
-        }
-    }
+            loop {
+                let (size, src) = match egress_local.recv_from(&mut buf) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
 
-    if ext_sockets.is_empty() {
-        return Err("Could not bind to any external ports".into());
-    }
-
-    // Ordered list of ext socket tokens for round-robin port rotation
-    let ext_tokens: Vec<Token> = ext_sockets.keys().copied().collect();
-    let mut ext_rr_idx: usize = 0;
-
-    let mut buf = [0u8; 65536];
-
-    // For sending back to WG clients with the right ephemeral source port
-    let std_local = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
-    let _ = std_local.set_nonblocking(true);
-
-    let mut local_socket = UdpSocket::from_std(std_local);
-    let local_token = Token(current_token_id);
-    poll.registry()
-        .register(&mut local_socket, local_token, Interest::READABLE)?;
-
-    // Client mode: WG tells us its address on the first packet it sends to ext_socket.
-    // Updated on every new handshake (Type 1) → reconnects always work.
-    // Server mode: wg_addr from config is authoritative (MikroTik, Linux WG daemon etc.)
-    let mut learned_wg_addr: Option<SocketAddr> = None;
-
-    loop {
-        let _ = poll.poll(&mut events, None);
-
-        for event in events.iter() {
-            let token = event.token();
-
-            if token == local_token {
-                loop {
-                    match local_socket.recv_from(&mut buf) {
-                        Ok((size, src)) => {
-                            // It's EGRESS traffic from local WG
-                            // Multi-client routing: determine destination by WG index
-                            let egress_dest = if !dynamic_peer {
-                                remote_peer_addr
-                            } else {
-                                if size < 4 {
-                                    None
-                                } else {
-                                    let wg_type = buf[0] & 0x1F;
-                                    if wg_type == 1 {
-                                        // Server-initiated rekey: no receiver_index to route.
-                                        // Drop — client will re-initiate.
-                                        eprintln!("[gutd] dropping server-initiated Type 1 rekey (dynamic mode)");
-                                        None
-                                    } else if wg_type == 2 && size >= 12 {
-                                        // Type 2: sender=S_idx[4..8], receiver=C_idx[8..12]
-                                        let s_idx =
-                                            u32::from_le_bytes(buf[4..8].try_into().unwrap());
-                                        let c_idx =
-                                            u32::from_le_bytes(buf[8..12].try_into().unwrap());
-                                        session_map.insert(s_idx, c_idx);
-                                        client_map.get(&c_idx).copied()
-                                    } else if wg_type == 3 && size >= 8 {
-                                        // Type 3 (Cookie Reply): receiver=C_idx[4..8]
-                                        // Critical for handshake completion under rate-limiting
-                                        let c_idx =
-                                            u32::from_le_bytes(buf[4..8].try_into().unwrap());
-                                        client_map.get(&c_idx).copied()
-                                    } else if wg_type == 4 && size >= 8 {
-                                        // Type 4: receiver=C_idx[4..8]
-                                        let c_idx =
-                                            u32::from_le_bytes(buf[4..8].try_into().unwrap());
-                                        client_map.get(&c_idx).copied()
-                                    } else {
-                                        None
-                                    }
-                                }
-                            };
-                            if let Some(dest) = egress_dest {
-                                if let Some(new_size) = quic_encap(
-                                    &mut buf,
-                                    size,
-                                    &key_init,
-                                    &feistel_rk,
-                                    rounds,
-                                    is_server,
-                                    src.port(),
-                                    wg_port,
-                                    noise,
-                                ) {
-                                    let tok = ext_tokens[ext_rr_idx % ext_tokens.len()];
-                                    ext_rr_idx = ext_rr_idx.wrapping_add(1);
-                                    if let Some(ext_sock) = ext_sockets.get(&tok) {
-                                        let _ = ext_sock.send_to(&buf[..new_size], dest);
-                                    }
-                                }
-                            } else if dynamic_peer && size >= 1 {
-                                let wg_type = buf[0] & 0x1F;
-                                if wg_type != 1 {
-                                    eprintln!(
-                                        "[gutd] egress: no route for WG type {} (size={}, client_map={})",
-                                        wg_type, size, client_map.len()
-                                    );
-                                }
-                            }
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(_) => break,
+                // Client: learn WG peer address
+                if !is_server {
+                    let wg_type = if size >= 1 { buf[0] & 0x1F } else { 0 };
+                    if wg_type == 1 || egress_wg_peer.load(Ordering::Relaxed) == 0 {
+                        egress_wg_peer.store(sockaddr_to_u64(src), Ordering::Relaxed);
                     }
                 }
-            } else if ext_sockets.contains_key(&token) {
-                let ext_socket = ext_sockets.get_mut(&token).unwrap();
-                loop {
-                    match ext_socket.recv_from(&mut buf) {
-                        Ok((size, src)) => {
-                            // Determine if this is inbound GUT traffic or local WG egress.
-                            // In quic mode: check QUIC first-byte pattern.
-                            // In noise mode: first byte is masked, so try quic_verify
-                            //   (which unmaskes in-place) — success = GUT ingress.
-                            let is_gut_ingress = if noise {
-                                size >= GUT_QUIC_SHORT_HEADER_SIZE + 16
-                                    && quic_verify(
-                                        &mut buf,
-                                        size,
-                                        &key_init,
-                                        &feistel_rk,
-                                        rounds,
-                                        true,
-                                    )
-                            } else {
-                                let first_byte = buf[0];
-                                ((first_byte & 0xC0) == 0xC0 || (first_byte & 0x40) == 0x40)
-                                    && quic_verify(
-                                        &mut buf,
-                                        size,
-                                        &key_init,
-                                        &feistel_rk,
-                                        rounds,
-                                        false,
-                                    )
-                            };
-                            if is_gut_ingress {
-                                // INGRESS traffic (GUT) from Remote Peer — already verified
-                                // Dynamic peer: learn endpoint from validated packet (multi-client)
-                                // We decap first, then parse WG type/index from the inner payload.
-                                if let Some((new_size, _wg_sport, _wg_dport)) =
-                                    quic_decap(&mut buf, size, &key_init, &feistel_rk, rounds)
-                                {
-                                    if dynamic_peer && new_size >= 8 {
-                                        let wg_type = buf[0] & 0x1F;
-                                        if wg_type == 1 {
-                                            // Type 1: sender_index[4..8] = C_idx
-                                            let c_idx =
-                                                u32::from_le_bytes(buf[4..8].try_into().unwrap());
-                                            if c_idx != 0 {
-                                                client_map.insert(c_idx, src);
-                                            }
-                                        } else if wg_type == 4 {
-                                            // Type 4: receiver_index[4..8] = S_idx → session_map → C_idx
-                                            let s_idx =
-                                                u32::from_le_bytes(buf[4..8].try_into().unwrap());
-                                            if let Some(&c_idx) = session_map.get(&s_idx) {
-                                                client_map.insert(c_idx, src);
-                                            }
-                                        }
-                                    }
-                                    if is_server {
-                                        // Server: forward decapped packet to local WireGuard daemon
-                                        let _ = local_socket.send_to(&buf[..new_size], wg_addr);
-                                    } else {
-                                        // Client: send back from ext_socket to WG's actual address.
-                                        // Use learned address (updated on every new handshake) so
-                                        // reconnects work even if WG changes its source port.
-                                        // Sending from ext_socket prevents WG endpoint roaming.
-                                        let dest = learned_wg_addr.unwrap_or(wg_addr);
-                                        let _ = ext_socket.send_to(&buf[..new_size], dest);
-                                    }
-                                }
-                            } else {
-                                // Prevent treating server's unreachable/error packets as WG egress
-                                if let Some(peer_addr) = remote_peer_addr {
-                                    if src.ip() == peer_addr.ip() && !is_server {
-                                        continue;
-                                    }
-                                }
-                                // Non-QUIC on ext_socket = WG traffic (Endpoint = 127.0.0.1:ext_port).
-                                // Learn WG's current address so we always reply to the right port,
-                                // including after reconnects where WG may use a different source port.
-                                if !is_server {
-                                    // Update on Type 1 (new handshake) always; otherwise only if unknown
-                                    let wg_type = if size >= 1 { buf[0] & 0x1F } else { 0 };
-                                    if wg_type == 1 || learned_wg_addr.is_none() {
-                                        learned_wg_addr = Some(src);
-                                    }
-                                }
-                                let egress_dest = if !dynamic_peer {
-                                    remote_peer_addr
-                                } else if size >= 12 {
-                                    let wg_type = buf[0] & 0x1F;
-                                    if wg_type == 2 {
-                                        let s_idx =
-                                            u32::from_le_bytes(buf[4..8].try_into().unwrap());
-                                        let c_idx =
-                                            u32::from_le_bytes(buf[8..12].try_into().unwrap());
-                                        session_map.insert(s_idx, c_idx);
-                                        client_map.get(&c_idx).copied()
-                                    } else if wg_type == 3 && size >= 8 {
-                                        // Type 3 (Cookie Reply): receiver=C_idx[4..8]
-                                        let c_idx =
-                                            u32::from_le_bytes(buf[4..8].try_into().unwrap());
-                                        client_map.get(&c_idx).copied()
-                                    } else if wg_type == 4 && size >= 8 {
-                                        let c_idx =
-                                            u32::from_le_bytes(buf[4..8].try_into().unwrap());
-                                        client_map.get(&c_idx).copied()
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                };
-                                if let Some(dest) = egress_dest {
-                                    if let Some(new_size) = quic_encap(
-                                        &mut buf,
-                                        size,
-                                        &key_init,
-                                        &feistel_rk,
-                                        rounds,
-                                        is_server,
-                                        src.port(),
-                                        wg_port,
-                                        noise,
-                                    ) {
-                                        let _ = ext_socket.send_to(&buf[..new_size], dest);
-                                    }
-                                }
-                            }
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(_) => break,
+
+                let egress_dest = if !dynamic_peer {
+                    remote_peer_addr
+                } else if size >= 4 {
+                    let wg_type = buf[0] & 0x1F;
+                    if wg_type == 1 {
+                        eprintln!("[gutd] dropping server-initiated Type 1 rekey (dynamic mode)");
+                        None
+                    } else if wg_type == 2 && size >= 12 {
+                        let s_idx = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+                        let c_idx = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+                        egress_session_map.lock().unwrap().insert(s_idx, c_idx);
+                        egress_client_map.lock().unwrap().get(&c_idx).copied()
+                    } else if matches!(wg_type, 3 | 4) && size >= 8 {
+                        let c_idx = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+                        egress_client_map.lock().unwrap().get(&c_idx).copied()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(dest) = egress_dest {
+                    if let Some(new_size) = quic_encap(
+                        &mut buf,
+                        size,
+                        &key_init,
+                        &feistel_rk,
+                        rounds,
+                        is_server,
+                        src.port(),
+                        wg_port,
+                        noise,
+                    ) {
+                        let _ = egress_ext.send_to(&buf[..new_size], dest);
                     }
                 }
             }
-        }
-    }
+        })?;
+
+    // ── Thread 2: INGRESS (remote peer → decap → WG) ─────────────────
+    let ingress_ext = Arc::clone(&ext_socket);
+    let ingress_local = Arc::clone(&local_socket);
+    let ingress_wg_peer = Arc::clone(&shared_wg_peer);
+    let ingress_client_map = Arc::clone(&client_map);
+    let ingress_session_map = Arc::clone(&session_map);
+    let ingress_handle = std::thread::Builder::new()
+        .name("gutd-ingress".into())
+        .spawn(move || {
+            let mut buf = [0u8; 65536];
+
+            loop {
+                let (size, src) = match ingress_ext.recv_from(&mut buf) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+
+                // Verify this is GUT traffic
+                let is_gut = if noise {
+                    size >= GUT_QUIC_SHORT_HEADER_SIZE + 16
+                        && quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, true)
+                } else {
+                    let fb = buf[0];
+                    ((fb & 0xC0) == 0xC0 || (fb & 0x40) == 0x40)
+                        && quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, false)
+                };
+
+                if !is_gut {
+                    continue;
+                }
+
+                if let Some((new_size, _wg_sport, _wg_dport)) =
+                    quic_decap(&mut buf, size, &key_init, &feistel_rk, rounds)
+                {
+                    if dynamic_peer && new_size >= 8 {
+                        let wg_type = buf[0] & 0x1F;
+                        if wg_type == 1 {
+                            let c_idx = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+                            if c_idx != 0 {
+                                ingress_client_map.lock().unwrap().insert(c_idx, src);
+                            }
+                        } else if wg_type == 4 {
+                            let s_idx = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+                            if let Some(&c_idx) = ingress_session_map.lock().unwrap().get(&s_idx) {
+                                ingress_client_map.lock().unwrap().insert(c_idx, src);
+                            }
+                        }
+                    }
+
+                    let dest = if is_server {
+                        Some(wg_addr)
+                    } else {
+                        u64_to_sockaddr(ingress_wg_peer.load(Ordering::Relaxed))
+                    };
+                    if let Some(d) = dest {
+                        let _ = ingress_local.send_to(&buf[..new_size], d);
+                    }
+                }
+            }
+        })?;
+
+    egress_handle.join().map_err(|_| "egress thread panicked")?;
+    ingress_handle
+        .join()
+        .map_err(|_| "ingress thread panicked")?;
+    Ok(())
 }

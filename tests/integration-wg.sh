@@ -257,8 +257,15 @@ setup_gutd() {
     log "Setting up gutd relay and server (mode: $mode)..."
     
     local userspace_line=""
+    local relay_responder_line=""
+    local server_responder_line=""
     if [ "$mode" = "userspace" ]; then
         userspace_line="userspace_only = true"
+        # In userspace mode the relay side hosts the WG client, so it must
+        # bind local_socket to wg_addr (responder = false).  The server side
+        # hosts the WG server and needs an ephemeral local_socket (responder = true).
+        relay_responder_line="responder = false"
+        server_responder_line="responder = true"
     fi
     
     # gutd config for relay (in server_ns)
@@ -278,6 +285,7 @@ peer_ip = 10.100.2.1
 ports = $GUT_PORTS_CSV
 keepalive_drop_percent = 30
 key = $GUTD_SHARED_KEY
+$relay_responder_line
 EOF
     
     # gutd config for server (on host)
@@ -297,6 +305,7 @@ peer_ip = 10.100.2.2
 ports = $GUT_PORTS_CSV
 keepalive_drop_percent = 30
 key = $GUTD_SHARED_KEY
+$server_responder_line
 EOF
     
     # Start gutd server on host
@@ -320,7 +329,12 @@ EOF
     
     # Start gutd relay in server_ns
     log "Starting gutd relay in server_ns..."
-    ip netns exec server_ns "$GUTD_BINARY" --config /tmp/gutd-relay.conf > /tmp/gutd-test-relay.log 2>&1 &
+    if [ "$mode" = "userspace" ]; then
+        ip netns exec server_ns env GUTD_WG_HOST=0.0.0.0:51820 \
+          "$GUTD_BINARY" --config /tmp/gutd-relay.conf > /tmp/gutd-test-relay.log 2>&1 &
+    else
+        ip netns exec server_ns "$GUTD_BINARY" --config /tmp/gutd-relay.conf > /tmp/gutd-test-relay.log 2>&1 &
+    fi
     GUTD_RELAY_PID=$!
     sleep 2
     
@@ -427,11 +441,10 @@ setup_wireguard_via_gutd() {
         cat > /tmp/wg-client-gutd.conf <<EOF
 [Interface]
 PrivateKey = $CLIENT_PRIVATE_KEY
-ListenPort = 51820
 
 [Peer]
 PublicKey = $SERVER_PUBLIC_KEY
-Endpoint = 10.100.2.2:${first_port}
+Endpoint = 10.100.2.2:51820
 AllowedIPs = 10.200.0.0/24
 PersistentKeepalive = 25
 EOF
