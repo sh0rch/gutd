@@ -528,11 +528,11 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     Err(_) => continue,
                 };
 
-                // Client: learn WG peer address
+                // Client: always track WG peer address (handles port changes, NAT rebind)
                 if !is_server {
-                    let wg_type = if size >= 1 { buf[0] & 0x1F } else { 0 };
-                    if wg_type == 1 || egress_wg_peer.load(Ordering::Relaxed) == 0 {
-                        egress_wg_peer.store(sockaddr_to_u64(src), Ordering::Relaxed);
+                    let new_val = sockaddr_to_u64(src);
+                    if egress_wg_peer.load(Ordering::Relaxed) != new_val {
+                        egress_wg_peer.store(new_val, Ordering::Relaxed);
                     }
                 }
 
