@@ -332,8 +332,18 @@ int gut_egress(struct __sk_buff *skb)
      *   0x40 | raw     = has ballast; actual len = (raw & 0x3F) + 1 → [1..64] */
     quic[quic_hdr_len - 1] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
 
+    /* Per-client noise mode: in dynamic_peer mode read from client_map,
+     * otherwise fall back to global cfg->obfs_noise. */
+    __u8 use_noise = cfg->obfs_noise;
+    if (cfg->dynamic_peer)
+    {
+        struct peer_endpoint *noise_ep = bpf_map_lookup_elem(&client_map, &c_idx);
+        if (noise_ep && noise_ep->valid)
+            use_noise = noise_ep->obfs_noise;
+    }
+
     /* Noise mode: XOR first 6 bytes with bytes [6..12] to hide QUIC signatures */
-    if (cfg->obfs_noise)
+    if (use_noise)
     {
 #pragma unroll
         for (int i = 0; i < 6; i++)

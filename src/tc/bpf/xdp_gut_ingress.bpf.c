@@ -103,16 +103,13 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     if (wg_len < WG_MIN_PACKET || wg + WG_MIN_PACKET > (__u8 *)data_end || wg + wg_len > (__u8 *)data_end)
         return -1;
 
-    /* Noise mode: unmask first 6 bytes in-place (XOR with bytes [6..12]) */
-    if (cfg->obfs_noise)
-    {
-        if (wg + 12 > (__u8 *)data_end)
-            return -1;
-#pragma unroll
-        for (int i = 0; i < 6; i++)
-            wg[i] ^= wg[6 + i];
-    }
+    /* Auto-detect noise vs plain QUIC per client.
+     * Try plain QUIC first (check first byte for 0x40/0xC0/0xF0).
+     * If that fails, apply noise unmask and check again. */
+    if (wg + 12 > (__u8 *)data_end)
+        return -1;
 
+    __u8 detected_noise = 0;
     __u32 quic_hdr_len = 0;
     if (wg[0] == 0x40)
     {
@@ -120,18 +117,40 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     }
     else if (wg[0] == 0xF0)
     {
-        /* QUIC Retry = Cookie Reply (WG Type 3) — accept on both sides */
         quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
     }
     else if (wg[0] >= 0xC0)
     {
         if (!is_quic_server(cfg))
-            return -1; // Client does not accept Initial Long Headers
+            return -1;
         quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
     }
     else
     {
-        return -1;
+        /* First byte is not a valid QUIC header — try noise unmask */
+#pragma unroll
+        for (int i = 0; i < 6; i++)
+            wg[i] ^= wg[6 + i];
+        detected_noise = 1;
+
+        if (wg[0] == 0x40)
+        {
+            quic_hdr_len = GUT_QUIC_SHORT_HEADER_SIZE;
+        }
+        else if (wg[0] == 0xF0)
+        {
+            quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
+        }
+        else if (wg[0] >= 0xC0)
+        {
+            if (!is_quic_server(cfg))
+                return -1;
+            quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
+        }
+        else
+        {
+            return -1; /* neither plain nor noise — not GUT traffic */
+        }
     }
 
     __u8 pad_byte = wg[quic_hdr_len - 1];
@@ -245,6 +264,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             ep.port = bpf_ntohs(udph->source);
             ep.server_port = bpf_ntohs(udph->dest);
             ep.valid = 1;
+            ep.obfs_noise = detected_noise;
             bpf_map_update_elem(&client_map, &client_idx, &ep, BPF_ANY);
             bpf_debug("XDP: client_map[%u] updated wg_type=%u port=%u", client_idx, wg_type, ep.port);
         }
