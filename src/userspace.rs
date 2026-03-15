@@ -13,57 +13,115 @@ const GUT_QUIC_LONG_HEADER_SIZE: usize = 100;
 const BALLAST_THRESHOLD: usize = 220;
 const SOCKET_BUF_SIZE: usize = 4 * 1024 * 1024; // 4 MiB send/recv buffer
 
-/// Lock-free shared SocketAddr (IPv4) using two AtomicU32.
+/// Lock-free shared SocketAddr (IPv4 + IPv6) using AtomicU32.
 /// Works on 32-bit targets (MIPS) where AtomicU64 is unavailable.
+/// Write order: ip → port → family (Release); read order: family (Acquire) → port → ip.
 struct SharedAddr {
-    ip: AtomicU32,
+    /// 0 = unset, 4 = IPv4, 6 = IPv6
+    family: AtomicU32,
+    /// IPv4: [ip, 0, 0, 0]. IPv6: 128-bit address as 4 big-endian words.
+    ip: [AtomicU32; 4],
     port: AtomicU32,
 }
 
 impl SharedAddr {
     fn new() -> Self {
         Self {
-            ip: AtomicU32::new(0),
+            family: AtomicU32::new(0),
+            ip: [
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+            ],
             port: AtomicU32::new(0),
         }
     }
 
     fn store(&self, addr: SocketAddr) {
-        if let SocketAddr::V4(v4) = addr {
-            self.ip
-                .store(u32::from_be_bytes(v4.ip().octets()), Ordering::Relaxed);
-            self.port.store(v4.port() as u32, Ordering::Relaxed);
+        match addr {
+            SocketAddr::V4(v4) => {
+                self.ip[0].store(u32::from_be_bytes(v4.ip().octets()), Ordering::Relaxed);
+                self.ip[1].store(0, Ordering::Relaxed);
+                self.ip[2].store(0, Ordering::Relaxed);
+                self.ip[3].store(0, Ordering::Relaxed);
+                self.port.store(v4.port() as u32, Ordering::Relaxed);
+                self.family.store(4, Ordering::Release);
+            }
+            SocketAddr::V6(v6) => {
+                let o = v6.ip().octets();
+                self.ip[0].store(
+                    u32::from_be_bytes([o[0], o[1], o[2], o[3]]),
+                    Ordering::Relaxed,
+                );
+                self.ip[1].store(
+                    u32::from_be_bytes([o[4], o[5], o[6], o[7]]),
+                    Ordering::Relaxed,
+                );
+                self.ip[2].store(
+                    u32::from_be_bytes([o[8], o[9], o[10], o[11]]),
+                    Ordering::Relaxed,
+                );
+                self.ip[3].store(
+                    u32::from_be_bytes([o[12], o[13], o[14], o[15]]),
+                    Ordering::Relaxed,
+                );
+                self.port.store(v6.port() as u32, Ordering::Relaxed);
+                self.family.store(6, Ordering::Release);
+            }
         }
     }
 
     fn load(&self) -> Option<SocketAddr> {
-        let ip = self.ip.load(Ordering::Relaxed);
-        let port = self.port.load(Ordering::Relaxed);
-        if ip == 0 && port == 0 {
+        let fam = self.family.load(Ordering::Acquire);
+        if fam == 0 {
             return None;
         }
-        let octets = ip.to_be_bytes();
-        Some(SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                octets[0], octets[1], octets[2], octets[3],
-            )),
-            port as u16,
-        ))
-    }
-
-    fn load_raw(&self) -> u64 {
-        let ip = self.ip.load(Ordering::Relaxed) as u64;
-        let port = self.port.load(Ordering::Relaxed) as u64;
-        (ip << 32) | port
-    }
-
-    fn store_raw_parts(&self, addr: SocketAddr) -> u64 {
-        if let SocketAddr::V4(v4) = addr {
-            let ip = u32::from_be_bytes(v4.ip().octets());
-            let port = v4.port() as u32;
-            (ip as u64) << 32 | port as u64
+        let port = self.port.load(Ordering::Relaxed) as u16;
+        if fam == 4 {
+            let o = self.ip[0].load(Ordering::Relaxed).to_be_bytes();
+            Some(SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(o[0], o[1], o[2], o[3])),
+                port,
+            ))
         } else {
-            0
+            let mut octets = [0u8; 16];
+            octets[0..4].copy_from_slice(&self.ip[0].load(Ordering::Relaxed).to_be_bytes());
+            octets[4..8].copy_from_slice(&self.ip[1].load(Ordering::Relaxed).to_be_bytes());
+            octets[8..12].copy_from_slice(&self.ip[2].load(Ordering::Relaxed).to_be_bytes());
+            octets[12..16].copy_from_slice(&self.ip[3].load(Ordering::Relaxed).to_be_bytes());
+            Some(SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)),
+                port,
+            ))
+        }
+    }
+
+    /// XOR-folded fingerprint for compare-and-store optimization.
+    fn load_raw(&self) -> u64 {
+        let w0 = self.ip[0].load(Ordering::Relaxed) as u64;
+        let w1 = self.ip[1].load(Ordering::Relaxed) as u64;
+        let w2 = self.ip[2].load(Ordering::Relaxed) as u64;
+        let w3 = self.ip[3].load(Ordering::Relaxed) as u64;
+        let port = self.port.load(Ordering::Relaxed) as u64;
+        ((w0 ^ w2) << 32 | (w1 ^ w3)) ^ port
+    }
+
+    /// Compute fingerprint for an address (matches load_raw layout).
+    fn addr_fingerprint(&self, addr: SocketAddr) -> u64 {
+        match addr {
+            SocketAddr::V4(v4) => {
+                let ip = u32::from_be_bytes(v4.ip().octets()) as u64;
+                (ip << 32) ^ v4.port() as u64
+            }
+            SocketAddr::V6(v6) => {
+                let o = v6.ip().octets();
+                let w0 = u32::from_be_bytes([o[0], o[1], o[2], o[3]]) as u64;
+                let w1 = u32::from_be_bytes([o[4], o[5], o[6], o[7]]) as u64;
+                let w2 = u32::from_be_bytes([o[8], o[9], o[10], o[11]]) as u64;
+                let w3 = u32::from_be_bytes([o[12], o[13], o[14], o[15]]) as u64;
+                ((w0 ^ w2) << 32 | (w1 ^ w3)) ^ v6.port() as u64
+            }
         }
     }
 }
@@ -558,7 +616,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
 
                 // Client: always track WG peer address (handles port changes, NAT rebind)
                 if !is_server {
-                    let new_val = egress_wg_peer.store_raw_parts(src);
+                    let new_val = egress_wg_peer.addr_fingerprint(src);
                     if egress_wg_peer.load_raw() != new_val {
                         egress_wg_peer.store(src);
                     }
