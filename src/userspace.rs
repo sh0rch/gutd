@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,31 +13,59 @@ const GUT_QUIC_LONG_HEADER_SIZE: usize = 100;
 const BALLAST_THRESHOLD: usize = 220;
 const SOCKET_BUF_SIZE: usize = 4 * 1024 * 1024; // 4 MiB send/recv buffer
 
-// Pack/unpack SocketAddr (IPv4 only) into u64 for lock-free sharing.
-// Layout: [32-bit IP][16-bit port][16-bit zero]
-fn sockaddr_to_u64(addr: SocketAddr) -> u64 {
-    match addr {
-        SocketAddr::V4(v4) => {
-            let ip = u32::from_be_bytes(v4.ip().octets());
-            ((ip as u64) << 32) | ((v4.port() as u64) << 16)
-        }
-        SocketAddr::V6(_) => 0,
-    }
+/// Lock-free shared SocketAddr (IPv4) using two AtomicU32.
+/// Works on 32-bit targets (MIPS) where AtomicU64 is unavailable.
+struct SharedAddr {
+    ip: AtomicU32,
+    port: AtomicU32,
 }
 
-fn u64_to_sockaddr(val: u64) -> Option<SocketAddr> {
-    if val == 0 {
-        return None;
+impl SharedAddr {
+    fn new() -> Self {
+        Self {
+            ip: AtomicU32::new(0),
+            port: AtomicU32::new(0),
+        }
     }
-    let ip = ((val >> 32) & 0xFFFF_FFFF) as u32;
-    let port = ((val >> 16) & 0xFFFF) as u16;
-    let octets = ip.to_be_bytes();
-    Some(SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-            octets[0], octets[1], octets[2], octets[3],
-        )),
-        port,
-    ))
+
+    fn store(&self, addr: SocketAddr) {
+        if let SocketAddr::V4(v4) = addr {
+            self.ip
+                .store(u32::from_be_bytes(v4.ip().octets()), Ordering::Relaxed);
+            self.port.store(v4.port() as u32, Ordering::Relaxed);
+        }
+    }
+
+    fn load(&self) -> Option<SocketAddr> {
+        let ip = self.ip.load(Ordering::Relaxed);
+        let port = self.port.load(Ordering::Relaxed);
+        if ip == 0 && port == 0 {
+            return None;
+        }
+        let octets = ip.to_be_bytes();
+        Some(SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                octets[0], octets[1], octets[2], octets[3],
+            )),
+            port as u16,
+        ))
+    }
+
+    fn load_raw(&self) -> u64 {
+        let ip = self.ip.load(Ordering::Relaxed) as u64;
+        let port = self.port.load(Ordering::Relaxed) as u64;
+        (ip << 32) | port
+    }
+
+    fn store_raw_parts(&self, addr: SocketAddr) -> u64 {
+        if let SocketAddr::V4(v4) = addr {
+            let ip = u32::from_be_bytes(v4.ip().octets());
+            let port = v4.port() as u32;
+            (ip as u64) << 32 | port as u64
+        } else {
+            0
+        }
+    }
 }
 
 /// Best-effort SO_SNDBUF + SO_RCVBUF increase.
@@ -505,7 +533,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     println!("Local WG-facing socket on {}", local_bind);
 
     // Lock-free shared WG peer address (client mode: egress writes, ingress reads)
-    let shared_wg_peer = Arc::new(AtomicU64::new(0));
+    let shared_wg_peer = Arc::new(SharedAddr::new());
 
     // Shared maps for dynamic_peer routing (egress reads client_map, ingress writes it; vice versa for session_map)
     let client_map: Arc<Mutex<HashMap<u32, SocketAddr>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -530,9 +558,9 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
 
                 // Client: always track WG peer address (handles port changes, NAT rebind)
                 if !is_server {
-                    let new_val = sockaddr_to_u64(src);
-                    if egress_wg_peer.load(Ordering::Relaxed) != new_val {
-                        egress_wg_peer.store(new_val, Ordering::Relaxed);
+                    let new_val = egress_wg_peer.store_raw_parts(src);
+                    if egress_wg_peer.load_raw() != new_val {
+                        egress_wg_peer.store(src);
                     }
                 }
 
@@ -628,7 +656,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     let dest = if is_server {
                         Some(wg_addr)
                     } else {
-                        u64_to_sockaddr(ingress_wg_peer.load(Ordering::Relaxed))
+                        ingress_wg_peer.load()
                     };
                     if let Some(d) = dest {
                         let _ = ingress_local.send_to(&buf[..new_size], d);
