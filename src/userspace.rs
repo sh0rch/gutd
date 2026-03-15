@@ -197,7 +197,7 @@ fn wg_nonce32(wg: &[u8]) -> u32 {
     n0 ^ n1 ^ n2 ^ n3
 }
 
-fn compute_feistel_rk(key: &[u8; 32], rounds: u8) -> [u32; 4] {
+pub fn compute_feistel_rk(key: &[u8; 32], rounds: u8) -> [u32; 4] {
     let ks = chacha_block(key, 0xFFFFFFFE, 0, rounds);
     [ks[0], ks[1], ks[2], ks[3]]
 }
@@ -216,7 +216,7 @@ fn noise_mask(buf: &mut [u8]) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn quic_encap(
+pub fn quic_encap(
     buf: &mut [u8],
     orig_len: usize,
     key: &[u32; 12],
@@ -358,7 +358,7 @@ fn quic_encap(
 /// Returns `true` if the packet is authentic GUT traffic.
 /// In noise mode, unmasking is applied to the first 6 bytes in-place on success;
 /// on failure, the original bytes are restored.
-fn quic_verify(
+pub fn quic_verify(
     buf: &mut [u8],
     orig_len: usize,
     key: &[u32; 12],
@@ -461,7 +461,7 @@ fn quic_verify_inner(
     }
 }
 
-fn quic_decap(
+pub fn quic_decap(
     buf: &mut [u8],
     orig_len: usize,
     key: &[u32; 12],
