@@ -118,7 +118,7 @@ struct peer_endpoint
     __u8 server_ip6[16]; /* Last-seen IPv6 dest (server) */
     __u16 server_port;   /* Last-seen UDP dest port (server) */
     __u8 valid;          /* 1 = endpoint learned, 0 = not yet */
-    __u8 _pad;           /* alignment */
+    __u8 obfs_noise;     /* 1 = this client uses noise mode, 0 = plain quic (auto-detected) */
 };
 
 /* Per-CPU statistics */

@@ -596,6 +596,8 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     // Shared maps for dynamic_peer routing (egress reads client_map, ingress writes it; vice versa for session_map)
     let client_map: Arc<Mutex<HashMap<u32, SocketAddr>>> = Arc::new(Mutex::new(HashMap::new()));
     let session_map: Arc<Mutex<HashMap<u32, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Per-client noise mode (auto-detected by ingress, read by egress in server mode)
+    let client_noise: Arc<Mutex<HashMap<SocketAddr, bool>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // ── Thread 1: EGRESS (WG → encap → remote peer) ──────────────────
     let egress_ext = Arc::clone(&ext_socket);
@@ -603,6 +605,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let egress_wg_peer = Arc::clone(&shared_wg_peer);
     let egress_client_map = Arc::clone(&client_map);
     let egress_session_map = Arc::clone(&session_map);
+    let egress_client_noise = Arc::clone(&client_noise);
     let egress_handle = std::thread::Builder::new()
         .name("gutd-egress".into())
         .spawn(move || {
@@ -645,6 +648,16 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                 };
 
                 if let Some(dest) = egress_dest {
+                    // In server mode, use per-client noise mode (auto-detected by ingress)
+                    let encap_noise = if is_server {
+                        *egress_client_noise
+                            .lock()
+                            .unwrap()
+                            .get(&dest)
+                            .unwrap_or(&noise)
+                    } else {
+                        noise
+                    };
                     if let Some(new_size) = quic_encap(
                         &mut buf,
                         size,
@@ -654,7 +667,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         is_server,
                         src.port(),
                         wg_port,
-                        noise,
+                        encap_noise,
                     ) {
                         let _ = egress_ext.send_to(&buf[..new_size], dest);
                     }
@@ -668,6 +681,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let ingress_wg_peer = Arc::clone(&shared_wg_peer);
     let ingress_client_map = Arc::clone(&client_map);
     let ingress_session_map = Arc::clone(&session_map);
+    let ingress_client_noise = Arc::clone(&client_noise);
     let ingress_handle = std::thread::Builder::new()
         .name("gutd-ingress".into())
         .spawn(move || {
@@ -679,18 +693,37 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     Err(_) => continue,
                 };
 
-                // Verify this is GUT traffic
-                let is_gut = if noise {
-                    size >= GUT_QUIC_SHORT_HEADER_SIZE + 16
-                        && quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, true)
+                // Verify this is GUT traffic — auto-detect noise mode in server mode
+                let (is_gut, detected_noise) = if is_server {
+                    // Try plain QUIC first, then noise
+                    if quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, false) {
+                        (true, false)
+                    } else if quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, true) {
+                        (true, true)
+                    } else {
+                        (false, false)
+                    }
+                } else if noise {
+                    let ok = size >= GUT_QUIC_SHORT_HEADER_SIZE + 16
+                        && quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, true);
+                    (ok, true)
                 } else {
                     let fb = buf[0];
-                    ((fb & 0xC0) == 0xC0 || (fb & 0x40) == 0x40)
-                        && quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, false)
+                    let ok = ((fb & 0xC0) == 0xC0 || (fb & 0x40) == 0x40)
+                        && quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, false);
+                    (ok, false)
                 };
 
                 if !is_gut {
                     continue;
+                }
+
+                // Store detected noise mode per client
+                if is_server {
+                    ingress_client_noise
+                        .lock()
+                        .unwrap()
+                        .insert(src, detected_noise);
                 }
 
                 if let Some((new_size, _wg_sport, _wg_dport)) =

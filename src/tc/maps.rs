@@ -70,7 +70,7 @@ pub struct PeerEndpoint {
     pub server_ip6: [u8; 16],
     pub server_port: u16,
     pub valid: u8,
-    pub _pad: u8,
+    pub obfs_noise: u8,
 }
 
 impl GutConfig {
