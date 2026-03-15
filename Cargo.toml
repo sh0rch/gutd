@@ -3,8 +3,21 @@ name = "gutd"
 version = "2.0.0"
 edition = "2021"
 authors = ["GUT Project"]
-description = "WireGuard traffic obfuscator using TC/XDP eBPF"
+description = "WireGuard traffic obfuscation library — QUIC-like encapsulation, cross-platform userspace proxy, optional eBPF fast path on Linux"
 license = "MIT"
+repository = "https://github.com/sh0rch/gutd"
+homepage = "https://github.com/sh0rch/gutd"
+readme = "README.md"
+keywords = ["wireguard", "vpn", "obfuscation", "quic", "tunnel"]
+categories = ["network-programming", "cryptography"]
+exclude = [
+    "target/",
+    "tmp/",
+    "docker/",
+    "tests/",
+    ".github/",
+    "*.sh",
+]
 
 [lib]
 name = "gutd"
