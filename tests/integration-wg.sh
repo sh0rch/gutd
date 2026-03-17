@@ -50,6 +50,12 @@ warn() {
 # Check dependencies
 check_dependencies() {
     log "Checking dependencies..."
+
+    if command -v apt-get &> /dev/null; then
+        log "Attempting to install required packages via apt-get..."
+        apt-get update && apt-get install -y tcpdump iptables iperf3 wireguard wireguard-tools iproute2
+    fi
+
     local missing=0
     
     for cmd in ip wg iperf3 tcpdump; do

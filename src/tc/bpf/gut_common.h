@@ -24,7 +24,7 @@
  * Long header layout (100 bytes):
  * [0]=0xC0 [1-4]=version [5]=dcid_len [6-13]=dcid [14]=scid_len [15-22]=scid
  * [23]=token_len [24-25]=length [26-29]=PPN [30-31]=inner_sport_be [32-33]=inner_dport_be
- * [34-98]=PRNG noise [99]=pad_len
+ * [34-98]=PRNG gost [99]=pad_len
  * TC egress stores the original WG UDP src/dst ports so XDP can restore them
  * after decapsulation, preserving the conntrack/WG port numbers end-to-end. */
 #define GUT_QUIC_SHORT_HEADER_SIZE 14
@@ -47,9 +47,7 @@
 #define GUT_MIN_OVERHEAD 0
 
 /* Variable-length ballast: ChaCha-derived 0..63 bytes appended inside masked body
- * for packets with inner_len < BALLAST_THRESHOLD.  Receiver determines
  * inner length from IP header; remainder is ballast (ignored). */
-#define BALLAST_THRESHOLD 220
 #define BALLAST_MAX 63
 #define GUT_PMTU_RESERVE 20
 #define GUT_OUTER_OVERHEAD_V4 (8 + 20 + GUT_PMTU_RESERVE)
@@ -101,7 +99,7 @@ struct gut_config
     __u8 tun_peer_ip6[16];       /* Remote veth peer IPv6 (zero if v4 only) */
     __u8 own_http3;              /* Respond to DPI probes via XDP_TX (1=yes) */
     __u8 dynamic_peer;           /* 1 = peer_ip unknown, learn from validated inbound packets */
-    __u8 obfs_noise;             /* 1 = noise mode: XOR quic[0..6] with quic[6..12] to hide QUIC signatures */
+    __u8 obfs_gost;             /* 1 = gost mode: XOR quic[0..6] with quic[6..12] to hide QUIC signatures */
 } __attribute__((packed));
 
 /* Dynamic peer endpoint — learned from validated inbound packets.
@@ -118,7 +116,7 @@ struct peer_endpoint
     __u8 server_ip6[16]; /* Last-seen IPv6 dest (server) */
     __u16 server_port;   /* Last-seen UDP dest port (server) */
     __u8 valid;          /* 1 = endpoint learned, 0 = not yet */
-    __u8 obfs_noise;     /* 1 = this client uses noise mode, 0 = plain quic (auto-detected) */
+    __u8 obfs_gost;     /* 1 = this client uses gost mode, 0 = plain quic (auto-detected) */
 };
 
 /* Per-CPU statistics */
@@ -468,7 +466,6 @@ static __always_inline void mask_data_chacha(__u8 *data, __u32 len,
  * Block 99 (counter=99, same nonce):
  *   bytes  0..62 = ballast data (up to 63 bytes)
  *   byte  63 bits[0:5] = ballast_len (0..63)
- *   Only computed for small packets (inner_len < BALLAST_THRESHOLD).
  *
  * Block 111 (counter=111, same nonce):
  *   words[0] = next_nonce (u32 LE), guaranteed non-zero
@@ -488,7 +485,6 @@ static __always_inline __u32 chacha_ballast(
     __u8 *ballast_out, __u32 inner_len, __u32 max_body,
     const __u32 chacha_init[12], __u32 nonce)
 {
-    if (inner_len >= BALLAST_THRESHOLD)
         return 0;
 
     __u32 ks[16];

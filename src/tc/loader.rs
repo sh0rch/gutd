@@ -1286,9 +1286,9 @@ impl TcBpfManager {
         }
 
         // Obfuscation mode
-        if config.peer().obfs == crate::config::ObfsMode::Noise {
-            gut_config.obfs_noise = 1;
-            eprintln!("  Obfuscation mode: noise (QUIC signatures masked)");
+        if config.peer().obfs == crate::config::ObfsMode::Gost {
+            gut_config.obfs_gost = 1;
+            eprintln!("  Obfuscation mode: gost (QUIC signatures masked)");
         }
 
         Ok(gut_config)

@@ -10,7 +10,6 @@ use crate::proto::mask_balanced::{chacha_block, chacha_block_fast, chacha_init};
 
 const GUT_QUIC_SHORT_HEADER_SIZE: usize = 14;
 const GUT_QUIC_LONG_HEADER_SIZE: usize = 100;
-const BALLAST_THRESHOLD: usize = 220;
 const SOCKET_BUF_SIZE: usize = 4 * 1024 * 1024; // 4 MiB send/recv buffer
 
 /// Lock-free shared SocketAddr (IPv4 + IPv6) using AtomicU32.
@@ -186,6 +185,66 @@ fn tune_udp_buffers(_sock: &UdpSocket) {
     }
 }
 
+fn disable_df(_sock: &UdpSocket) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = _sock.as_raw_fd();
+        let val: libc::c_int = libc::IP_PMTUDISC_DONT;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_MTU_DISCOVER,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_MTU_DISCOVER,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    #[cfg(target_family = "windows")]
+    {
+        use std::os::windows::io::AsRawSocket;
+        const IPPROTO_IP: i32 = 0;
+        const IPPROTO_IPV6: i32 = 41;
+        const IP_DONTFRAGMENT: i32 = 14;
+        const IPV6_DONTFRAG: i32 = 14;
+        extern "system" {
+            fn setsockopt(
+                s: usize,
+                level: i32,
+                optname: i32,
+                optval: *const u8,
+                optlen: i32,
+            ) -> i32;
+        }
+        let fd = _sock.as_raw_socket() as usize;
+        let val: i32 = 0; // FALSE
+        unsafe {
+            setsockopt(
+                fd,
+                IPPROTO_IP,
+                IP_DONTFRAGMENT,
+                &val as *const i32 as *const u8,
+                std::mem::size_of::<i32>() as i32,
+            );
+            setsockopt(
+                fd,
+                IPPROTO_IPV6,
+                IPV6_DONTFRAG,
+                &val as *const i32 as *const u8,
+                std::mem::size_of::<i32>() as i32,
+            );
+        }
+    }
+}
+
 fn wg_nonce32(wg: &[u8]) -> u32 {
     if wg.len() < 32 {
         return 0;
@@ -208,8 +267,8 @@ fn xor16(p: &mut [u8], k: &[u8]) {
     }
 }
 
-/// Noise mode: XOR first 6 bytes with bytes [6..12] to hide QUIC signatures.
-fn noise_mask(buf: &mut [u8]) {
+/// Gost mode: XOR first 6 bytes with bytes [6..12] to hide QUIC signatures.
+fn gost_mask(buf: &mut [u8]) {
     for i in 0..6 {
         buf[i] ^= buf[6 + i];
     }
@@ -225,14 +284,14 @@ pub fn quic_encap(
     is_server: bool,
     wg_sport: u16,
     wg_dport: u16,
-    noise: bool,
-) -> Option<usize> {
+    obfs: crate::config::ObfsMode,
+) -> Option<(usize, u32)> {
     if orig_len < 16 {
         return None;
     }
 
     let wg_type = buf[0] & 0x1F;
-    let quic_hdr_len = if wg_type == 3 {
+    let quic_hdr_len = if obfs != crate::config::ObfsMode::Quic { GUT_QUIC_SHORT_HEADER_SIZE } else if wg_type == 3 {
         // Cookie Reply → QUIC Retry long header (must never be dropped)
         GUT_QUIC_LONG_HEADER_SIZE
     } else if is_server {
@@ -276,27 +335,41 @@ pub fn quic_encap(
     // PPn
     let ppn = ks47[10];
 
-    // Compute Ballast
+    // Compute Padding/Ballast
     let ks69 = chacha_block_fast(key, 69, nonce, rounds);
     let pad_block: [u8; 64] = unsafe { std::mem::transmute(ks69) };
 
-    let pad_len;
-    if orig_len < BALLAST_THRESHOLD {
-        let raw = pad_block[63] & 0x3F;
-        pad_len = (raw as usize) + 1;
+    let mut pad_len = 0;
+    if obfs != crate::config::ObfsMode::Quic {
+        // GOST-like 16-byte alignment emulation
+        let base_udp_size = 8 + quic_hdr_len + orig_len;
+        let remainder = base_udp_size % 16;
+        if remainder != 0 {
+            pad_len = 16 - remainder;
+        }
+    } else {
+        // Plain QUIC mode: random ballast for small packets to hide handshakes
+        if orig_len < 220 {
+            let raw = pad_block[63] & 0x3F;
+            pad_len = (raw as usize) + 1; // 1..64
+        }
+    }
+
+    if pad_len > 0 {
+        let raw = (pad_len - 1) as u8;
         // copy padding to the end
         for i in 0..pad_len {
             buf[wg_off + orig_len + i] = pad_block[i & 0x3F];
         }
         buf[quic_hdr_len - 1] = 0x40 | raw;
     } else {
-        pad_len = 0;
         buf[quic_hdr_len - 1] = 0x00;
     }
 
+    let dcid = feistel32(wg_idx, feistel_rk);
+    
     if quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
         buf[0] = 0x40; // Short
-        let dcid = feistel32(wg_idx, feistel_rk);
         buf[1..5].copy_from_slice(&dcid.to_le_bytes());
         buf[5..9].copy_from_slice(&ppn.to_le_bytes());
         buf[9..13].copy_from_slice(&enc_ports.to_le_bytes());
@@ -312,11 +385,11 @@ pub fn quic_encap(
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u32;
-        let time_noise = feistel32(t_ns, feistel_rk);
-        let noise_b = time_noise.to_le_bytes();
+        let time_gost = feistel32(t_ns, feistel_rk);
+        let gost_b = time_gost.to_le_bytes();
 
         for i in 1..90 {
-            buf[i] = pad_block[(i * 7) & 0x3F] ^ noise_b[i & 3];
+            buf[i] = pad_block[(i * 7) & 0x3F] ^ gost_b[i & 3];
         }
 
         buf[1] = 0x6b;
@@ -324,7 +397,6 @@ pub fn quic_encap(
         buf[3] = 0x43;
         buf[4] = 0xcf;
 
-        let dcid = feistel32(wg_idx, feistel_rk);
         let dcid2 = feistel32(wg_idx ^ 0xDEADBEEF, feistel_rk);
         let scid = feistel32(wg_idx ^ 0xCAFEBABE, feistel_rk);
         let scid2 = feistel32(wg_idx ^ 0x12345678, feistel_rk);
@@ -347,16 +419,16 @@ pub fn quic_encap(
         };
     }
 
-    // Noise mode: XOR first 6 bytes with bytes [6..12] to hide QUIC signatures
-    if noise {
-        noise_mask(buf);
+    // Gost mode: XOR first 6 bytes with bytes [6..12] to hide QUIC signatures
+    if obfs != crate::config::ObfsMode::Quic {
+        gost_mask(buf);
     }
 
-    Some(quic_hdr_len + orig_len + pad_len)
+    Some((quic_hdr_len + orig_len + pad_len, dcid))
 }
 /// Verify DCID and PPN in QUIC header match the crypto-derived values.
 /// Returns `true` if the packet is authentic GUT traffic.
-/// In noise mode, unmasking is applied to the first 6 bytes in-place on success;
+/// In gost mode, unmasking is applied to the first 6 bytes in-place on success;
 /// on failure, the original bytes are restored.
 pub fn quic_verify(
     buf: &mut [u8],
@@ -364,17 +436,17 @@ pub fn quic_verify(
     key: &[u32; 12],
     feistel_rk: &[u32; 4],
     rounds: u8,
-    noise: bool,
+    obfs: crate::config::ObfsMode,
 ) -> bool {
     if orig_len < GUT_QUIC_SHORT_HEADER_SIZE + 16 {
         return false;
     }
 
-    // Noise mode: save first 6 bytes, unmask, restore on failure
-    let saved = if noise {
+    // Gost mode: save first 6 bytes, unmask, restore on failure
+    let saved = if obfs != crate::config::ObfsMode::Quic {
         let mut s = [0u8; 6];
         s.copy_from_slice(&buf[..6]);
-        noise_mask(buf);
+        gost_mask(buf);
         Some(s)
     } else {
         None
@@ -382,7 +454,7 @@ pub fn quic_verify(
 
     let verify_result = quic_verify_inner(buf, orig_len, key, feistel_rk, rounds);
 
-    // On failure in noise mode, restore original bytes
+    // On failure in gost mode, restore original bytes
     if !verify_result {
         if let Some(s) = saved {
             buf[..6].copy_from_slice(&s);
@@ -544,16 +616,18 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let feistel_rk = compute_feistel_rk(&key, rounds);
 
     let is_server = peer.responder;
-    let noise = match std::env::var("GUTD_OBFS").as_deref() {
-        Ok("noise") => true,
-        Ok(_) => peer.obfs == crate::config::ObfsMode::Noise,
-        Err(_) => peer.obfs == crate::config::ObfsMode::Noise,
+    let obfs = match std::env::var("GUTD_OBFS").as_deref() {
+        Ok("syslog") => crate::config::ObfsMode::Syslog,
+        Ok("quic") => crate::config::ObfsMode::Quic,
+        Ok("gost") | Ok("noise") => crate::config::ObfsMode::Gost,
+        Ok(_) => peer.obfs,
+        Err(_) => peer.obfs,
     };
 
     println!(
         "Starting gutd-userspace proxy (dual-thread). is_server={} obfs={}",
         is_server,
-        if noise { "noise" } else { "quic" }
+        std::format!("{:?}", obfs)
     );
 
     let wg_host_str = env::var("GUTD_WG_HOST").unwrap_or_else(|_| peer.wg_host.clone());
@@ -572,11 +646,16 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         Some(format!("{}:{}", peer_ip_str, peer_port).parse()?)
     };
 
-    // ext_socket: GUT traffic to/from remote peer (first configured port).
-    let ext_addr = SocketAddr::new(peer.bind_ip, peer.ports[0]);
-    let ext_socket = Arc::new(UdpSocket::bind(ext_addr)?);
-    tune_udp_buffers(&ext_socket);
-    println!("Listening (ext) on {}", ext_addr);
+    // ext_sockets: GUT traffic to/from remote peer (bound to all configured ports).
+    let mut ext_sockets = Vec::new();
+    for &port in &peer.ports {
+        let ext_addr = SocketAddr::new(peer.bind_ip, port);
+        let ext_socket = Arc::new(UdpSocket::bind(ext_addr)?);
+        tune_udp_buffers(&ext_socket);
+        disable_df(&ext_socket);
+        println!("Listening (ext) on {}", ext_addr);
+        ext_sockets.push(ext_socket);
+    }
 
     // local_socket: WG-facing socket.
     // Client: binds to wg_addr (WG Endpoint = wg_addr).
@@ -588,6 +667,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     };
     let local_socket = Arc::new(UdpSocket::bind(local_bind)?);
     tune_udp_buffers(&local_socket);
+    disable_df(&local_socket);
     println!("Local WG-facing socket on {}", local_bind);
 
     // Lock-free shared WG peer address (client mode: egress writes, ingress reads)
@@ -596,20 +676,23 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     // Shared maps for dynamic_peer routing (egress reads client_map, ingress writes it; vice versa for session_map)
     let client_map: Arc<Mutex<HashMap<u32, SocketAddr>>> = Arc::new(Mutex::new(HashMap::new()));
     let session_map: Arc<Mutex<HashMap<u32, u32>>> = Arc::new(Mutex::new(HashMap::new()));
-    // Per-client noise mode (auto-detected by ingress, read by egress in server mode)
-    let client_noise: Arc<Mutex<HashMap<SocketAddr, bool>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Per-client gost mode (auto-detected by ingress, read by egress in server mode)
+    let client_obfs: Arc<Mutex<HashMap<SocketAddr, crate::config::ObfsMode>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // ── Thread 1: EGRESS (WG → encap → remote peer) ──────────────────
-    let egress_ext = Arc::clone(&ext_socket);
+    let egress_exts: Vec<Arc<UdpSocket>> = ext_sockets.iter().map(|s| Arc::clone(s)).collect();
     let egress_local = Arc::clone(&local_socket);
     let egress_wg_peer = Arc::clone(&shared_wg_peer);
     let egress_client_map = Arc::clone(&client_map);
     let egress_session_map = Arc::clone(&session_map);
-    let egress_client_noise = Arc::clone(&client_noise);
+    let egress_peer = peer.clone();
+    let egress_client_obfs = Arc::clone(&client_obfs);
     let egress_handle = std::thread::Builder::new()
         .name("gutd-egress".into())
         .spawn(move || {
+            let peer = &egress_peer;
             let mut buf = [0u8; 65536];
+            let mut out_buf = [0u8; 65536];
 
             loop {
                 let (size, src) = match egress_local.recv_from(&mut buf) {
@@ -648,17 +731,20 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                 };
 
                 if let Some(dest) = egress_dest {
-                    // In server mode, use per-client noise mode (auto-detected by ingress)
-                    let encap_noise = if is_server {
-                        *egress_client_noise
+                    let encap_obfs = if is_server {
+                        *egress_client_obfs
                             .lock()
                             .unwrap()
                             .get(&dest)
-                            .unwrap_or(&noise)
+                            .unwrap_or(&obfs)
                     } else {
-                        noise
+                        obfs
                     };
-                    if let Some(new_size) = quic_encap(
+
+                    let orig_wg_type = buf[0];
+                    let orig_wg_size = size;
+
+                    if let Some((new_size, dcid)) = quic_encap(
                         &mut buf,
                         size,
                         &key_init,
@@ -667,63 +753,217 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         is_server,
                         src.port(),
                         wg_port,
-                        encap_noise,
+                        encap_obfs,
                     ) {
-                        let _ = egress_ext.send_to(&buf[..new_size], dest);
+                        let mut final_dest = dest;
+                        let mut sock_idx = 0;
+
+                        let final_buf = if encap_obfs == crate::config::ObfsMode::Syslog {
+                            crate::proto::syslog::write_header(&mut out_buf);
+                            let b64_len = crate::proto::base64::encode(
+                                &buf[..new_size],
+                                &mut out_buf[crate::proto::syslog::SYSLOG_HEADER_LEN..],
+                            );
+                            &out_buf[..crate::proto::syslog::SYSLOG_HEADER_LEN + b64_len]
+                        } else if encap_obfs == crate::config::ObfsMode::Sip {
+                            if orig_wg_type == 4 && orig_wg_size > 32 {
+                                // RTP - use DCID from QUIC header as SSRC
+                                let ts = wg_nonce32(&buf[..new_size]);
+                                let seq = (ts & 0xFFFF) as u16;
+                                let ssrc = dcid; // DCID from QUIC = unique session identifier
+                                crate::proto::sip::write_rtp_header(&mut out_buf, seq, ts, ssrc);
+                                out_buf[crate::proto::sip::RTP_HEADER_LEN..crate::proto::sip::RTP_HEADER_LEN + new_size].copy_from_slice(&buf[..new_size]);
+                                
+                                if peer.ports.len() > 1 {
+                                    sock_idx = 1 + (ts as usize % (peer.ports.len() - 1));
+                                    final_dest.set_port(peer.ports[sock_idx]);
+                                }
+
+                                &out_buf[..crate::proto::sip::RTP_HEADER_LEN + new_size]
+                            } else {
+                                let sip_kind = match orig_wg_type {
+                                    1 => crate::proto::sip::SipKind::Register,
+                                    2 => crate::proto::sip::SipKind::Response200,
+                                    3 => crate::proto::sip::SipKind::Response401,
+                                    4 if orig_wg_size == 32 => crate::proto::sip::SipKind::Options,
+                                    _ => crate::proto::sip::SipKind::Message,
+                                };
+                                let sip_domain = peer.sip_domain.as_str();
+                                let b64_len = if matches!(sip_kind, crate::proto::sip::SipKind::Options) {
+                                    0
+                                } else {
+                                    crate::proto::base64::encode(
+                                        &buf[..new_size],
+                                        &mut out_buf[crate::proto::sip::MAX_SIP_HEADER_LEN..],
+                                    )
+                                };
+                                let mut sip_buf = vec![0u8; crate::proto::sip::MAX_SIP_HEADER_LEN];
+                                let src_ip_str = src.ip().to_string();
+                                let dst_ip_str = dest.ip().to_string();
+                                let rtp_port = peer.ports.get(1).copied().unwrap_or(10000);
+                                let date_str = crate::tc::maps::format_sip_date_only(
+                                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+                                );
+                                let sip_header_len = crate::proto::sip::write_header(
+                                    &mut sip_buf,
+                                    sip_kind,
+                                    sip_domain,
+                                    &src_ip_str,
+                                    &dst_ip_str,
+                                    src.port(),
+                                    dest.port(),
+                                    rtp_port,
+                                    b64_len,
+                                    &feistel_rk,
+                                    &date_str,
+                                );
+                                out_buf.copy_within(crate::proto::sip::MAX_SIP_HEADER_LEN..crate::proto::sip::MAX_SIP_HEADER_LEN + b64_len, sip_header_len);
+                                out_buf[..sip_header_len].copy_from_slice(&sip_buf[..sip_header_len]);
+
+                                final_dest.set_port(peer.ports[0]);
+                                println!("[gutd] sending SIP to port {}", peer.ports[0]);
+                                sock_idx = 0;
+
+                                &out_buf[..sip_header_len + b64_len]
+                            }
+                        } else {
+                            &buf[..new_size]
+                        };
+
+                        let _ = egress_exts[sock_idx].send_to(final_buf, final_dest);
                     }
                 }
             }
         })?;
 
     // ── Thread 2: INGRESS (remote peer → decap → WG) ─────────────────
-    let ingress_ext = Arc::clone(&ext_socket);
-    let ingress_local = Arc::clone(&local_socket);
-    let ingress_wg_peer = Arc::clone(&shared_wg_peer);
-    let ingress_client_map = Arc::clone(&client_map);
-    let ingress_session_map = Arc::clone(&session_map);
-    let ingress_client_noise = Arc::clone(&client_noise);
-    let ingress_handle = std::thread::Builder::new()
-        .name("gutd-ingress".into())
-        .spawn(move || {
+    let mut ingress_handles = Vec::new();
+    for (port_idx, ext_sock) in ext_sockets.iter().enumerate() {
+        let ingress_ext = Arc::clone(ext_sock);
+        let ingress_local = Arc::clone(&local_socket);
+        let ingress_wg_peer = Arc::clone(&shared_wg_peer);
+        let ingress_client_map = Arc::clone(&client_map);
+        let ingress_session_map = Arc::clone(&session_map);
+        let ingress_client_obfs = Arc::clone(&client_obfs);
+        let ingress_peer = peer.clone();
+        
+        let ingress_handle = std::thread::Builder::new()
+            .name(format!("gutd-ingress-{}", port_idx))
+            .spawn(move || {
             let mut buf = [0u8; 65536];
+            let mut out_buf = [0u8; 65536];
 
             loop {
-                let (size, src) = match ingress_ext.recv_from(&mut buf) {
+                let (mut size, src) = match ingress_ext.recv_from(&mut buf) {
                     Ok(r) => r,
                     Err(_) => continue,
                 };
 
-                // Verify this is GUT traffic — auto-detect noise mode in server mode
-                let (is_gut, detected_noise) = if is_server {
-                    // Try plain QUIC first, then noise
-                    if quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, false) {
-                        (true, false)
-                    } else if quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, true) {
-                        (true, true)
+                // Decode Prepend+Base64 before any QUIC detection
+                let mut detected_prepend = None;
+                let mut was_sip_probe = false;
+                
+                if crate::proto::syslog::check_header(&buf[..size]) {
+                    if let Some(decoded_len) = crate::proto::base64::decode(&buf[crate::proto::syslog::SYSLOG_HEADER_LEN..size], &mut out_buf) {
+                        buf[..decoded_len].copy_from_slice(&out_buf[..decoded_len]);
+                        size = decoded_len;
+                        detected_prepend = Some(crate::config::ObfsMode::Syslog);
                     } else {
-                        (false, false)
+                        continue;
                     }
-                } else if noise {
-                    let ok = size >= GUT_QUIC_SHORT_HEADER_SIZE + 16
-                        && quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, true);
-                    (ok, true)
-                } else {
-                    let fb = buf[0];
-                    let ok = ((fb & 0xC0) == 0xC0 || (fb & 0x40) == 0x40)
-                        && quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, false);
-                    (ok, false)
-                };
+                } else if let Some(sip_len) = crate::proto::sip::check_header(&buf[..size]) {
+                    if let Some(decoded_len) = crate::proto::base64::decode(&buf[sip_len..size], &mut out_buf) {
+                        buf[..decoded_len].copy_from_slice(&out_buf[..decoded_len]);
+                        size = decoded_len;
+                        detected_prepend = Some(crate::config::ObfsMode::Sip);
+                    } else {
+                        was_sip_probe = true;
+                    }
+                } else if crate::proto::sip::check_rtp_header(&buf[..size]) {
+                    buf.copy_within(crate::proto::sip::RTP_HEADER_LEN..size, 0);
+                    size -= crate::proto::sip::RTP_HEADER_LEN;
+                    detected_prepend = Some(crate::config::ObfsMode::Sip);
+                }
 
-                if !is_gut {
+                if was_sip_probe {
+                    if is_server {
+                        let mut sip_resp = vec![0u8; crate::proto::sip::MAX_SIP_HEADER_LEN];
+                        let src_ip_str = "127.0.0.1".to_string();
+                        let dst_ip_str = src.ip().to_string();
+                        let date_str = crate::tc::maps::format_sip_date_only(
+                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+                        );
+                        let hlen = crate::proto::sip::write_header(
+                            &mut sip_resp,
+                            crate::proto::sip::SipKind::Response401,
+                            ingress_peer.sip_domain.as_str(),
+                            &src_ip_str,
+                            &dst_ip_str,
+                            5060,
+                            src.port(),
+                            10000,
+                            0,
+                            &feistel_rk,
+                            &date_str,
+                        );
+                        let _ = ingress_ext.send_to(&sip_resp[..hlen], src);
+                    }
                     continue;
                 }
 
-                // Store detected noise mode per client
+                // Verify this is GUT traffic — auto-detect gost mode in server mode
+                let (is_gut, detected_obfs) = if is_server {
+                    // Try plain QUIC first, then obfs
+                    if quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Quic) {
+                        (true, crate::config::ObfsMode::Quic)
+                    } else if quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Gost) {
+                        (true, detected_prepend.unwrap_or(crate::config::ObfsMode::Gost))
+                    } else {
+                        (false, crate::config::ObfsMode::Quic)
+                    }
+                } else if obfs != crate::config::ObfsMode::Quic {
+                    let ok = size >= GUT_QUIC_SHORT_HEADER_SIZE + 16
+                        && quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Gost);
+                    (ok, obfs)
+                } else {
+                    let fb = buf[0];
+                    let ok = ((fb & 0xC0) == 0xC0 || (fb & 0x40) == 0x40)
+                        && quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Quic);
+                    (ok, crate::config::ObfsMode::Quic)
+                };
+
+                if !is_gut {
+                    if is_server && detected_prepend == Some(crate::config::ObfsMode::Sip) {
+                        let mut sip_resp = vec![0u8; crate::proto::sip::MAX_SIP_HEADER_LEN];
+                        let src_ip_str = "127.0.0.1".to_string();
+                        let dst_ip_str = src.ip().to_string();
+                        let date_str = crate::tc::maps::format_sip_date_only(
+                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+                        );
+                        let hlen = crate::proto::sip::write_header(
+                            &mut sip_resp,
+                            crate::proto::sip::SipKind::Response401,
+                            ingress_peer.sip_domain.as_str(),
+                            &src_ip_str,
+                            &dst_ip_str,
+                            4500,
+                            src.port(),
+                            10000,
+                            0,
+                            &feistel_rk,
+                            &date_str,
+                        );
+                        let _ = ingress_ext.send_to(&sip_resp[..hlen], src);
+                    }
+                    continue;
+                }
+
+                // Store detected gost mode per client
                 if is_server {
-                    ingress_client_noise
+                    ingress_client_obfs
                         .lock()
                         .unwrap()
-                        .insert(src, detected_noise);
+                        .insert(src, detected_obfs);
                 }
 
                 if let Some((new_size, _wg_sport, _wg_dport)) =
@@ -749,16 +989,19 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     } else {
                         ingress_wg_peer.load()
                     };
+
                     if let Some(d) = dest {
                         let _ = ingress_local.send_to(&buf[..new_size], d);
                     }
                 }
             }
         })?;
+        ingress_handles.push(ingress_handle);
+    }
 
     egress_handle.join().map_err(|_| "egress thread panicked")?;
-    ingress_handle
-        .join()
-        .map_err(|_| "ingress thread panicked")?;
+    for h in ingress_handles {
+        h.join().map_err(|_| "ingress thread panicked")?;
+    }
     Ok(())
 }

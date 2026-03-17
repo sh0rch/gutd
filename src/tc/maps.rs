@@ -7,7 +7,6 @@ use std::net::IpAddr;
 pub const MAX_PORTS: usize = 16;
 pub const GUT_KEY_SIZE: usize = 32;
 // GUT wire overhead per *large* payload (the MTU-relevant case):
-// - Large packets (wg_type=4, wg_len >= BALLAST_THRESHOLD) always use QUIC Short Header (14 B)
 //   and get zero ballast, so only 14 bytes of GUT header are added.
 // - wg_type=1 Handshake Initiation uses Long Header (100 B) but is only 148 bytes total,
 //   so it always fits even with Long Header + full ballast — it never drives fragmentation.
@@ -21,6 +20,30 @@ pub const DEFAULT_INNER_MTU: u16 = 1492;
 
 /// ChaCha round count — compile-time constant, must match BPF CHACHA_ROUNDS.
 pub const CHACHA_ROUNDS: u8 = 4;
+
+/// Format Unix timestamp as RFC 2822 date (only date part, no time)
+pub fn format_sip_date_only(timestamp: u64) -> String {
+    const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    
+    let secs_per_day = 86400u64;
+    let days_since_epoch = timestamp / secs_per_day;
+    let day_of_week = ((days_since_epoch + 4) % 7) as usize; // 1970-01-01 was Thursday
+    
+    // Simplified date calculation (works for 2000-2099)
+    let days = days_since_epoch as i64 + 719468; // Days since 0000-03-01
+    let era = (if days >= 0 { days } else { days - 146096 }) / 146097;
+    let doe = (days - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let year = yoe as i32 + era as i32 * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u8;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as usize - 1;
+    let year = if month <= 1 { year + 1 } else { year };
+    
+    format!("{}, {:02} {} {}", DAYS[day_of_week], day, MONTHS[month], year)
+}
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -54,7 +77,8 @@ pub struct GutConfig {
     pub tun_peer_ip6: [u8; 16], // Remote veth peer IPv6 (zero if v4 only)
     pub own_http3: u8,          // Whether to respond to active DPI probes via XDP_TX
     pub dynamic_peer: u8,       // 1 = peer_ip unknown, learn from validated inbound packets
-    pub obfs_noise: u8,         // 1 = noise mode: XOR quic[0..6] with quic[6..12]
+    pub obfs_gost: u8,         // 1 = gost mode: XOR quic[0..6] with quic[6..12]
+    pub sip_date_str: [u8; 32], // SIP Date string: "Mon, 17 Mar 2026" (time added dynamically)
 }
 
 /// Dynamic peer endpoint — stored in `client_map` (LRU_HASH, key=C_idx).
@@ -70,7 +94,7 @@ pub struct PeerEndpoint {
     pub server_ip6: [u8; 16],
     pub server_port: u16,
     pub valid: u8,
-    pub obfs_noise: u8,
+    pub obfs_gost: u8,
 }
 
 impl GutConfig {
@@ -116,14 +140,37 @@ impl GutConfig {
             tun_peer_ip6: [0u8; 16],
             own_http3: 1,
             dynamic_peer: 0,
-            obfs_noise: 0,
+            obfs_gost: 0,
+            sip_date_str: [0u8; 32],
         };
 
         for (i, &port) in ports.iter().enumerate().take(MAX_PORTS) {
             cfg.ports[i] = port;
         }
+        
+        // Initialize SIP date string with current date
+        cfg.update_sip_date();
 
         cfg
+    }
+    
+    /// Update SIP date string with current date (should be called at midnight)
+    pub fn update_sip_date(&mut self) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let date_str = format_sip_date_only(timestamp);
+        let bytes = date_str.as_bytes();
+        let len = bytes.len().min(31); // Leave space for null terminator
+        self.sip_date_str[..len].copy_from_slice(&bytes[..len]);
+        self.sip_date_str[len] = 0; // Null terminator
+    }
+    
+    /// Get SIP date string as &str
+    pub fn get_sip_date(&self) -> &str {
+        let end = self.sip_date_str.iter().position(|&c| c == 0).unwrap_or(31);
+        std::str::from_utf8(&self.sip_date_str[..end]).unwrap_or("Mon, 01 Jan 2024")
     }
 
     /// Compute partial IP header checksum from fixed fields (saddr, daddr, etc.).
@@ -133,11 +180,11 @@ impl GutConfig {
         let peer_bytes = self.peer_ip.to_ne_bytes();
         // Sum fixed 16-bit words of IP header (in network/big-endian order):
         //   version+ihl+tos = 0x4500
-        //   frag_off (DF)   = 0x4000
+        //   frag_off        = 0x0000 // no DF flag
         //   ttl(64)+proto(17=UDP) = 0x4011
         //   saddr (2 words), daddr (2 words)
         self.partial_ip_csum = 0x4500u32
-            + 0x4000
+            + 0x0000
             + 0x4011
             + ((bind_bytes[0] as u32) << 8 | bind_bytes[1] as u32)
             + ((bind_bytes[2] as u32) << 8 | bind_bytes[3] as u32)
@@ -182,7 +229,7 @@ fn compute_chacha_init(key: &[u8; 32]) -> [u32; 12] {
     init
 }
 
-const _: [(); 256] = [(); std::mem::size_of::<GutConfig>()];
+const _: [(); 288] = [(); std::mem::size_of::<GutConfig>()];
 const _: [(); 56] = [(); std::mem::size_of::<GutStats>()];
 
 impl GutStats {

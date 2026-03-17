@@ -18,7 +18,7 @@
 ## Features
 
 - Fake QUIC Long Header encapsulation to mimic typical HTTPS/QUIC traffic
-- Optional `obfs=noise` mode — masks QUIC signatures so packets look like random UDP
+- Optional `obfs=gost` mode — masks QUIC signatures so packets look like random UDP
 - Built-in lightweight HTTP/3 (QUIC) responder at the XDP layer to mock DPI active probes
 - WireGuard payload masking with ChaCha (4 rounds by default)
 - TC egress hook on a veth pair, XDP ingress hook on the physical NIC
