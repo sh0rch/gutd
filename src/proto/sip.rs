@@ -154,12 +154,26 @@ pub fn parse_timestamp_from_date_header(buf: &[u8]) -> Option<u64> {
 
 /// Generates authentication token using Feistel cipher from timestamp (microseconds)
 /// Uses 100ms granularity for efficiency while maintaining tight security
-fn generate_auth_token(timestamp_us: u64, feistel_key: &[u32; 4]) -> String {
+#[inline]
+fn generate_auth_token(timestamp_us: u64, feistel_key: &[u32; 4]) -> u32 {
     // Round to 100ms granularity (100,000 microseconds)
     // This gives 10 unique tokens per second, tight enough for security
     let ts_100ms = (timestamp_us / 100_000) as u32;
-    let token = crate::proto::feistel::feistel32(ts_100ms, feistel_key);
-    format!("{:08x}", token)
+    crate::proto::feistel::feistel32(ts_100ms, feistel_key)
+}
+
+/// Fast hex encoding into buffer (8 chars for u32)
+#[inline]
+fn write_hex8(buf: &mut [u8], val: u32) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    buf[0] = HEX[((val >> 28) & 0xF) as usize];
+    buf[1] = HEX[((val >> 24) & 0xF) as usize];
+    buf[2] = HEX[((val >> 20) & 0xF) as usize];
+    buf[3] = HEX[((val >> 16) & 0xF) as usize];
+    buf[4] = HEX[((val >> 12) & 0xF) as usize];
+    buf[5] = HEX[((val >> 8) & 0xF) as usize];
+    buf[6] = HEX[((val >> 4) & 0xF) as usize];
+    buf[7] = HEX[(val & 0xF) as usize];
 }
 
 /// Verifies authentication token by extracting timestamp from the packet itself
@@ -187,6 +201,49 @@ pub fn verify_auth_token_from_timestamp(
     token == expected_token
 }
 
+/// Fast path for OPTIONS keepalive (NAT hole punching)
+#[inline]
+fn write_options_keepalive(
+    buf: &mut [u8],
+    src_ip: &str,
+    sport: u16,
+    dport: u16,
+    domain: &str,
+    feistel_key: &[u32; 4],
+    date_str: &str,
+) -> usize {
+    let timestamp_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
+    let auth_token = generate_auth_token(timestamp_us, feistel_key);
+    let from_tag_val = crate::proto::feistel::feistel32(((timestamp_us / 1000) ^ sport as u64) as u32, feistel_key);
+    
+    let time_of_day_us = timestamp_us % 86_400_000_000;
+    let hour = (time_of_day_us / 3_600_000_000) as u8;
+    let minute = ((time_of_day_us % 3_600_000_000) / 60_000_000) as u8;
+    let second = ((time_of_day_us % 60_000_000) / 1_000_000) as u8;
+    let microsecond = (time_of_day_us % 1_000_000) as u32;
+    
+    let mut cursor = std::io::Cursor::new(buf);
+    write!(cursor, "OPTIONS sip:{}@{}:{} SIP/2.0\r\nVia: SIP/2.0/UDP {}:{};branch=z9hG4bK-", 
+        dport, domain, dport, src_ip, sport).unwrap();
+    let pos = cursor.position() as usize;
+    write_hex8(&mut cursor.get_mut()[pos..pos+8], auth_token);
+    cursor.set_position(pos as u64 + 8);
+    write!(cursor, "\r\nMax-Forwards: 70\r\nFrom: <sip:{}@{}>;tag=", sport, domain).unwrap();
+    let pos = cursor.position() as usize;
+    write_hex8(&mut cursor.get_mut()[pos..pos+8], from_tag_val);
+    cursor.set_position(pos as u64 + 8);
+    write!(cursor, "\r\nTo: <sip:{}@{}>\r\nCall-ID: ", dport, domain).unwrap();
+    let pos = cursor.position() as usize;
+    write_hex8(&mut cursor.get_mut()[pos..pos+8], auth_token);
+    cursor.set_position(pos as u64 + 8);
+    write!(cursor, "@{}\r\nCSeq: {} OPTIONS\r\nDate: {} {:02}:{:02}:{:02}.{:06} GMT\r\nContact: <sip:{}@{}:{}>\r\nUser-Agent: Asterisk PBX 16.2.0\r\nContent-Length: 0\r\n\r\n",
+        domain, ((timestamp_us / 1000) % 1000) + 1, date_str, hour, minute, second, microsecond, sport, src_ip, sport).unwrap();
+    cursor.position() as usize
+}
+
 /// Writes a dynamic SIP header into the buffer with real data.
 /// Returns the number of bytes written.
 pub fn write_header(
@@ -202,6 +259,11 @@ pub fn write_header(
     feistel_key: &[u32; 4],
     date_str: &str, // Pre-formatted date string (e.g., "Mon, 17 Mar 2026")
 ) -> usize {
+    // Fast path for OPTIONS keepalive (empty payload, very frequent)
+    if matches!(kind, SipKind::Options) && payload_len == 0 {
+        return write_options_keepalive(buf, src_ip, sport, dport, domain, feistel_key, date_str);
+    }
+    
     let mut cursor = std::io::Cursor::new(buf);
     
     // Generate timestamp-based authentication (microseconds for Feistel)
@@ -213,10 +275,8 @@ pub fn write_header(
     
     // Generate dynamic identifiers
     let session_id = timestamp_us / 1000; // milliseconds for session ID
-    let from_tag = format!("{:x}", crate::proto::feistel::feistel32(((timestamp_us / 1000) ^ sport as u64) as u32, feistel_key));
-    let to_tag = format!("{:x}", crate::proto::feistel::feistel32(((timestamp_us / 1000) ^ dport as u64) as u32, feistel_key));
-    let branch = format!("z9hG4bK-{}", auth_token);
-    let call_id = format!("{}@{}", auth_token, domain);
+    let from_tag_val = crate::proto::feistel::feistel32(((timestamp_us / 1000) ^ sport as u64) as u32, feistel_key);
+    let to_tag_val = crate::proto::feistel::feistel32(((timestamp_us / 1000) ^ dport as u64) as u32, feistel_key);
 
     match kind {
         SipKind::Register => {
@@ -233,23 +293,40 @@ pub fn write_header(
         },
         SipKind::Response401 => {
             write!(cursor, "SIP/2.0 401 Unauthorized\r\n").unwrap();
-            let nonce = format!("{:x}", crate::proto::feistel::feistel32((timestamp_us / 1000) as u32, feistel_key));
-            write!(cursor, "WWW-Authenticate: Digest realm=\"{}\", nonce=\"{}\", algorithm=MD5\r\n", domain, nonce).unwrap();
+            let nonce_val = crate::proto::feistel::feistel32((timestamp_us / 1000) as u32, feistel_key);
+            write!(cursor, "WWW-Authenticate: Digest realm=\"{}\", nonce=\"", domain).unwrap();
+            let pos = cursor.position() as usize;
+            write_hex8(&mut cursor.get_mut()[pos..pos+8], nonce_val);
+            cursor.set_position(pos as u64 + 8);
+            write!(cursor, "\", algorithm=MD5\r\n").unwrap();
         }
     }
 
-    write!(cursor, "Via: SIP/2.0/UDP {}:{};branch={}\r\n", src_ip, sport, branch).unwrap();
-    write!(cursor, "Max-Forwards: 70\r\n").unwrap();
-    write!(cursor, "From: <sip:{}@{}>;tag={}\r\n", sport, domain, from_tag).unwrap();
-    write!(cursor, "To: <sip:{}@{}>", dport, domain).unwrap();
+    write!(cursor, "Via: SIP/2.0/UDP {}:{};branch=z9hG4bK-", src_ip, sport).unwrap();
+    let pos = cursor.position() as usize;
+    write_hex8(&mut cursor.get_mut()[pos..pos+8], auth_token);
+    cursor.set_position(pos as u64 + 8);
+    write!(cursor, "\r\nMax-Forwards: 70\r\nFrom: <sip:{}@{}>;tag=", sport, domain).unwrap();
+    let pos = cursor.position() as usize;
+    write_hex8(&mut cursor.get_mut()[pos..pos+8], from_tag_val);
+    cursor.set_position(pos as u64 + 8);
+    write!(cursor, "\r\nTo: <sip:{}@{}>", dport, domain).unwrap();
     
     if matches!(kind, SipKind::Response200 | SipKind::Response401) {
-        write!(cursor, ";tag={}\r\n", to_tag).unwrap();
+        write!(cursor, ";tag=").unwrap();
+        let pos = cursor.position() as usize;
+        write_hex8(&mut cursor.get_mut()[pos..pos+8], to_tag_val);
+        cursor.set_position(pos as u64 + 8);
+        write!(cursor, "\r\n").unwrap();
     } else {
         write!(cursor, "\r\n").unwrap();
     }
     
-    write!(cursor, "Call-ID: {}\r\n", call_id).unwrap();
+    write!(cursor, "Call-ID: ").unwrap();
+    let pos = cursor.position() as usize;
+    write_hex8(&mut cursor.get_mut()[pos..pos+8], auth_token);
+    cursor.set_position(pos as u64 + 8);
+    write!(cursor, "@{}\r\n", domain).unwrap();
     
     let cseq_method = match kind {
         SipKind::Register | SipKind::Response200 | SipKind::Response401 => "REGISTER",
