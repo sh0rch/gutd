@@ -89,7 +89,6 @@ pub fn chacha_next_ids(key: &[u8; 32], nonce: u32, rounds: u8) -> (u32, u32) {
 
 /// Compute ballast data + length from ChaCha block 99.
 /// Returns (ballast_bytes, ballast_len) where ballast_len ∈ [0, 63].
-/// Only meaningful when inner_len < `BALLAST_THRESHOLD` (caller checks).
 pub fn chacha_ballast(key: &[u8; 32], nonce: u32, rounds: u8) -> ([u8; 63], usize) {
     let ks = chacha_block(key, 99, nonce, rounds);
     let bytes: [u8; 64] = unsafe { std::mem::transmute(ks) };

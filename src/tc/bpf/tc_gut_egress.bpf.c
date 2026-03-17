@@ -134,31 +134,6 @@ int gut_egress(struct __sk_buff *skb)
     chacha_block(ks69, cfg->chacha_init, 69, nonce);
     __u8 *pad_block = (__u8 *)ks69;
 
-    /* Ballast for small packets: uniform [1..64] bytes.
-     * Wire encoding: last QUIC header byte = 0x40 | (raw & 0x3F)
-     *   bit6 (0x40) = "has ballast" flag
-     *   bits[0:5]   = raw ∈ [0..63], actual ballast = raw+1 → [1..64]
-     * Large packets (no ballast): the byte stays 0x00 — bit6 clear = no trim.
-     * Verifier note: after bpf_skb_change_tail spills pad_len to stack the
-     * tnum loses umin; explicit re-check restores [1,64] before the store. */
-    __u32 pad_len = 0;
-    if (wg_len < BALLAST_THRESHOLD)
-    {
-        __u32 raw = pad_block[63] & 0x3F; /* [0..63] uniform */
-        pad_len = raw + 1;                /* [1..64] */
-        if (bpf_skb_change_tail(skb, skb->len + pad_len, 0) < 0)
-            return TC_ACT_OK;
-        /* Re-establish [1,64] for verifier after potential stack reload. */
-        if (pad_len == 0 || pad_len > 64)
-            return TC_ACT_OK;
-        if (bpf_skb_store_bytes(skb, skb->len - pad_len, pad_block, pad_len, 0) < 0)
-            return TC_ACT_OK;
-    }
-
-    __u32 *ks47 = (__u32 *)(scratch + 128);
-    chacha_block(ks47, cfg->chacha_init, 47, nonce);
-    __u8 *ks47_b = (__u8 *)ks47;
-
     // Extract index before masking for stable connection IDs
     __u32 wg_idx = 0;
     if (wg_type == 2)
@@ -168,18 +143,11 @@ int gut_egress(struct __sk_buff *skb)
 
     /* ── Multi-client dynamic peer: session bridging & routing ─────
      * TC egress sees raw (unmasked) WG on the veth.
-     *   Type 1 (init): sender_index [4..8] only.  In dynamic_peer server mode
-     *     the server should not initiate rekeys — drop; client will re-initiate.
+     *   Type 1 (init): sender_index [4..8] only.
      *   Type 2 (resp): sender=S_idx [4..8], receiver=C_idx [8..12].
-     *     Build bridge: session_map[S_idx] = C_idx so XDP ingress can map
-     *     future Type 4 packets (keyed by S_idx on ingress) back to C_idx.
-     *   Type 4 (data): receiver=C_idx [4..8] — direct lookup in client_map.
-     *
-     * Note: wg_idx (used for DCID) reads bytes[8..12] for non-Type-1, which is
-     * correct for DCID matching but NOT for routing.  Type 4 receiver_index lives
-     * at bytes[4..8], so we extract a separate c_idx for the client_map lookup.
+     *   Type 4 (data): receiver=C_idx [4..8].
      */
-    __u32 c_idx = wg_idx; /* correct for Type 2: bytes[8..12] = receiver_index = C_idx */
+    __u32 c_idx = wg_idx;
     if (cfg->dynamic_peer)
     {
         if (wg_type == 1)
@@ -187,18 +155,60 @@ int gut_egress(struct __sk_buff *skb)
 
         if (wg_type == 4 || wg_type == 3)
         {
-            /* Type 3/4: receiver_index at bytes[4..8] = C_idx */
             __builtin_memcpy(&c_idx, wg_head + 4, 4);
         }
 
         if (wg_type == 2)
         {
             __u32 s_idx = 0;
-            __builtin_memcpy(&s_idx, wg_head + 4, 4); /* sender_index = S_idx */
-            /* c_idx = wg_idx = wg_head[8..12] = receiver_index = C_idx for Type 2 */
+            __builtin_memcpy(&s_idx, wg_head + 4, 4);
             bpf_map_update_elem(&session_map, &s_idx, &c_idx, BPF_ANY);
         }
     }
+
+    __u8 use_gost = cfg->obfs_gost;
+    if (cfg->dynamic_peer)
+    {
+        struct peer_endpoint *gost_ep = bpf_map_lookup_elem(&client_map, &c_idx);
+        if (gost_ep && gost_ep->valid)
+            use_gost = gost_ep->obfs_gost;
+    }
+
+    __u32 pad_len = 0;
+    if (use_gost)
+    {
+        /* 16-byte alignment padding (Kuznyechik/AES block size emulation). */
+        __u32 base_udp_size = 8 + quic_hdr_len + wg_len;
+        __u32 remainder = base_udp_size % 16;
+        if (remainder != 0)
+        {
+            pad_len = 16 - remainder; /* [1..15] */
+        }
+    }
+    else
+    {
+        /* Plain QUIC mode: random ballast [1..64] for small packets */
+        if (wg_len < 220)
+        {
+            __u32 raw = pad_block[63] & 0x3F; /* [0..63] uniform */
+            pad_len = raw + 1;                /* [1..64] */
+        }
+    }
+
+    if (pad_len > 0)
+    {
+        if (bpf_skb_change_tail(skb, skb->len + pad_len, 0) < 0)
+            return TC_ACT_OK;
+        /* Re-establish bounds for verifier. */
+        if (pad_len > 64)
+            return TC_ACT_OK;
+        if (bpf_skb_store_bytes(skb, skb->len - pad_len, pad_block, pad_len, 0) < 0)
+            return TC_ACT_OK;
+    }
+
+    __u32 *ks47 = (__u32 *)(scratch + 128);
+    chacha_block(ks47, cfg->chacha_init, 47, nonce);
+    __u8 *ks47_b = (__u8 *)ks47;
 
     // Extract Protected Packet Number (PPN) from unused 47th block keystream
     __u32 ppn = ks47[10];
@@ -288,12 +298,12 @@ int gut_egress(struct __sk_buff *skb)
         /* 0xC0 = QUIC Initial (client Type 1), 0xF0 = QUIC Retry (Cookie Reply Type 3) */
         quic[0] = (wg_type == 3) ? 0xF0 : 0xC0;
 
-        __u32 time_noise = feistel32((__u32)bpf_ktime_get_ns(), cfg->feistel_rk);
-        __u8 *noise_b = (__u8 *)&time_noise;
+        __u32 time_gost = feistel32((__u32)bpf_ktime_get_ns(), cfg->feistel_rk);
+        __u8 *gost_b = (__u8 *)&time_gost;
 
 #pragma unroll
         for (int i = 1; i < 90; i++)
-            quic[i] = pad_block[(i * 7) & 0x3F] ^ noise_b[i & 3]; // fill with PRNG noise
+            quic[i] = pad_block[(i * 7) & 0x3F] ^ gost_b[i & 3]; // fill with PRNG gost
 
         // Version (QUICv2 = 0x6b3343cf)
         quic[1] = 0x6b;
@@ -325,25 +335,15 @@ int gut_egress(struct __sk_buff *skb)
         // Bytes 30-33: feistel-encrypted ports (sport<<16|dport); XDP decrypts with feistel32_inv
         __builtin_memcpy((__u8 *)quic + 30, &enc_ports, 4);
 
-        // Keep the rest filled with the PRNG noise generated above. No open text SNI!
+        // Keep the rest filled with the PRNG gost generated above. No open text SNI!
     }
     /* Encode ballast info in the last QUIC header byte:
      *   0x00           = no ballast (large packet path, pad_len==0)
      *   0x40 | raw     = has ballast; actual len = (raw & 0x3F) + 1 → [1..64] */
-    quic[quic_hdr_len - 1] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
+    quic[quic_hdr_len - 1] = (!use_gost && pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
 
-    /* Per-client noise mode: in dynamic_peer mode read from client_map,
-     * otherwise fall back to global cfg->obfs_noise. */
-    __u8 use_noise = cfg->obfs_noise;
-    if (cfg->dynamic_peer)
-    {
-        struct peer_endpoint *noise_ep = bpf_map_lookup_elem(&client_map, &c_idx);
-        if (noise_ep && noise_ep->valid)
-            use_noise = noise_ep->obfs_noise;
-    }
-
-    /* Noise mode: XOR first 6 bytes with bytes [6..12] to hide QUIC signatures */
-    if (use_noise)
+    /* Gost mode: XOR first 6 bytes with bytes [6..12] to hide QUIC signatures */
+    if (use_gost)
     {
 #pragma unroll
         for (int i = 0; i < 6; i++)
@@ -364,6 +364,7 @@ int gut_egress(struct __sk_buff *skb)
         udph->source = bpf_htons(tunnel_port);
         udph->dest = bpf_htons(tunnel_port);
 
+        iph->frag_off = 0; // Clear DF (Don't Fragment) flag
         iph->check = 0;
 
         /* Dynamic peer: read destination from client_map keyed by c_idx.

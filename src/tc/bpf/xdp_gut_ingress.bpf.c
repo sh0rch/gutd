@@ -103,13 +103,13 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     if (wg_len < WG_MIN_PACKET || wg + WG_MIN_PACKET > (__u8 *)data_end || wg + wg_len > (__u8 *)data_end)
         return -1;
 
-    /* Auto-detect noise vs plain QUIC per client.
+    /* Auto-detect gost vs plain QUIC per client.
      * Try plain QUIC first (check first byte for 0x40/0xC0/0xF0).
-     * If that fails, apply noise unmask and check again. */
+     * If that fails, apply gost unmask and check again. */
     if (wg + 12 > (__u8 *)data_end)
         return -1;
 
-    __u8 detected_noise = 0;
+    __u8 detected_gost = 0;
     __u32 quic_hdr_len = 0;
     if (wg[0] == 0x40)
     {
@@ -127,11 +127,11 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     }
     else
     {
-        /* First byte is not a valid QUIC header — try noise unmask */
+        /* First byte is not a valid QUIC header — try gost unmask */
 #pragma unroll
         for (int i = 0; i < 6; i++)
             wg[i] ^= wg[6 + i];
-        detected_noise = 1;
+        detected_gost = 1;
 
         if (wg[0] == 0x40)
         {
@@ -149,7 +149,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         }
         else
         {
-            return -1; /* neither plain nor noise — not GUT traffic */
+            return -1; /* neither plain nor gost — not GUT traffic */
         }
     }
 
@@ -264,7 +264,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             ep.port = bpf_ntohs(udph->source);
             ep.server_port = bpf_ntohs(udph->dest);
             ep.valid = 1;
-            ep.obfs_noise = detected_noise;
+            ep.obfs_gost = detected_gost;
             bpf_map_update_elem(&client_map, &client_idx, &ep, BPF_ANY);
             bpf_debug("XDP: client_map[%u] updated wg_type=%u port=%u", client_idx, wg_type, ep.port);
         }
@@ -676,7 +676,9 @@ int xdp_gut_ingress(struct xdp_md *ctx)
 
     if (gut_xdp_core(ctx, cfg) != 0)
     {
-        if (cfg->own_http3 == 1)
+        // If we use gost mode (GOST/IPsec spoofing), we MUST NOT reply 
+        // with pure QUIC Version Negotiation packets to active probes.
+        if (cfg->own_http3 == 1 && cfg->obfs_gost == 0)
         {
             if (handle_quic_probe(ctx) == XDP_TX)
                 return XDP_TX;
