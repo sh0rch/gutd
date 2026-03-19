@@ -9,6 +9,7 @@ use crate::proto::feistel::{feistel32, feistel32_inv, FEISTEL_SALT_PORTS};
 use crate::proto::mask_balanced::{chacha_block, chacha_block_fast, chacha_init};
 
 const GUT_QUIC_SHORT_HEADER_SIZE: usize = 16;
+const GUT_GOST_HEADER_SIZE: usize = 10;
 const GUT_QUIC_LONG_HEADER_SIZE: usize = 1200;
 const SOCKET_BUF_SIZE: usize = 4 * 1024 * 1024; // 4 MiB send/recv buffer
 
@@ -267,12 +268,7 @@ fn xor16(p: &mut [u8], k: &[u8]) {
     }
 }
 
-/// Gost mode: XOR first 6 bytes (including byte 5 DCID length) with bytes [6..12].
-fn gost_mask(buf: &mut [u8]) {
-    for i in 0..6 {
-        buf[i] ^= buf[6 + i];
-    }
-}
+
 
 #[allow(clippy::too_many_arguments)]
 pub fn quic_encap(
@@ -292,7 +288,7 @@ pub fn quic_encap(
     }
 
     let wg_type = buf[0] & 0x1F;
-    let quic_hdr_len = if obfs != crate::config::ObfsMode::Quic { GUT_QUIC_SHORT_HEADER_SIZE } else if wg_type == 3 {
+    let quic_hdr_len = if obfs != crate::config::ObfsMode::Quic { GUT_GOST_HEADER_SIZE } else if wg_type == 3 {
         // Cookie Reply → QUIC Retry long header (must never be dropped)
         GUT_QUIC_LONG_HEADER_SIZE
     } else if is_server {
@@ -344,19 +340,23 @@ pub fn quic_encap(
     let pad_block: [u8; 64] = unsafe { std::mem::transmute(ks69) };
 
     let mut pad_len = 0;
-    if obfs != crate::config::ObfsMode::Quic {
+    if obfs == crate::config::ObfsMode::Gost {
         // GOST-like 16-byte alignment emulation
         let base_udp_size = 8 + quic_hdr_len + orig_len;
         let remainder = base_udp_size % 16;
         if remainder != 0 {
             pad_len = 16 - remainder;
         }
-    } else {
+    } else if obfs == crate::config::ObfsMode::Quic {
         // Plain QUIC mode: random ballast for small packets to hide handshakes
         if orig_len < 220 {
             let raw = pad_block[63] & 0x3F;
             pad_len = (raw as usize) + 1; // 1..64
         }
+    } else {
+        // SIP / Syslog mode: random padding to break 16-byte signature of WG payloads
+        let raw = pad_block[63] & 0x1F;
+        pad_len = (raw as usize) + 1; // 1..32
     }
 
     if pad_len > 0 {
@@ -372,7 +372,12 @@ pub fn quic_encap(
 
     let dcid = feistel32(wg_idx, feistel_rk);
     
-    if quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
+    if quic_hdr_len == GUT_GOST_HEADER_SIZE {
+        buf[0..4].copy_from_slice(&ppn.to_le_bytes());
+        buf[4..8].copy_from_slice(&enc_ports.to_le_bytes());
+        buf[8] = 0x00;
+        buf[9] = if pad_len > 0 { 0x40 | ((pad_len as u8 - 1) & 0x3F) } else { 0 };
+    } else if quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
         buf[0] = 0x40; // Short
         buf[1..5].copy_from_slice(&dcid.to_le_bytes());
         buf[5] = 0x01; // DCID length byte in standard QUIC header
@@ -488,14 +493,14 @@ pub fn quic_encap(
             nonce_iv[15] ^= i as u8; // Simple block counter in last byte
             let mut ks = [0u8; 16];
             crate::crypto::aes128_encrypt_block(&rk, &nonce_iv, &mut ks);
-            for j in 0..16 {
+            for (j, k_val) in ks.iter().enumerate() {
                 let idx = i * 16 + j;
                 if idx < crypto_frame.len() {
                     // For standard DPI decryptability, we MUST overwrite the buffer
                     // exactly as AES-CTR would. If we XOR with random buf entropy, 
                     // DPI will get garbage when it decrypts using ks.
                     // nDPI successfully decrypted it previously because we did just `=`
-                    buf[sni_pos + idx] = crypto_frame[idx] ^ ks[j];
+                    buf[sni_pos + idx] = crypto_frame[idx] ^ *k_val;
                 }
             }
         }
@@ -521,10 +526,7 @@ pub fn quic_encap(
         };
     }
 
-    // Gost mode: XOR first 6 bytes with bytes [6..12] to hide QUIC signatures
-    if obfs != crate::config::ObfsMode::Quic {
-        gost_mask(buf);
-    }
+
 
     Some((quic_hdr_len + orig_len + pad_len, dcid))
 }
@@ -540,30 +542,24 @@ pub fn quic_verify(
     rounds: u8,
     obfs: crate::config::ObfsMode,
 ) -> bool {
-    if orig_len < GUT_QUIC_SHORT_HEADER_SIZE + 16 {
-        return false;
+    if obfs != crate::config::ObfsMode::Quic {
+        if orig_len < GUT_GOST_HEADER_SIZE + 32 { return false; }
+        let pad_byte = buf[GUT_GOST_HEADER_SIZE - 1];
+        let ballast_len = if (pad_byte & 0x40) != 0 { ((pad_byte & 0x3F) as usize) + 1 } else { 0 };
+        let wg_off = GUT_GOST_HEADER_SIZE;
+        let wg_len = orig_len - wg_off;
+        if ballast_len > wg_len { return false; }
+        let actual_wg_len = wg_len - ballast_len;
+        if actual_wg_len < 32 { return false; }
+        
+        let nonce = wg_nonce32(&buf[wg_off..wg_off + actual_wg_len]);
+        let ks47 = chacha_block_fast(key, 47, nonce, rounds);
+        let expected_ppn = ks47[10];
+        let pkt_ppn = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        return pkt_ppn == expected_ppn;
     }
-
-    // Gost mode: save first 6 bytes, unmask, restore on failure
-    let saved = if obfs != crate::config::ObfsMode::Quic {
-        let mut s = [0u8; 6];
-        s.copy_from_slice(&buf[..6]);
-        gost_mask(buf);
-        Some(s)
-    } else {
-        None
-    };
-
-    let verify_result = quic_verify_inner(buf, orig_len, key, feistel_rk, rounds);
-
-    // On failure in gost mode, restore original bytes
-    if !verify_result {
-        if let Some(s) = saved {
-            buf[..6].copy_from_slice(&s);
-        }
-    }
-
-    verify_result
+    
+    quic_verify_inner(buf, orig_len, key, feistel_rk, rounds)
 }
 
 fn quic_verify_inner(
@@ -666,20 +662,24 @@ pub fn quic_decap(
     key: &[u32; 12],
     feistel_rk: &[u32; 4],
     rounds: u8,
+    obfs: crate::config::ObfsMode,
 ) -> Option<(usize, u16, u16)> {
-    if orig_len < GUT_QUIC_SHORT_HEADER_SIZE + 16 {
+    let quic_hdr_len = if obfs != crate::config::ObfsMode::Quic {
+        GUT_GOST_HEADER_SIZE
+    } else {
+        let first_byte = buf[0];
+        if (first_byte & 0x80) == 0x80 {
+            GUT_QUIC_LONG_HEADER_SIZE
+        } else if (first_byte & 0x40) == 0x40 {
+            GUT_QUIC_SHORT_HEADER_SIZE
+        } else {
+            return None;
+        }
+    };
+
+    if orig_len < quic_hdr_len + 16 {
         return None;
     }
-
-    let first_byte = buf[0];
-    let quic_hdr_len = if (first_byte & 0x80) == 0x80 {
-        // High bit set means Long Header (regardless of other bits)
-        GUT_QUIC_LONG_HEADER_SIZE
-    } else if (first_byte & 0x40) == 0x40 {
-        GUT_QUIC_SHORT_HEADER_SIZE
-    } else {
-        return None;
-    };
 
     if orig_len < quic_hdr_len + 16 {
         return None;
@@ -711,7 +711,9 @@ pub fn quic_decap(
     }
 
     // We can decrypt ports from QUIC Header
-    let enc_ports = if quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
+    let enc_ports = if quic_hdr_len == GUT_GOST_HEADER_SIZE {
+        u32::from_le_bytes(buf[4..8].try_into().unwrap())
+    } else if quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
         u32::from_le_bytes(buf[10..14].try_into().unwrap())
     } else {
         u32::from_le_bytes(buf[24..28].try_into().unwrap()) // Ports were hidden in Token!
@@ -851,9 +853,9 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     };
 
     println!(
-        "Starting gutd-userspace proxy (dual-thread). is_server={} obfs={}",
+        "Starting gutd-userspace proxy (dual-thread). is_server={} obfs={:?}",
         is_server,
-        std::format!("{:?}", obfs)
+        obfs
     );
 
     let wg_host_str = env::var("GUTD_WG_HOST").unwrap_or_else(|_| peer.wg_host.clone());
@@ -906,7 +908,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let client_obfs: Arc<Mutex<HashMap<SocketAddr, crate::config::ObfsMode>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // ── Thread 1: EGRESS (WG → encap → remote peer) ──────────────────
-    let egress_exts: Vec<Arc<UdpSocket>> = ext_sockets.iter().map(|s| Arc::clone(s)).collect();
+    let egress_exts: Vec<Arc<UdpSocket>> = ext_sockets.iter().map(Arc::clone).collect();
     let egress_local = Arc::clone(&local_socket);
     let egress_wg_peer = Arc::clone(&shared_wg_peer);
     let egress_client_map = Arc::clone(&client_map);
@@ -1089,6 +1091,8 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                 // Decode Prepend+Base64 before any QUIC detection
                 let mut detected_prepend = None;
                 let mut was_sip_probe = false;
+                let mut was_rtp = false;
+                let mut sip_probe_kind = crate::proto::sip::SipKind::Response401;
                 
                 if crate::proto::syslog::check_header(&buf[..size]) {
                     if let Some(decoded_len) = crate::proto::base64::decode(&buf[crate::proto::syslog::SYSLOG_HEADER_LEN..size], &mut out_buf) {
@@ -1099,10 +1103,22 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         continue;
                     }
                 } else if let Some(sip_len) = crate::proto::sip::check_header(&buf[..size]) {
+                    if buf[..size].starts_with(b"OPTIONS ") {
+                        sip_probe_kind = crate::proto::sip::SipKind::Response200;
+                    } else if buf[..size].starts_with(b"REGISTER ") {
+                        sip_probe_kind = crate::proto::sip::SipKind::Response401;
+                    } else {
+                        sip_probe_kind = crate::proto::sip::SipKind::Response403;
+                    }
+
                     if let Some(decoded_len) = crate::proto::base64::decode(&buf[sip_len..size], &mut out_buf) {
-                        buf[..decoded_len].copy_from_slice(&out_buf[..decoded_len]);
-                        size = decoded_len;
-                        detected_prepend = Some(crate::config::ObfsMode::Sip);
+                        if decoded_len > 0 {
+                            buf[..decoded_len].copy_from_slice(&out_buf[..decoded_len]);
+                            size = decoded_len;
+                            detected_prepend = Some(crate::config::ObfsMode::Sip);
+                        } else {
+                            was_sip_probe = true;
+                        }
                     } else {
                         was_sip_probe = true;
                     }
@@ -1110,6 +1126,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     buf.copy_within(crate::proto::sip::RTP_HEADER_LEN..size, 0);
                     size -= crate::proto::sip::RTP_HEADER_LEN;
                     detected_prepend = Some(crate::config::ObfsMode::Sip);
+                    was_rtp = true;
                 }
 
                 if was_sip_probe {
@@ -1122,7 +1139,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         );
                         let hlen = crate::proto::sip::write_header(
                             &mut sip_resp,
-                            crate::proto::sip::SipKind::Response401,
+                            sip_probe_kind,
                             ingress_peer.sip_domain.as_str(),
                             &src_ip_str,
                             &dst_ip_str,
@@ -1145,9 +1162,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     original_start.copy_from_slice(&buf[..6]);
 
                     // Try plain QUIC first
-                    if (buf[0] & 0x40) == 0x40 && quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Quic) {
-                        (true, crate::config::ObfsMode::Quic)
-                    } else if (buf[0] & 0x80) == 0x80 && quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Quic) {
+                    if ((buf[0] & 0x40) == 0x40 || (buf[0] & 0x80) == 0x80) && quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Quic) {
                         (true, crate::config::ObfsMode::Quic)
                     } else {
                         // Restore and try GOST/Sip/Syslog (they all use gost_mask)
@@ -1171,7 +1186,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
 
                 if !is_gut {
                     if is_server {
-                        if detected_prepend == Some(crate::config::ObfsMode::Sip) {
+                        if detected_prepend == Some(crate::config::ObfsMode::Sip) && !was_rtp {
                             let mut sip_resp = vec![0u8; crate::proto::sip::MAX_SIP_HEADER_LEN];
                             let src_ip_str = "127.0.0.1".to_string();
                             let dst_ip_str = src.ip().to_string();
@@ -1179,8 +1194,8 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
                             );
                             let hlen = crate::proto::sip::write_header(
-                                &mut sip_resp,
-                                crate::proto::sip::SipKind::Response401,
+                            &mut sip_resp,
+                            sip_probe_kind,
                                 ingress_peer.sip_domain.as_str(),
                                 &src_ip_str,
                                 &dst_ip_str,
@@ -1210,7 +1225,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                 }
 
                 if let Some((new_size, _wg_sport, _wg_dport)) =
-                    quic_decap(&mut buf, size, &key_init, &feistel_rk, rounds)
+                    quic_decap(&mut buf, size, &key_init, &feistel_rk, rounds, detected_obfs)
                 {
                     if dynamic_peer && new_size >= 8 {
                         let wg_type = buf[0] & 0x1F;

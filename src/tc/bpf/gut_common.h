@@ -28,6 +28,7 @@
  * TC egress stores the original WG UDP src/dst ports so XDP can restore them
  * after decapsulation, preserving the conntrack/WG port numbers end-to-end. */
 #define GUT_QUIC_SHORT_HEADER_SIZE 16
+#define GUT_GOST_HEADER_SIZE 10
 #define GUT_QUIC_LONG_HEADER_SIZE 1200
 #define GUT_KEY_SIZE 32
 #define MAX_PACKET_SIZE 1500

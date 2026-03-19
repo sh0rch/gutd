@@ -173,7 +173,6 @@ impl GutConfig {
         //   ttl(64)+proto(17=UDP) = 0x4011
         //   saddr (2 words), daddr (2 words)
         self.partial_ip_csum = 0x4500u32
-            + 0x0000
             + 0x4011
             + ((bind_bytes[0] as u32) << 8 | bind_bytes[1] as u32)
             + ((bind_bytes[2] as u32) << 8 | bind_bytes[3] as u32)

@@ -47,7 +47,7 @@ pub fn encode(input: &[u8], output: &mut [u8]) -> usize {
 
 /// Decodes Base64 data. Returns number of bytes written or None on invalid input.
 pub fn decode(input: &[u8], output: &mut [u8]) -> Option<usize> {
-    if input.len() % 4 != 0 {
+    if !input.len().is_multiple_of(4) {
         return None;
     }
 

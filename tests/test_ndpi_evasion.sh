@@ -118,7 +118,7 @@ if [ "$GUTD_US" = "true" ]; then
     cat <<EOF > /tmp/gutd_s.conf
 [global]
 stats_interval = 0
-userspace_only = true
+userspace_only = ${GUTD_US}
 
 [peer]
 name = gut0
@@ -134,7 +134,7 @@ EOF
     cat <<EOF > /tmp/gutd_c.conf
 [global]
 stats_interval = 0
-userspace_only = true
+userspace_only = ${GUTD_US}
 
 [peer]
 name = gut0
