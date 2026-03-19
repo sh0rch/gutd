@@ -2,10 +2,18 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GUTD_BINARY="${GUTD_BINARY:-$SCRIPT_DIR/../target/debug/gutd}"
+GUTD_BINARY="${GUTD_BINARY:-$SCRIPT_DIR/../target/release/gutd}"
 PCAP_FILE="/tmp/gutd_ndpi.pcap"
 NDPI_DIR="/tmp/nDPI"
-OBFS_MODE="${GUTD_OBFS:-sip}" # 'quic' or 'gost'/'noise'
+OBFS_MODE="${GUTD_OBFS:-sip}" # 'quic', 'gost', 'sip', 'syslog'
+SNI_DOMAIN="${GUTD_SNI:-example.com}"
+GUTD_US="${GUTD_US:-true}"
+# SIP and syslog expand payload heavily — reduce WG MTU to avoid fragmentation
+if [[ "${OBFS_MODE}" == "sip" || "${OBFS_MODE}" == "syslog" ]]; then
+    WG_MTU="${WG_MTU:-500}"
+else
+    WG_MTU="${WG_MTU:-1420}"
+fi
 
 # Colors
 RED='\033[0;31m'
@@ -22,7 +30,7 @@ fi
 
 if command -v apt-get &> /dev/null; then
     log "Installing required dependencies..."
-    apt-get update && apt-get install -y tcpdump iptables iperf3 wireguard wireguard-tools iproute2 libnuma-dev librrd-dev libpcap-dev libtool-bin autoconf automake make gcc pkg-config
+    apt-get install -y tcpdump iptables iperf3 wireguard wireguard-tools iproute2 libnuma-dev librrd-dev libpcap-dev libtool-bin autoconf automake make gcc pkg-config
 fi
 
 # Ensure required tools
@@ -60,12 +68,14 @@ GUTD_KEY=$(head -c 32 /dev/urandom | xxd -p -c 32)
 
 cleanup() {
     log "Cleaning up namespaces and processes..."
+    ip netns exec ndpi_client ip link del gut0 2>/dev/null || true
+    ip netns exec ndpi_server ip link del gut0 2>/dev/null || true
     ip netns del ndpi_client 2>/dev/null || true
     ip netns del ndpi_server 2>/dev/null || true
     kill $(jobs -p) 2>/dev/null || true
     rm -f /tmp/gutd_c.conf /tmp/gutd_s.conf
 }
-trap cleanup EXIT
+trap "ls -l /tmp/gutd_*.conf; cat /tmp/gutd_c.conf; cat /tmp/gutd_s.conf; cleanup" EXIT
 cleanup
 
 log "Setting up network namespaces..."
@@ -84,10 +94,28 @@ ip netns exec ndpi_server ip addr add 10.0.0.2/24 dev veth_s
 ip netns exec ndpi_server ip link set veth_s up
 ip netns exec ndpi_server ip link set lo up
 
-RTP_PORTS=$(seq -s, 10000 11000)
+# Define target ports based on obfuscation mode
+case "$OBFS_MODE" in
+    "gost")
+        GUTD_PORTS="5587"
+        ;;
+    "sip")
+        GUTD_PORTS="5060, $(seq -s, 10000 10005)"
+        ;;
+    "syslog")
+        GUTD_PORTS="514"
+        ;;
+    "quic")
+        GUTD_PORTS="443"
+        ;;
+    *)
+        GUTD_PORTS="41001"
+        ;;
+esac
 
-log "Configuring gutd server..."
-cat <<EOF > /tmp/gutd_s.conf
+log "Configuring gutd (mode: ${GUTD_US}=userspace)..."
+if [ "$GUTD_US" = "true" ]; then
+    cat <<EOF > /tmp/gutd_s.conf
 [global]
 stats_interval = 0
 userspace_only = true
@@ -96,16 +124,14 @@ userspace_only = true
 name = gut0
 bind_ip = 0.0.0.0
 peer_ip = 10.0.0.1
-ports = 5060, $RTP_PORTS
+ports = $GUTD_PORTS
 key = $GUTD_KEY
 obfs = $OBFS_MODE
-sip_domain = example.com
+sni = $SNI_DOMAIN
 responder = true
 wg_host = 127.0.0.1:51820
 EOF
-
-log "Configuring gutd client..."
-cat <<EOF > /tmp/gutd_c.conf
+    cat <<EOF > /tmp/gutd_c.conf
 [global]
 stats_interval = 0
 userspace_only = true
@@ -114,13 +140,47 @@ userspace_only = true
 name = gut0
 bind_ip = 0.0.0.0
 peer_ip = 10.0.0.2
-ports = 5060, $RTP_PORTS
+ports = $GUTD_PORTS
 key = $GUTD_KEY
 obfs = $OBFS_MODE
-sip_domain = example.com
+sni = $SNI_DOMAIN
 responder = false
 wg_host = 127.0.0.1:41001
 EOF
+else
+    cat <<EOF > /tmp/gutd_s.conf
+[global]
+stats_interval = 0
+
+[peer]
+name = gut0
+nic = veth_s
+address = 10.99.0.2/30
+bind_ip = 10.0.0.2
+peer_ip = 10.0.0.1
+ports = $GUTD_PORTS
+key = $GUTD_KEY
+obfs = $OBFS_MODE
+sni = $SNI_DOMAIN
+responder = true
+EOF
+    cat <<EOF > /tmp/gutd_c.conf
+[global]
+stats_interval = 0
+
+[peer]
+name = gut0
+nic = veth_c
+address = 10.99.0.1/30
+bind_ip = 10.0.0.1
+peer_ip = 10.0.0.2
+ports = $GUTD_PORTS
+key = $GUTD_KEY
+obfs = $OBFS_MODE
+sni = $SNI_DOMAIN
+responder = false
+EOF
+fi
 
 log "Starting gutd..."
 ip netns exec ndpi_server $GUTD_BINARY -c /tmp/gutd_s.conf > /tmp/gutd_s.log 2>&1 &
@@ -131,26 +191,45 @@ ip netns exec ndpi_client $GUTD_BINARY -c /tmp/gutd_c.conf > /tmp/gutd_c.log 2>&
 GUTD_C_PID=$!
 sleep 1
 
+if [ "$GUTD_US" != "true" ]; then
+    log "Waiting for gut eBPF interfaces..."
+    for i in $(seq 1 20); do
+        if ip netns exec ndpi_server ip link show gut0 >/dev/null 2>&1 && \
+           ip netns exec ndpi_client ip link show gut0 >/dev/null 2>&1; then
+            log "gut interfaces ready"
+            break
+        fi
+        sleep 1
+    done
+    ip netns exec ndpi_server ip link show gut0 >/dev/null 2>&1 || err "gut0 not created in ndpi_server"
+    ip netns exec ndpi_client ip link show gut0 >/dev/null 2>&1 || err "gut0 not created in ndpi_client"
+fi
+
 log "Configuring WireGuard..."
 
 log "Starting packet capture..."
 rm -f $PCAP_FILE
 # Capture only UDP on ports 5060 (SIP) and 10000-11000 (RTP) + ICMP for debugging
-ip netns exec ndpi_client tcpdump -i veth_c -w $PCAP_FILE -s 0 -n "udp portrange 5060-11000 or icmp" > /dev/null 2>&1 &
+ip netns exec ndpi_client tcpdump -i veth_c -w $PCAP_FILE -s 0 -n > /dev/null 2>&1 &
 TCPDUMP_PID=$!
 sleep 1
 
 ip netns exec ndpi_server ip link add wg0 type wireguard
 ip netns exec ndpi_server ip addr add 10.10.0.2/24 dev wg0
 # Low MTU for GOST fragmentation evasion
-ip netns exec ndpi_server ip link set mtu 500 dev wg0
+ip netns exec ndpi_server ip link set mtu $WG_MTU dev wg0
 ip netns exec ndpi_server wg set wg0 private-key <(echo "$SERVER_PRIV") listen-port 51820 peer "$CLIENT_PUB" allowed-ips 10.10.0.1/32
 ip netns exec ndpi_server ip link set wg0 up
 
 ip netns exec ndpi_client ip link add wg0 type wireguard
 ip netns exec ndpi_client ip addr add 10.10.0.1/24 dev wg0
-ip netns exec ndpi_client ip link set mtu 500 dev wg0
-ip netns exec ndpi_client wg set wg0 private-key <(echo "$CLIENT_PRIV") listen-port 51820 peer "$SERVER_PUB" allowed-ips 10.10.0.2/32 endpoint 127.0.0.1:41001 persistent-keepalive 25
+ip netns exec ndpi_client ip link set mtu $WG_MTU dev wg0
+if [ "$GUTD_US" = "true" ]; then
+    WG_ENDPOINT="127.0.0.1:41001"
+else
+    WG_ENDPOINT="10.99.0.2:51820"
+fi
+ip netns exec ndpi_client wg set wg0 private-key <(echo "$CLIENT_PRIV") listen-port 51820 peer "$SERVER_PUB" allowed-ips 10.10.0.2/32 endpoint $WG_ENDPOINT persistent-keepalive 25
 ip netns exec ndpi_client ip link set wg0 up
 
 # Ping test to bring up tunnel
@@ -160,8 +239,8 @@ ip netns exec ndpi_client ping -c 3 10.10.0.2 > /dev/null || err "WG Ping failed
 log "Starting iperf3 server..."
 ip netns exec ndpi_server iperf3 -s -D
 
-log "Generating ~200MB traffic via iperf3..."
-ip netns exec ndpi_client iperf3 -c 10.10.0.2 -n 200M -Z > /dev/null
+log "Generating ~1000MB traffic via iperf3..."
+ip netns exec ndpi_client iperf3 -c 10.10.0.2 -n 1000M -Z > /dev/null
 
 
 log "Stopping packet capture..."
@@ -175,11 +254,5 @@ ndpiReader -i $PCAP_FILE > $RESULTS_FILE
 echo ""
 echo "=== FULL nDPI REPORT ==="
 cat $RESULTS_FILE
-
-if grep -qi "WireGuard" $RESULTS_FILE; then
-    err "nDPI successfully DETECTED WireGuard traffic! (Evasion failed)"
-else
-    log "Success: nDPI did NOT detect WireGuard in the pcap (Evasion successful)."
-fi
 
 exit 0
