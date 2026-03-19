@@ -275,11 +275,11 @@ pub fn aes128_expand_key(key: &[u8; 16]) -> [u32; 44] {
 }
 
 fn mix_columns(s: &mut [u32; 4]) {
-    for i in 0..4 {
-        let col = s[i].to_be_bytes();
+    for col_val in s.iter_mut() {
+        let col = col_val.to_be_bytes();
         let a = col[0]; let b = col[1]; let c = col[2]; let d = col[3];
         let h = |x: u8| if (x & 0x80) != 0 { (x << 1) ^ 0x1b } else { x << 1 };
-        s[i] = u32::from_be_bytes([
+        *col_val = u32::from_be_bytes([
             h(a) ^ (h(b) ^ b) ^ c ^ d,
             a ^ h(b) ^ (h(c) ^ c) ^ d,
             a ^ b ^ h(c) ^ (h(d) ^ d),
@@ -290,9 +290,9 @@ fn mix_columns(s: &mut [u32; 4]) {
 
 pub fn aes128_encrypt_block(round_keys: &[u32; 44], block: &[u8; 16], out: &mut [u8; 16]) {
     let mut s = [0u32; 4];
-    for i in 0..4 {
-        s[i] = u32::from_be_bytes([block[4 * i], block[4 * i + 1], block[4 * i + 2], block[4 * i + 3]]);
-        s[i] ^= round_keys[i];
+    for (i, v) in s.iter_mut().take(4).enumerate() {
+        *v = u32::from_be_bytes([block[4 * i], block[4 * i + 1], block[4 * i + 2], block[4 * i + 3]]);
+        *v ^= round_keys[i];
     }
 
     for r in 1..10 {

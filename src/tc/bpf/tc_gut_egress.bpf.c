@@ -114,22 +114,6 @@ int gut_egress(struct __sk_buff *skb)
     if (tunnel_port == 0)
         return TC_ACT_OK;
 
-    __u8 is_server = is_quic_server(cfg);
-    __u32 quic_hdr_len;
-    if (wg_type == 3)
-    {
-        /* Cookie Reply → QUIC Retry long header (must never be dropped) */
-        quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
-    }
-    else if (is_server)
-    {
-        quic_hdr_len = GUT_QUIC_SHORT_HEADER_SIZE;
-    }
-    else
-    {
-        quic_hdr_len = (wg_type == 1) ? GUT_QUIC_LONG_HEADER_SIZE : GUT_QUIC_SHORT_HEADER_SIZE;
-    }
-
     __u32 *ks69 = (__u32 *)(scratch + 64);
     chacha_block(ks69, cfg->chacha_init, 69, nonce);
     __u8 *pad_block = (__u8 *)ks69;
@@ -172,6 +156,26 @@ int gut_egress(struct __sk_buff *skb)
         struct peer_endpoint *gost_ep = bpf_map_lookup_elem(&client_map, &c_idx);
         if (gost_ep && gost_ep->valid)
             use_gost = gost_ep->obfs_gost;
+    }
+
+    __u8 is_server = is_quic_server(cfg);
+    __u32 quic_hdr_len;
+    if (use_gost)
+    {
+        quic_hdr_len = GUT_GOST_HEADER_SIZE;
+    }
+    else if (wg_type == 3)
+    {
+        /* Cookie Reply → QUIC Retry long header (must never be dropped) */
+        quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
+    }
+    else if (is_server)
+    {
+        quic_hdr_len = GUT_QUIC_SHORT_HEADER_SIZE;
+    }
+    else
+    {
+        quic_hdr_len = (wg_type == 1) ? GUT_QUIC_LONG_HEADER_SIZE : GUT_QUIC_SHORT_HEADER_SIZE;
     }
 
     __u32 pad_len = 0;
@@ -275,7 +279,16 @@ int gut_egress(struct __sk_buff *skb)
     __u32 new_quic_off = 14 + shift_len;
     __u8 *quic = (__u8 *)data + new_quic_off;
 
-    if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
+    if (quic_hdr_len == GUT_GOST_HEADER_SIZE)
+    {
+        if ((__u8 *)quic + GUT_GOST_HEADER_SIZE > (__u8 *)data_end)
+            return TC_ACT_OK;
+        __builtin_memcpy((__u8 *)quic + 0, &ppn, 4);
+        __builtin_memcpy((__u8 *)quic + 4, &enc_ports, 4);
+        quic[8] = 0x00;
+        quic[9] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
+    }
+    else if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
     {
         if ((__u8 *)quic + GUT_QUIC_SHORT_HEADER_SIZE > (__u8 *)data_end)
             return TC_ACT_OK;
@@ -297,7 +310,7 @@ int gut_egress(struct __sk_buff *skb)
         if ((__u8 *)quic + GUT_QUIC_LONG_HEADER_SIZE > (__u8 *)data_end)
             return TC_ACT_OK;
         /* 0xC0 = QUIC Initial (client Type 1), 0xF0 = QUIC Retry (Cookie Reply Type 3) */
-        quic[0] = (wg_type == 3) ? 0xF0 : 0xC0;
+        quic[0] = (wg_type == 3) ? 0xF0 : 0xC3;
 
         __u32 time_gost = feistel32((__u32)bpf_ktime_get_ns(), cfg->feistel_rk);
         __u8 *gost_b = (__u8 *)&time_gost;
@@ -338,18 +351,11 @@ int gut_egress(struct __sk_buff *skb)
 
         // Keep the rest filled with the PRNG gost generated above. No open text SNI!
     }
-    /* Encode ballast info in the last QUIC header byte:
+    /* Encode ballast info in the last header byte:
      *   0x00           = no ballast (large packet path, pad_len==0)
      *   0x40 | raw     = has ballast; actual len = (raw & 0x3F) + 1 → [1..64] */
-    quic[quic_hdr_len - 1] = (!use_gost && pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
+    quic[quic_hdr_len - 1] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
 
-    /* Gost mode: XOR first 6 bytes with bytes [6..12] to hide QUIC signatures */
-    if (use_gost)
-    {
-#pragma unroll
-        for (int i = 0; i < 6; i++)
-            quic[i] ^= quic[6 + i];
-    }
 
     if (ipver == 4)
     {

@@ -109,30 +109,15 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     if (wg + 12 > (__u8 *)data_end)
         return -1;
 
-    __u8 detected_gost = 0;
+    __u8 detected_gost = cfg->obfs_gost;
     __u32 quic_hdr_len = 0;
-    if (wg[0] == 0x40)
+
+    if (detected_gost)
     {
-        quic_hdr_len = GUT_QUIC_SHORT_HEADER_SIZE;
-    }
-    else if (wg[0] == 0xF0)
-    {
-        quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
-    }
-    else if (wg[0] >= 0xC0)
-    {
-        if (!is_quic_server(cfg))
-            return -1;
-        quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
+        quic_hdr_len = GUT_GOST_HEADER_SIZE;
     }
     else
     {
-        /* First byte is not a valid QUIC header — try gost unmask */
-#pragma unroll
-        for (int i = 0; i < 6; i++)
-            wg[i] ^= wg[6 + i];
-        detected_gost = 1;
-
         if (wg[0] == 0x40)
         {
             quic_hdr_len = GUT_QUIC_SHORT_HEADER_SIZE;
@@ -141,7 +126,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         {
             quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
         }
-        else if (wg[0] >= 0xC0)
+        else if (wg[0] == 0xC3 || wg[0] >= 0xC0)
         {
             if (!is_quic_server(cfg))
                 return -1;
@@ -149,7 +134,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         }
         else
         {
-            return -1; /* neither plain nor gost — not GUT traffic */
+            return -1; /* not GUT traffic */
         }
     }
 
@@ -188,7 +173,14 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     __u32 expected_ppn = ks47[10];
 
     __u8 *quic = wg - quic_hdr_len;
-    if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
+    if (detected_gost)
+    {
+        __u32 pkt_ppn = 0;
+        __builtin_memcpy(&pkt_ppn, quic + 0, 4);
+        if (pkt_ppn != expected_ppn)
+            return -1;
+    }
+    else if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
     {
         __u32 pkt_dcid = 0;
         __builtin_memcpy(&pkt_dcid, quic + 1, 4);
@@ -282,15 +274,17 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
      * Decrypt: feistel32_inv(enc, rk) ^ FEISTEL_SALT_PORTS -> (sport<<16)|dport host-order.
      * On bpf_xdp_load_bytes failure enc_ports stays 0 and ports_ok=0 prevents restore. */
     __u32 enc_ports = 0;
-    int ports_ok;
-    if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
+    int ports_ok = 1;
+    if (detected_gost)
     {
-        ports_ok = 1;
-        __builtin_memcpy(&enc_ports, quic + 9, 4);
+        __builtin_memcpy(&enc_ports, quic + 4, 4);
+    }
+    else if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
+    {
+        __builtin_memcpy(&enc_ports, quic + 10, 4);
     }
     else
     {
-        ports_ok = 1;
         __builtin_memcpy(&enc_ports, quic + 30, 4);
     }
     __u32 plain_ports = feistel32_inv(enc_ports, cfg->feistel_rk) ^ FEISTEL_SALT_PORTS;

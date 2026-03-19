@@ -1,3 +1,6 @@
+#![allow(clippy::write_with_newline)]
+#![allow(clippy::format_in_format_args)]
+
 use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -10,6 +13,7 @@ pub enum SipKind {
     Options,
     Response200,
     Response401,
+    Response403,
 }
 
 // Packed date storage: bits 0-15: year, bits 16-19: month, bits 20-24: day, bits 25-27: weekday
@@ -144,7 +148,7 @@ pub fn parse_timestamp_from_date_header(buf: &[u8]) -> Option<u64> {
     // Extract all digits and concatenate them
     let mut result = 0u64;
     for &byte in date_line {
-        if byte >= b'0' && byte <= b'9' {
+        if byte.is_ascii_digit() {
             result = result.saturating_mul(10).saturating_add((byte - b'0') as u64);
         }
     }
@@ -246,6 +250,7 @@ fn write_options_keepalive(
 
 /// Writes a dynamic SIP header into the buffer with real data.
 /// Returns the number of bytes written.
+#[allow(clippy::too_many_arguments)]
 pub fn write_header(
     buf: &mut [u8],
     kind: SipKind,
@@ -300,6 +305,9 @@ pub fn write_header(
             cursor.set_position(pos as u64 + 8);
             write!(cursor, "\", algorithm=MD5\r\n").unwrap();
         }
+        SipKind::Response403 => {
+            write!(cursor, "SIP/2.0 403 Forbidden\r\n").unwrap();
+        }
     }
 
     write!(cursor, "Via: SIP/2.0/UDP {}:{};branch=z9hG4bK-", src_ip, sport).unwrap();
@@ -312,7 +320,7 @@ pub fn write_header(
     cursor.set_position(pos as u64 + 8);
     write!(cursor, "\r\nTo: <sip:{}@{}>", dport, domain).unwrap();
     
-    if matches!(kind, SipKind::Response200 | SipKind::Response401) {
+    if matches!(kind, SipKind::Response200 | SipKind::Response401 | SipKind::Response403) {
         write!(cursor, ";tag=").unwrap();
         let pos = cursor.position() as usize;
         write_hex8(&mut cursor.get_mut()[pos..pos+8], to_tag_val);
@@ -329,7 +337,9 @@ pub fn write_header(
     write!(cursor, "@{}\r\n", domain).unwrap();
     
     let cseq_method = match kind {
-        SipKind::Register | SipKind::Response200 | SipKind::Response401 => "REGISTER",
+        SipKind::Register | SipKind::Response401 => "REGISTER",
+        SipKind::Response200 => "OPTIONS",
+        SipKind::Response403 => "INVITE",
         SipKind::Message => "MESSAGE",
         SipKind::Options => "OPTIONS",
     };
