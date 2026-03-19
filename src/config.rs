@@ -287,7 +287,8 @@ pub fn load_config_from_env() -> Result<Config> {
             own_http3,
             wg_host: std::env::var("GUTD_WG_HOST")
                 .unwrap_or_else(|_| "127.0.0.1:51820".to_string()),
-            sip_domain: std::env::var("GUTD_SIP_DOMAIN")
+            sip_domain: std::env::var("GUTD_SNI")
+                .or_else(|_| std::env::var("GUTD_SIP_DOMAIN"))
                 .unwrap_or_else(|_| "example.com".to_string()),
             obfs,
         }],
@@ -556,8 +557,8 @@ fn parse_config(content: &str) -> Result<Config> {
                         "responder" => {
                             b.responder = Some(value == "true" || value == "1");
                         }
-                        "sip_domain" => {
-                                b.sip_domain = Some(value.to_string());
+                        "sip_domain" | "sni" => {
+                            b.sip_domain = Some(value.trim_matches('"').to_string());
                             }
                             "obfs" => {
                             b.obfs = match value {

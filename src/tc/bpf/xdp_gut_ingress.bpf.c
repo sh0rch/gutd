@@ -195,8 +195,11 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         if (pkt_dcid != expected_dcid)
             return -1;
 
+        if (quic[5] != 0x01) // DCID length 1
+            return -1;
+
         __u32 pkt_ppn = 0;
-        __builtin_memcpy(&pkt_ppn, quic + 5, 4);
+        __builtin_memcpy(&pkt_ppn, quic + 6, 4);
         if (pkt_ppn != expected_ppn)
             return -1;
     }
@@ -205,6 +208,9 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         __u32 pkt_dcid = 0;
         __builtin_memcpy(&pkt_dcid, quic + 6, 4);
         if (pkt_dcid != expected_dcid)
+            return -1;
+
+        if (quic[5] != 0x08) // DCID length 8
             return -1;
 
         __u32 pkt_ppn = 0;

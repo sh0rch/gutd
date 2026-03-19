@@ -285,11 +285,12 @@ int gut_egress(struct __sk_buff *skb)
         __u32 dcid = feistel32(wg_idx, cfg->feistel_rk);
         __builtin_memcpy((__u8 *)quic + 1, &dcid, 4);
 
-        // Inject 4-byte PPN
-        __builtin_memcpy((__u8 *)quic + 5, &ppn, 4);
-
-        // Bytes 9-12: feistel-encrypted ports (sport<<16|dport); XDP decrypts with feistel32_inv
-        __builtin_memcpy((__u8 *)quic + 9, &enc_ports, 4);
+        // Inject fields with RFC-style Length byte
+        quic[5] = 0x01; // DCID Length 1 (RFC compliant)
+        __builtin_memcpy((__u8 *)quic + 6, &ppn, 4);
+        __builtin_memcpy((__u8 *)quic + 10, &enc_ports, 4);
+        quic[14] = 0x00;
+        quic[15] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
     }
     else
     {
@@ -317,7 +318,7 @@ int gut_egress(struct __sk_buff *skb)
         __u32 scid = feistel32(wg_idx ^ 0xCAFEBABE, cfg->feistel_rk);
         __u32 scid2 = feistel32(wg_idx ^ 0x12345678, cfg->feistel_rk);
 
-        quic[5] = 0x08; // DCID Len 8
+        quic[5] = 0x08; // DCID length 8
         __builtin_memcpy((__u8 *)quic + 6, &dcid, 4);
         __builtin_memcpy((__u8 *)quic + 10, &dcid2, 4);
 
@@ -325,8 +326,8 @@ int gut_egress(struct __sk_buff *skb)
         __builtin_memcpy((__u8 *)quic + 15, &scid, 4);
         __builtin_memcpy((__u8 *)quic + 19, &scid2, 4);
 
-        quic[23] = 0x00; // token len 0
-        quic[24] = 0x40; // length (approx)
+        quic[23] = 0x00; // Token length 0
+        quic[24] = 0x40; // Payload Length (High byte of Varint)
         quic[25] = 0x00;
 
         // 4-byte PPN

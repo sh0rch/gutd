@@ -18,7 +18,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-#define MAX_PORTS 16
+#define MAX_PORTS 6
 /* Short header layout (14 bytes):
  * [0]=0x40 [1-4]=DCID [5-8]=PPN [9-10]=inner_sport_be [11-12]=inner_dport_be [13]=pad_len
  * Long header layout (100 bytes):
@@ -27,8 +27,8 @@
  * [34-98]=PRNG gost [99]=pad_len
  * TC egress stores the original WG UDP src/dst ports so XDP can restore them
  * after decapsulation, preserving the conntrack/WG port numbers end-to-end. */
-#define GUT_QUIC_SHORT_HEADER_SIZE 14
-#define GUT_QUIC_LONG_HEADER_SIZE 100
+#define GUT_QUIC_SHORT_HEADER_SIZE 16
+#define GUT_QUIC_LONG_HEADER_SIZE 1200
 #define GUT_KEY_SIZE 32
 #define MAX_PACKET_SIZE 1500
 #define SCRATCH_SIZE 4096                    /* scratch buffer: power-of-2.  Must be > MAX_PACKET_SIZE + 1 \

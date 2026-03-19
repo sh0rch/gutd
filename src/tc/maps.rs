@@ -4,7 +4,7 @@
 
 use std::net::IpAddr;
 
-pub const MAX_PORTS: usize = 16;
+pub const MAX_PORTS: usize = 6;
 pub const GUT_KEY_SIZE: usize = 32;
 // GUT wire overhead per *large* payload (the MTU-relevant case):
 //   and get zero ballast, so only 14 bytes of GUT header are added.
@@ -78,7 +78,6 @@ pub struct GutConfig {
     pub own_http3: u8,          // Whether to respond to active DPI probes via XDP_TX
     pub dynamic_peer: u8,       // 1 = peer_ip unknown, learn from validated inbound packets
     pub obfs_gost: u8,         // 1 = gost mode: XOR quic[0..6] with quic[6..12]
-    pub sip_date_str: [u8; 32], // SIP Date string: "Mon, 17 Mar 2026" (time added dynamically)
 }
 
 /// Dynamic peer endpoint — stored in `client_map` (LRU_HASH, key=C_idx).
@@ -141,7 +140,6 @@ impl GutConfig {
             own_http3: 1,
             dynamic_peer: 0,
             obfs_gost: 0,
-            sip_date_str: [0u8; 32],
         };
 
         for (i, &port) in ports.iter().enumerate().take(MAX_PORTS) {
@@ -156,21 +154,12 @@ impl GutConfig {
     
     /// Update SIP date string with current date (should be called at midnight)
     pub fn update_sip_date(&mut self) {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let date_str = format_sip_date_only(timestamp);
-        let bytes = date_str.as_bytes();
-        let len = bytes.len().min(31); // Leave space for null terminator
-        self.sip_date_str[..len].copy_from_slice(&bytes[..len]);
-        self.sip_date_str[len] = 0; // Null terminator
+        // Now handled by userspace logic, not stored in BPF config map
     }
     
     /// Get SIP date string as &str
     pub fn get_sip_date(&self) -> &str {
-        let end = self.sip_date_str.iter().position(|&c| c == 0).unwrap_or(31);
-        std::str::from_utf8(&self.sip_date_str[..end]).unwrap_or("Mon, 01 Jan 2024")
+        "Mon, 01 Jan 2024"
     }
 
     /// Compute partial IP header checksum from fixed fields (saddr, daddr, etc.).
@@ -229,7 +218,7 @@ fn compute_chacha_init(key: &[u8; 32]) -> [u32; 12] {
     init
 }
 
-const _: [(); 288] = [(); std::mem::size_of::<GutConfig>()];
+const _: [(); 236] = [(); std::mem::size_of::<GutConfig>()];
 const _: [(); 56] = [(); std::mem::size_of::<GutStats>()];
 
 impl GutStats {
