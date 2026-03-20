@@ -97,7 +97,7 @@ ip netns exec ndpi_server ip link set lo up
 # Define target ports based on obfuscation mode
 case "$OBFS_MODE" in
     "gost")
-        GUTD_PORTS="5587"
+        GUTD_PORTS="55777"
         ;;
     "sip")
         GUTD_PORTS="5060, $(seq -s, 10000 10005)"
