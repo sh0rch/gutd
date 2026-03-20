@@ -271,7 +271,7 @@ fn xor16(p: &mut [u8], k: &[u8]) {
 
 
 #[allow(clippy::too_many_arguments)]
-pub fn quic_encap(
+pub fn obfs_encap(
     buf: &mut [u8],
     orig_len: usize,
     key: &[u32; 12],
@@ -347,16 +347,20 @@ pub fn quic_encap(
         if remainder != 0 {
             pad_len = 16 - remainder;
         }
-    } else if obfs == crate::config::ObfsMode::Quic {
-        // Plain QUIC mode: random ballast for small packets to hide handshakes
-        if orig_len < 220 {
-            let raw = pad_block[63] & 0x3F;
-            pad_len = (raw as usize) + 1; // 1..64
-        }
     } else {
-        // SIP / Syslog mode: random padding to break 16-byte signature of WG payloads
-        let raw = pad_block[63] & 0x1F;
-        pad_len = (raw as usize) + 1; // 1..32
+        // For QUIC / SIP / Syslog we use random length padding to mask packet sizes and handshakes
+        let max_pad = if obfs == crate::config::ObfsMode::Quic && orig_len >= 220 {
+            0
+        } else if obfs == crate::config::ObfsMode::Quic {
+            0x3F // 1..64
+        } else {
+            0x1F // 1..32
+        };
+        
+        if max_pad > 0 {
+            let raw = pad_block[63] & max_pad;
+            pad_len = (raw as usize) + 1;
+        }
     }
 
     if pad_len > 0 {
@@ -373,160 +377,15 @@ pub fn quic_encap(
     let dcid = feistel32(wg_idx, feistel_rk);
     
     if quic_hdr_len == GUT_GOST_HEADER_SIZE {
-        buf[0..4].copy_from_slice(&ppn.to_le_bytes());
-        buf[4..8].copy_from_slice(&enc_ports.to_le_bytes());
-        buf[8] = 0x00;
-        buf[9] = if pad_len > 0 { 0x40 | ((pad_len as u8 - 1) & 0x3F) } else { 0 };
+        write_gost_header(buf, ppn, enc_ports, pad_len);
     } else if quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
-        buf[0] = 0x40; // Short
-        buf[1..5].copy_from_slice(&dcid.to_le_bytes());
-        buf[5] = 0x01; // DCID length byte in standard QUIC header
-        buf[6..10].copy_from_slice(&ppn.to_le_bytes());
-        buf[10..14].copy_from_slice(&enc_ports.to_le_bytes());
-        buf[14] = 0x00; // Reserved
-        buf[15] = if pad_len > 0 {
-            0x40 | ((pad_len as u8 - 1) & 0x3F)
-        } else {
-            0
-        };
+        write_quic_short_header(buf, dcid, ppn, enc_ports, pad_len);
     } else {
-        // 0xC3 = QUIC Initial (client Type 1) with 4-byte PN, 0xF0 = QUIC Retry (Cookie Reply Type 3)
-        buf[0] = if wg_type == 3 { 0xF0 } else { 0xC3 };
-        buf[1] = 0x00;
-        buf[2] = 0x00;
-        buf[3] = 0x00;
-        buf[4] = 0x01; // QUIC v1
-
-        // Use the middle/end part of the (already masked) WG payload as entropy for the Long Header.
-        // This avoids double-encryption and looks more random to DPI.
-        let mut entropy_source = [0u8; 32];
-        if orig_len >= 64 {
-            entropy_source.copy_from_slice(&buf[wg_off + 32..wg_off + 64]);
-        } else {
-            entropy_source.copy_from_slice(&pad_block[0..32]);
-        };
-
-        let t_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u32;
-        let time_gost = feistel32(t_ns, feistel_rk);
-        let gost_b = time_gost.to_le_bytes();
-
-        let head = (GUT_QUIC_LONG_HEADER_SIZE / 2).min(200);
-        for i in 1..head {
-            buf[i] = entropy_source[i & 31] ^ gost_b[i & 3];
-        }
-        // Fill the rest with combination of entropy and pad_block
-        for i in head..(GUT_QUIC_LONG_HEADER_SIZE - 1) {
-            buf[i] = pad_block[(i * 13) & 0x3F] ^ entropy_source[i & 31] ^ gost_b[(i >> 2) & 3];
-        }
-
-        buf[1] = 0x00;
-        buf[2] = 0x00;
-        buf[3] = 0x00;
-        buf[4] = 0x01; // QUIC v1
-
-        let dcid2 = feistel32(wg_idx ^ 0xDEADBEEF, feistel_rk);
-        let scid = feistel32(wg_idx ^ 0xCAFEBABE, feistel_rk);
-        let scid2 = feistel32(wg_idx ^ 0x12345678, feistel_rk);
-
-        let mut actual_dcid = [0u8; 8];
-        actual_dcid[0..4].copy_from_slice(&dcid.to_le_bytes());
-        actual_dcid[4..8].copy_from_slice(&dcid2.to_le_bytes());
-
-        buf[5] = 0x08; // DCID length 8
-        buf[6..14].copy_from_slice(&actual_dcid);
-        buf[14] = 0x08; // SCID length 8
-        buf[15..19].copy_from_slice(&scid.to_le_bytes());
-        buf[19..23].copy_from_slice(&scid2.to_le_bytes());
-        
-        buf[23] = 0x04; // Token length 4
-        buf[24..28].copy_from_slice(&enc_ports.to_le_bytes()); // Hide enc_ports in Token
-        
-        // Payload Length varint 
-        let total_quic_len = (GUT_QUIC_LONG_HEADER_SIZE - 30) as u16;
-        buf[28] = 0x40 | ((total_quic_len >> 8) as u8);
-        buf[29] = (total_quic_len & 0xFF) as u8;
-
-        // --- RFC-COMPLIANT QUIC INITIAL ENCRYPTION FOR nDPI ---
-        let initial_secret = crate::proto::quic::derive_quic_initial_secret(&actual_dcid);
-        let client_secret = crate::proto::quic::derive_client_initial_secret(&initial_secret);
-        let (q_key, q_iv, q_hp) = crate::proto::quic::derive_quic_keys(&client_secret);
-
-        let sni_pos = 34; // Immediately after PPN!
-        let mut crypto_frame = [0u8; 128];
-        // CRYPTO frame header
-        crypto_frame[0] = 0x06; // Type: CRYPTO
-        crypto_frame[1] = 0x00; // Offset 0
-        crypto_frame[2] = 0x40; // Length
-        crypto_frame[3] = 0x64;
-        
-        // Handshake: Client Hello
-        crypto_frame[4] = 0x01; // Client Hello
-        crypto_frame[7] = 0x60; // Length
-        crypto_frame[8] = 0x03; // TLS 1.3
-        crypto_frame[9] = 0x03;
-        
-        // SNI Extension
-        let domain_bytes = sip_domain.as_bytes();
-        let domain_len = domain_bytes.len().min(32);
-        if domain_len > 0 {
-            let ext_pos = 4 + 40; // Skip CRYPTO hdr + Handshake HDR + Random...
-            crypto_frame[ext_pos] = 0x00; // SNI Extension type
-            crypto_frame[ext_pos+1] = 0x00;
-            crypto_frame[ext_pos+3] = (domain_len + 5) as u8;
-            crypto_frame[ext_pos+5] = (domain_len + 3) as u8;
-            crypto_frame[ext_pos+8] = domain_len as u8;
-            crypto_frame[ext_pos+9..ext_pos+9+domain_len].copy_from_slice(&domain_bytes[..domain_len]);
-        }
-
-        // Encrypt with AES-GCM (simplified to CTR as it's often enough for DPI if they don't check tag)
-        // Using AES-128-CTR with q_key and q_iv
-        let rk = crate::crypto::aes128_expand_key(&q_key);
-        for i in 0..8 {
-            let mut nonce_iv = [0u8; 16];
-            nonce_iv[..12].copy_from_slice(&q_iv);
-            // Packet number is at index 26..30 (4 bytes), let's use it as partial PN
-            let pn = u32::from_le_bytes(ppn.to_le_bytes()); // Use the same PPN as IV part
-            for j in 0..4 { nonce_iv[8+j] ^= ((pn >> (j*8)) & 0xFF) as u8; }
-            nonce_iv[15] ^= i as u8; // Simple block counter in last byte
-            let mut ks = [0u8; 16];
-            crate::crypto::aes128_encrypt_block(&rk, &nonce_iv, &mut ks);
-            for (j, k_val) in ks.iter().enumerate() {
-                let idx = i * 16 + j;
-                if idx < crypto_frame.len() {
-                    // For standard DPI decryptability, we MUST overwrite the buffer
-                    // exactly as AES-CTR would. If we XOR with random buf entropy, 
-                    // DPI will get garbage when it decrypts using ks.
-                    // nDPI successfully decrypted it previously because we did just `=`
-                    buf[sni_pos + idx] = crypto_frame[idx] ^ *k_val;
-                }
-            }
-        }
-
-        // Header Protection
-        let hp_rk = crate::crypto::aes128_expand_key(&q_hp);
-        let mut hp_mask = [0u8; 16];
-        // Sample from buf[sni_pos..sni_pos+16]
-        crate::crypto::aes128_encrypt_block(&hp_rk, &buf[sni_pos..sni_pos+16].try_into().unwrap(), &mut hp_mask);
-        
-        // Write the PPN so it's protected by the mask!
-        buf[30..34].copy_from_slice(&ppn.to_le_bytes());
-
-        buf[0] ^= hp_mask[0] & 0x0F; // Long header mask
-        for i in 0..4 {
-            buf[30 + i] ^= hp_mask[1 + i];
-        }
-
-        buf[GUT_QUIC_LONG_HEADER_SIZE - 1] = if pad_len > 0 {
-            0x40 | ((pad_len as u8 - 1) & 0x3F)
-        } else {
-            0
-        };
+        write_quic_long_header(
+            buf, wg_type, wg_idx, dcid, ppn, enc_ports, pad_len,
+            orig_len, wg_off, &pad_block, feistel_rk, sip_domain
+        );
     }
-
-
 
     Some((quic_hdr_len + orig_len + pad_len, dcid))
 }
@@ -534,81 +393,217 @@ pub fn quic_encap(
 /// Returns `true` if the packet is authentic GUT traffic.
 /// In gost mode, unmasking is applied to the first 6 bytes in-place on success;
 /// on failure, the original bytes are restored.
-pub fn quic_verify(
+
+
+#[inline]
+fn write_gost_header(buf: &mut [u8], ppn: u32, enc_ports: u32, pad_len: usize) {
+    buf[0..4].copy_from_slice(&ppn.to_le_bytes());
+    buf[4..8].copy_from_slice(&enc_ports.to_le_bytes());
+    buf[8] = 0x00;
+    buf[9] = if pad_len > 0 { 0x40 | ((pad_len as u8 - 1) & 0x3F) } else { 0 };
+}
+
+#[inline]
+fn write_quic_short_header(buf: &mut [u8], dcid: u32, ppn: u32, enc_ports: u32, pad_len: usize) {
+    buf[0] = 0x40; // Short
+    buf[1..5].copy_from_slice(&dcid.to_le_bytes());
+    buf[5] = 0x01; // DCID length byte in standard QUIC header
+    buf[6..10].copy_from_slice(&ppn.to_le_bytes());
+    buf[10..14].copy_from_slice(&enc_ports.to_le_bytes());
+    buf[14] = 0x00; // Reserved
+    buf[15] = if pad_len > 0 { 0x40 | ((pad_len as u8 - 1) & 0x3F) } else { 0 };
+}
+
+#[inline]
+fn write_quic_long_header(
     buf: &mut [u8],
+    wg_type: u8,
+    wg_idx: u32,
+    dcid: u32,
+    ppn: u32,
+    enc_ports: u32,
+    pad_len: usize,
+    orig_len: usize,
+    wg_off: usize,
+    pad_block: &[u8; 64],
+    feistel_rk: &[u32; 4],
+    sip_domain: &str,
+) {
+    // 0xC3 = QUIC Initial (client Type 1) with 4-byte PN, 0xF0 = QUIC Retry (Cookie Reply Type 3)
+    buf[0] = if wg_type == 3 { 0xF0 } else { 0xC3 };
+    buf[1] = 0x00;
+    buf[2] = 0x00;
+    buf[3] = 0x00;
+    buf[4] = 0x01; // QUIC v1
+
+    // Use the middle/end part of the (already masked) WG payload as entropy for the Long Header.
+    // This avoids double-encryption and looks more random to DPI.
+    let mut entropy_source = [0u8; 32];
+    if orig_len >= 64 {
+        entropy_source.copy_from_slice(&buf[wg_off + 32..wg_off + 64]);
+    } else {
+        entropy_source.copy_from_slice(&pad_block[0..32]);
+    };
+
+    let t_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u32;
+    let time_gost = feistel32(t_ns, feistel_rk);
+    let gost_b = time_gost.to_le_bytes();
+
+    let head = (GUT_QUIC_LONG_HEADER_SIZE / 2).min(200);
+    for i in 1..head {
+        buf[i] = entropy_source[i & 31] ^ gost_b[i & 3];
+    }
+    // Fill the rest with combination of entropy and pad_block
+    for i in head..(GUT_QUIC_LONG_HEADER_SIZE - 1) {
+        buf[i] = pad_block[(i * 13) & 0x3F] ^ entropy_source[i & 31] ^ gost_b[(i >> 2) & 3];
+    }
+
+    buf[1] = 0x00;
+    buf[2] = 0x00;
+    buf[3] = 0x00;
+    buf[4] = 0x01; // QUIC v1
+
+    let dcid2 = feistel32(wg_idx ^ 0xDEADBEEF, feistel_rk);
+    let scid = feistel32(wg_idx ^ 0xCAFEBABE, feistel_rk);
+    let scid2 = feistel32(wg_idx ^ 0x12345678, feistel_rk);
+
+    let mut actual_dcid = [0u8; 8];
+    actual_dcid[0..4].copy_from_slice(&dcid.to_le_bytes());
+    actual_dcid[4..8].copy_from_slice(&dcid2.to_le_bytes());
+
+    buf[5] = 0x08; // DCID length 8
+    buf[6..14].copy_from_slice(&actual_dcid);
+    buf[14] = 0x08; // SCID length 8
+    buf[15..19].copy_from_slice(&scid.to_le_bytes());
+    buf[19..23].copy_from_slice(&scid2.to_le_bytes());
+    
+    buf[23] = 0x04; // Token length 4
+    buf[24..28].copy_from_slice(&enc_ports.to_le_bytes()); // Hide enc_ports in Token
+    
+    // Payload Length varint 
+    let total_quic_len = (GUT_QUIC_LONG_HEADER_SIZE - 30) as u16;
+    buf[28] = 0x40 | ((total_quic_len >> 8) as u8);
+    buf[29] = (total_quic_len & 0xFF) as u8;
+
+    // --- RFC-COMPLIANT QUIC INITIAL ENCRYPTION FOR nDPI ---
+    let initial_secret = crate::proto::quic::derive_quic_initial_secret(&actual_dcid);
+    let client_secret = crate::proto::quic::derive_client_initial_secret(&initial_secret);
+    let (q_key, q_iv, q_hp) = crate::proto::quic::derive_quic_keys(&client_secret);
+
+    let sni_pos = 34; // Immediately after PPN!
+    let mut crypto_frame = [0u8; 128];
+    // CRYPTO frame header
+    crypto_frame[0] = 0x06; // Type: CRYPTO
+    crypto_frame[1] = 0x00; // Offset 0
+    crypto_frame[2] = 0x40; // Length
+    crypto_frame[3] = 0x64;
+    
+    // Handshake: Client Hello
+    crypto_frame[4] = 0x01; // Client Hello
+    crypto_frame[7] = 0x60; // Length
+    crypto_frame[8] = 0x03; // TLS 1.3
+    crypto_frame[9] = 0x03;
+    
+    // SNI Extension
+    let domain_bytes = sip_domain.as_bytes();
+    let domain_len = domain_bytes.len().min(32);
+    if domain_len > 0 {
+        let ext_pos = 4 + 40; // Skip CRYPTO hdr + Handshake HDR + Random...
+        crypto_frame[ext_pos] = 0x00; // SNI Extension type
+        crypto_frame[ext_pos+1] = 0x00;
+        crypto_frame[ext_pos+3] = (domain_len + 5) as u8;
+        crypto_frame[ext_pos+5] = (domain_len + 3) as u8;
+        crypto_frame[ext_pos+8] = domain_len as u8;
+        crypto_frame[ext_pos+9..ext_pos+9+domain_len].copy_from_slice(&domain_bytes[..domain_len]);
+    }
+
+    // Encrypt with AES-GCM (simplified to CTR as it's often enough for DPI if they don't check tag)
+    // Using AES-128-CTR with q_key and q_iv
+    let rk = crate::crypto::aes128_expand_key(&q_key);
+    for i in 0..8 {
+        let mut nonce_iv = [0u8; 16];
+        nonce_iv[..12].copy_from_slice(&q_iv);
+        // Packet number is at index 26..30 (4 bytes), let's use it as partial PN
+        let pn = u32::from_le_bytes(ppn.to_le_bytes()); // Use the same PPN as IV part
+        for j in 0..4 { nonce_iv[8+j] ^= ((pn >> (j*8)) & 0xFF) as u8; }
+        nonce_iv[15] ^= i as u8; // Simple block counter in last byte
+        let mut ks = [0u8; 16];
+        crate::crypto::aes128_encrypt_block(&rk, &nonce_iv, &mut ks);
+        for (j, k_val) in ks.iter().enumerate() {
+            let idx = i * 16 + j;
+            if idx < crypto_frame.len() {
+                buf[sni_pos + idx] = crypto_frame[idx] ^ *k_val;
+            }
+        }
+    }
+
+    // Header Protection
+    let hp_rk = crate::crypto::aes128_expand_key(&q_hp);
+    let mut hp_mask = [0u8; 16];
+    // Sample from buf[sni_pos..sni_pos+16]
+    crate::crypto::aes128_encrypt_block(&hp_rk, &buf[sni_pos..sni_pos+16].try_into().unwrap(), &mut hp_mask);
+    
+    // Write the PPN so it's protected by the mask!
+    buf[30..34].copy_from_slice(&ppn.to_le_bytes());
+
+    buf[0] ^= hp_mask[0] & 0x0F; // Long header mask
+    for i in 0..4 {
+        buf[30 + i] ^= hp_mask[1 + i];
+    }
+
+    buf[GUT_QUIC_LONG_HEADER_SIZE - 1] = if pad_len > 0 {
+        0x40 | ((pad_len as u8 - 1) & 0x3F)
+    } else {
+        0
+    };
+}
+
+pub fn obfs_verify(
+    buf: &[u8],
     orig_len: usize,
     key: &[u32; 12],
     feistel_rk: &[u32; 4],
     rounds: u8,
     obfs: crate::config::ObfsMode,
 ) -> bool {
-    if obfs != crate::config::ObfsMode::Quic {
-        if orig_len < GUT_GOST_HEADER_SIZE + 32 { return false; }
-        let pad_byte = buf[GUT_GOST_HEADER_SIZE - 1];
-        let ballast_len = if (pad_byte & 0x40) != 0 { ((pad_byte & 0x3F) as usize) + 1 } else { 0 };
-        let wg_off = GUT_GOST_HEADER_SIZE;
-        let wg_len = orig_len - wg_off;
-        if ballast_len > wg_len { return false; }
-        let actual_wg_len = wg_len - ballast_len;
-        if actual_wg_len < 32 { return false; }
-        
-        let nonce = wg_nonce32(&buf[wg_off..wg_off + actual_wg_len]);
-        let ks47 = chacha_block_fast(key, 47, nonce, rounds);
-        let expected_ppn = ks47[10];
-        let pkt_ppn = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-        return pkt_ppn == expected_ppn;
-    }
-    
-    quic_verify_inner(buf, orig_len, key, feistel_rk, rounds)
-}
-
-fn quic_verify_inner(
-    buf: &[u8],
-    orig_len: usize,
-    key: &[u32; 12],
-    feistel_rk: &[u32; 4],
-    rounds: u8,
-) -> bool {
+    if orig_len == 0 { return false; }
     let first_byte = buf[0];
-    let quic_hdr_len = if (first_byte & 0xC0) == 0xC0 {
-        if buf[5] != 0x08 { return false; } // DCID length 8
+    let hdr_len = if obfs != crate::config::ObfsMode::Quic {
+        GUT_GOST_HEADER_SIZE
+    } else if (first_byte & 0xC0) == 0xC0 {
+        if buf.len() <= 5 || buf[5] != 0x08 { return false; }
         GUT_QUIC_LONG_HEADER_SIZE
     } else if (first_byte & 0x40) == 0x40 {
-        if buf[5] != 0x01 { return false; } // DCID length byte in standard QUIC header (RFC placeholder)
+        if buf.len() <= 5 || buf[5] != 0x01 { return false; }
         GUT_QUIC_SHORT_HEADER_SIZE
     } else {
         return false;
     };
 
-    if orig_len < quic_hdr_len + 32 {
-        return false;
-    }
-
-    let pad_byte = buf[quic_hdr_len - 1];
-    let ballast_len = if (pad_byte & 0x40) != 0 {
-        ((pad_byte & 0x3F) as usize) + 1
-    } else {
-        0
-    };
-
-    let wg_off = quic_hdr_len;
-    let wg_len = orig_len - quic_hdr_len;
-    if ballast_len > wg_len {
-        return false;
-    }
+    if orig_len < hdr_len + 32 { return false; }
+    
+    let pad_byte = buf[hdr_len - 1];
+    let ballast_len = if (pad_byte & 0x40) != 0 { ((pad_byte & 0x3F) as usize) + 1 } else { 0 };
+    
+    let wg_off = hdr_len;
+    let wg_len = orig_len - hdr_len;
+    if ballast_len > wg_len { return false; }
     let actual_wg_len = wg_len - ballast_len;
-    if actual_wg_len < 32 {
-        return false;
+    if actual_wg_len < 32 { return false; }
+
+    let nonce = wg_nonce32(&buf[wg_off..wg_off + actual_wg_len]);
+    let ks47 = chacha_block_fast(key, 47, nonce, rounds);
+    let expected_ppn = ks47[10];
+
+    if obfs != crate::config::ObfsMode::Quic {
+        let pkt_ppn = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        return pkt_ppn == expected_ppn;
     }
 
-    // Since wg_nonce32 reads bytes 16..32, and ks47 only masks bytes 0..16,
-    // the nonce bytes (16..32) are the same in both the plain and masked payload.
-    let nonce = wg_nonce32(&buf[wg_off..wg_off + actual_wg_len]);
-
-    let ks47 = chacha_block_fast(key, 47, nonce, rounds);
     let ks47_b: [u8; 64] = unsafe { std::mem::transmute(ks47) };
-
-    // Temporarily decrypt first 16 bytes to get wg_type and wg_idx
     let mut hdr = [0u8; 16];
     hdr.copy_from_slice(&buf[wg_off..wg_off + 16]);
     xor16(&mut hdr, &ks47_b[0..16]);
@@ -621,14 +616,12 @@ fn quic_verify_inner(
     };
 
     let expected_dcid = feistel32(wg_idx, feistel_rk);
-    let expected_ppn = ks47[10];
 
-    if quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
+    if hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
         let pkt_dcid = u32::from_le_bytes(buf[1..5].try_into().unwrap());
         let pkt_ppn = u32::from_le_bytes(buf[6..10].try_into().unwrap());
         pkt_dcid == expected_dcid && pkt_ppn == expected_ppn
     } else {
-        // --- RFC-COMPLIANT QUIC INITIAL DECRYPTION FOR nDPI ---
         let mut actual_dcid = [0u8; 8];
         actual_dcid.copy_from_slice(&buf[6..14]);
         let initial_secret = crate::proto::quic::derive_quic_initial_secret(&actual_dcid);
@@ -641,22 +634,17 @@ fn quic_verify_inner(
         crate::crypto::aes128_encrypt_block(&hp_rk, &buf[sni_pos..sni_pos+16].try_into().unwrap(), &mut hp_mask);
         
         let fb_unmasked = buf[0] ^ (hp_mask[0] & 0x0F);
-        if (fb_unmasked & 0x80) == 0 {
-            return false;
-        }
-        let pkt_ppn = u32::from_le_bytes(buf[30..34].try_into().unwrap()) ^ u32::from_le_bytes(hp_mask[1..5].try_into().unwrap());
+        if (fb_unmasked & 0x80) == 0 { return false; }
         
-        // DCID is at 6..14, we only check first 4 bytes
+        // Use wrapping logic or direct bit logic instead of mutating buf!
+        let pkt_ppn = u32::from_le_bytes(buf[30..34].try_into().unwrap()) ^ u32::from_le_bytes(hp_mask[1..5].try_into().unwrap());
         let pkt_dcid = u32::from_le_bytes(buf[6..10].try_into().unwrap());
-        if pkt_dcid != expected_dcid || pkt_ppn != expected_ppn {
-            eprintln!("DECAP VERIFY FAIL: dcid={:x}=={:x} ppn={:x}=={:x}", pkt_dcid, expected_dcid, pkt_ppn, expected_ppn);
-            return false;
-        }
-        true
+        
+        pkt_dcid == expected_dcid && pkt_ppn == expected_ppn
     }
 }
 
-pub fn quic_decap(
+pub fn obfs_decap(
     buf: &mut [u8],
     orig_len: usize,
     key: &[u32; 12],
@@ -664,97 +652,41 @@ pub fn quic_decap(
     rounds: u8,
     obfs: crate::config::ObfsMode,
 ) -> Option<(usize, u16, u16)> {
-    let quic_hdr_len = if obfs != crate::config::ObfsMode::Quic {
+    if orig_len == 0 { return None; }
+    let hdr_len = if obfs != crate::config::ObfsMode::Quic {
         GUT_GOST_HEADER_SIZE
     } else {
         let first_byte = buf[0];
-        if (first_byte & 0x80) == 0x80 {
-            GUT_QUIC_LONG_HEADER_SIZE
-        } else if (first_byte & 0x40) == 0x40 {
-            GUT_QUIC_SHORT_HEADER_SIZE
-        } else {
-            return None;
-        }
+        if (first_byte & 0x80) == 0x80 { GUT_QUIC_LONG_HEADER_SIZE }
+        else if (first_byte & 0x40) == 0x40 { GUT_QUIC_SHORT_HEADER_SIZE }
+        else { return None; }
     };
 
-    if orig_len < quic_hdr_len + 16 {
-        return None;
-    }
+    if orig_len < hdr_len + 16 { return None; }
 
-    if orig_len < quic_hdr_len + 16 {
-        return None;
-    }
+    let pad_byte = buf[hdr_len - 1];
+    let ballast_len = if (pad_byte & 0x40) != 0 { ((pad_byte & 0x3F) as usize) + 1 } else { 0 };
 
-    let pad_byte = buf[quic_hdr_len - 1];
-    let ballast_len = if (pad_byte & 0x40) != 0 {
-        ((pad_byte & 0x3F) as usize) + 1
-    } else {
-        0
-    };
+    let wg_off = hdr_len;
+    let wg_len = orig_len - hdr_len;
+    if ballast_len > wg_len { return None; }
+    let actual_wg_len = wg_len - ballast_len;
 
-    // Unmask header in-place if it was RFC-protected
-    if quic_hdr_len == GUT_QUIC_LONG_HEADER_SIZE {
-        let mut actual_dcid = [0u8; 8];
-        actual_dcid.copy_from_slice(&buf[6..14]);
-        let initial_secret = crate::proto::quic::derive_quic_initial_secret(&actual_dcid);
-        let client_secret = crate::proto::quic::derive_client_initial_secret(&initial_secret);
-        let (_q_key, _q_iv, q_hp) = crate::proto::quic::derive_quic_keys(&client_secret);
-        let hp_rk = crate::crypto::aes128_expand_key(&q_hp);
-        let mut hp_mask = [0u8; 16];
-        let sni_pos = 34; // Sample starts directly after PPN
-        crate::crypto::aes128_encrypt_block(&hp_rk, &buf[sni_pos..sni_pos+16].try_into().unwrap(), &mut hp_mask);
-        
-        buf[0] ^= hp_mask[0] & 0x0F;
-        for i in 0..4 {
-            buf[30 + i] ^= hp_mask[1 + i];
-        }
-    }
-
-    // We can decrypt ports from QUIC Header
-    let enc_ports = if quic_hdr_len == GUT_GOST_HEADER_SIZE {
+    let enc_ports = if hdr_len == GUT_GOST_HEADER_SIZE {
         u32::from_le_bytes(buf[4..8].try_into().unwrap())
-    } else if quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
+    } else if hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
         u32::from_le_bytes(buf[10..14].try_into().unwrap())
     } else {
-        u32::from_le_bytes(buf[24..28].try_into().unwrap()) // Ports were hidden in Token!
+        u32::from_le_bytes(buf[24..28].try_into().unwrap()) // Ports hidden in Token in Long Header
     };
 
     let plain_ports = feistel32_inv(enc_ports, feistel_rk) ^ FEISTEL_SALT_PORTS;
     let wg_sport = (plain_ports >> 16) as u16;
     let wg_dport = (plain_ports & 0xFFFF) as u16;
 
-    let wg_off = quic_hdr_len;
-    let wg_len = orig_len - quic_hdr_len;
-
-    if ballast_len > wg_len {
-        return None;
-    }
-    let actual_wg_len = wg_len - ballast_len;
-
     let nonce = wg_nonce32(&buf[wg_off..wg_off + actual_wg_len]);
-
     let ks47 = chacha_block_fast(key, 47, nonce, rounds);
     let ks47_b: [u8; 64] = unsafe { std::mem::transmute(ks47) };
-
-    // Decrypt first 16 bytes
-    if quic_hdr_len == GUT_QUIC_LONG_HEADER_SIZE {
-        // --- RFC-COMPLIANT QUIC INITIAL DECRYPTION FOR nDPI ---
-        let mut actual_dcid = [0u8; 8];
-        actual_dcid.copy_from_slice(&buf[6..14]);
-        let initial_secret = crate::proto::quic::derive_quic_initial_secret(&actual_dcid);
-        let client_secret = crate::proto::quic::derive_client_initial_secret(&initial_secret);
-        let (_q_key, _q_iv, q_hp) = crate::proto::quic::derive_quic_keys(&client_secret);
-
-        let hp_rk = crate::crypto::aes128_expand_key(&q_hp);
-        let mut hp_mask = [0u8; 16];
-        let sni_pos = 34; // Sample starts directly after PPN
-        crate::crypto::aes128_encrypt_block(&hp_rk, &buf[sni_pos..sni_pos+16].try_into().unwrap(), &mut hp_mask);
-        
-        buf[0] ^= hp_mask[0] & 0x0F;
-        for i in 0..4 {
-            buf[30 + i] ^= hp_mask[1 + i];
-        }
-    }
 
     xor16(&mut buf[wg_off..wg_off + 16], &ks47_b[0..16]);
     let wg_type = buf[wg_off] & 0x1F;
@@ -765,7 +697,6 @@ pub fn quic_decap(
         xor16(&mut buf[wg_off + 76..wg_off + 92], &ks47_b[16..32]);
     }
 
-    // Shift the unwrapped payload back to the start
     buf.copy_within(wg_off..wg_off + actual_wg_len, 0);
 
     Some((actual_wg_len, wg_sport, wg_dport))
@@ -973,7 +904,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     let orig_wg_size = size;
 
                     let sip_domain = peer.sip_domain.as_str();
-                    if let Some((new_size, dcid)) = quic_encap(
+                    if let Some((new_size, dcid)) = obfs_encap(
                         &mut buf,
                         size,
                         &key_init,
@@ -1031,7 +962,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 let dst_ip_str = dest.ip().to_string();
                                 let rtp_port = peer.ports.get(1).copied().unwrap_or(10000);
                                 let date_str = crate::tc::maps::format_sip_date_only(
-                                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+                                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
                                 );
                                 let sip_header_len = crate::proto::sip::write_header(
                                     &mut sip_buf,
@@ -1135,7 +1066,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         let src_ip_str = "127.0.0.1".to_string();
                         let dst_ip_str = src.ip().to_string();
                         let date_str = crate::tc::maps::format_sip_date_only(
-                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+                            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
                         );
                         let hlen = crate::proto::sip::write_header(
                             &mut sip_resp,
@@ -1157,17 +1088,17 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
 
                 // Verify this is GUT traffic — auto-detect gost mode in server mode
                 let (is_gut, detected_obfs) = if is_server {
-                    // Save first 6 bytes for fallback, as quic_verify(Gost) modifies them
+                    // Save first 6 bytes for fallback, as obfs_verify(Gost) modifies them
                     let mut original_start = [0u8; 6];
                     original_start.copy_from_slice(&buf[..6]);
 
                     // Try plain QUIC first
-                    if ((buf[0] & 0x40) == 0x40 || (buf[0] & 0x80) == 0x80) && quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Quic) {
+                    if ((buf[0] & 0x40) == 0x40 || (buf[0] & 0x80) == 0x80) && obfs_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Quic) {
                         (true, crate::config::ObfsMode::Quic)
                     } else {
                         // Restore and try GOST/Sip/Syslog (they all use gost_mask)
                         buf[..6].copy_from_slice(&original_start);
-                        if quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Gost) {
+                        if obfs_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Gost) {
                             (true, detected_prepend.unwrap_or(crate::config::ObfsMode::Gost))
                         } else {
                             (false, crate::config::ObfsMode::Quic)
@@ -1175,12 +1106,12 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     }
                 } else if obfs != crate::config::ObfsMode::Quic {
                     let ok = size >= GUT_QUIC_SHORT_HEADER_SIZE + 16
-                        && quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Gost);
+                        && obfs_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Gost);
                     (ok, obfs)
                 } else {
                     let fb = buf[0];
                     let ok = ((fb & 0x80) == 0x80 || (fb & 0x40) == 0x40)
-                        && quic_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Quic);
+                        && obfs_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Quic);
                     (ok, crate::config::ObfsMode::Quic)
                 };
 
@@ -1191,7 +1122,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                             let src_ip_str = "127.0.0.1".to_string();
                             let dst_ip_str = src.ip().to_string();
                             let date_str = crate::tc::maps::format_sip_date_only(
-                                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+                                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
                             );
                             let hlen = crate::proto::sip::write_header(
                             &mut sip_resp,
@@ -1225,7 +1156,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                 }
 
                 if let Some((new_size, _wg_sport, _wg_dport)) =
-                    quic_decap(&mut buf, size, &key_init, &feistel_rk, rounds, detected_obfs)
+                    obfs_decap(&mut buf, size, &key_init, &feistel_rk, rounds, detected_obfs)
                 {
                     if dynamic_peer && new_size >= 8 {
                         let wg_type = buf[0] & 0x1F;
