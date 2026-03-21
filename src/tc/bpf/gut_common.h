@@ -18,6 +18,14 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+/* ── Compile-time obfuscation mode ─────────────────────────────────────
+ * Exactly one GUT_MODE_* must be defined via -D flag in build.rs.
+ * Default: GUT_MODE_QUIC (backward-compatible QUIC encapsulation).   */
+#if !defined(GUT_MODE_QUIC) && !defined(GUT_MODE_GOST) && \
+    !defined(GUT_MODE_SYSLOG) && !defined(GUT_MODE_SIP)
+#define GUT_MODE_QUIC
+#endif
+
 #define MAX_PORTS 6
 /* Short header layout (14 bytes):
  * [0]=0x40 [1-4]=DCID [5-8]=PPN [9-10]=inner_sport_be [11-12]=inner_dport_be [13]=pad_len
@@ -102,7 +110,7 @@ struct gut_config
     __u8 tun_peer_ip6[16];       /* Remote veth peer IPv6 (zero if v4 only) */
     __u8 own_http3;              /* Respond to DPI probes via XDP_TX (1=yes) */
     __u8 dynamic_peer;           /* 1 = peer_ip unknown, learn from validated inbound packets */
-    __u8 obfs_gost;             /* 1 = noise mode: XOR quic[0..6] with quic[6..12] to hide QUIC signatures */
+    __u8 obfs_gost;              /* 1 = noise mode: XOR quic[0..6] with quic[6..12] to hide QUIC signatures */
 } __attribute__((packed));
 
 /* Dynamic peer endpoint — learned from validated inbound packets.
@@ -119,7 +127,7 @@ struct peer_endpoint
     __u8 server_ip6[16]; /* Last-seen IPv6 dest (server) */
     __u16 server_port;   /* Last-seen UDP dest port (server) */
     __u8 valid;          /* 1 = endpoint learned, 0 = not yet */
-    __u8 obfs_gost;     /* 1 = this client uses noise mode, 0 = plain quic (auto-detected) */
+    __u8 obfs_gost;      /* 1 = this client uses noise mode, 0 = plain quic (auto-detected) */
 };
 
 /* Per-CPU statistics */
@@ -1055,7 +1063,6 @@ static __always_inline __u8 is_quic_server(const struct gut_config *cfg)
 
 #endif /* __GUT_COMMON_H__ */
 
-
 static __always_inline void write_gost_header(__u8 *quic, void *data_end, __u32 ppn, __u32 enc_ports, __u32 pad_len)
 {
     if ((__u8 *)quic + GUT_GOST_HEADER_SIZE > (__u8 *)data_end)
@@ -1085,12 +1092,13 @@ static __always_inline void write_quic_long_header(__u8 *quic, void *data_end, _
         return;
 
     quic[0] = (wg_type == 3) ? 0xF0 : 0xC3;
-    
+
     __u32 time_gost = feistel32((__u32)bpf_ktime_get_ns(), cfg->feistel_rk);
     __u8 *gost_b = (__u8 *)&time_gost;
 
 #pragma unroll
-    for (int i = 1; i < 64; i++) {
+    for (int i = 1; i < 64; i++)
+    {
         quic[i] = pad_block[(i * 13) & 0x3F] ^ gost_b[i & 3];
     }
 
@@ -1118,7 +1126,7 @@ static __always_inline void write_quic_long_header(__u8 *quic, void *data_end, _
     quic[29] = total_quic_len & 0xFF;
 
     __builtin_memcpy(quic + 30, &ppn, 4);
-    
+
     // Simplistic fake Crypto frame to deceive some fast DPIs
     quic[34] = 0x06; // CRYPTO
     quic[35] = 0x00;

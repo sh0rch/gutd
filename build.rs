@@ -76,7 +76,52 @@ fn compile_tc_ebpf() {
         .build_and_generate(&ingress_skel)
         .expect("Failed to generate XDP ingress skeleton");
 
-    println!("cargo:warning=TC eBPF skeletons generated successfully");
+    // ── Gost mode skeletons ─────────────────────────────────────────
+
+    // Generate skeleton for egress Gost mode (outer IPv4)
+    let egress_gost_skel = out_dir.join("tc_gut_egress_gost.skel.rs");
+    SkeletonBuilder::new()
+        .source("src/tc/bpf/tc_gut_egress.bpf.c")
+        .clang_args([
+            "-I",
+            "src/tc/bpf",
+            &chacha_define,
+            "-DGUT_MODE_GOST",
+            &arch_include,
+        ])
+        .build_and_generate(&egress_gost_skel)
+        .expect("Failed to generate TC egress Gost (v4) skeleton");
+
+    // Generate skeleton for egress Gost mode (outer IPv6)
+    let egress_gost_v6_skel = out_dir.join("tc_gut_egress_gost_v6.skel.rs");
+    SkeletonBuilder::new()
+        .source("src/tc/bpf/tc_gut_egress.bpf.c")
+        .clang_args([
+            "-I",
+            "src/tc/bpf",
+            &chacha_define,
+            "-DGUT_MODE_GOST",
+            "-DGUT_OUTER_IPV6",
+            &arch_include,
+        ])
+        .build_and_generate(&egress_gost_v6_skel)
+        .expect("Failed to generate TC egress Gost (v6) skeleton");
+
+    // Generate skeleton for XDP ingress Gost mode
+    let ingress_gost_skel = out_dir.join("xdp_gut_ingress_gost.skel.rs");
+    SkeletonBuilder::new()
+        .source("src/tc/bpf/xdp_gut_ingress.bpf.c")
+        .clang_args([
+            "-I",
+            "src/tc/bpf",
+            &chacha_define,
+            "-DGUT_MODE_GOST",
+            &arch_include,
+        ])
+        .build_and_generate(&ingress_gost_skel)
+        .expect("Failed to generate XDP ingress Gost skeleton");
+
+    println!("cargo:warning=TC eBPF skeletons generated successfully (QUIC + Gost)");
 }
 
 fn get_git_version() -> Option<String> {

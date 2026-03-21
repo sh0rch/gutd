@@ -114,6 +114,9 @@ int gut_egress(struct __sk_buff *skb)
     if (tunnel_port == 0)
         return TC_ACT_OK;
 
+#if defined(GUT_MODE_GOST)
+    __u32 quic_hdr_len = GUT_GOST_HEADER_SIZE;
+#else /* GUT_MODE_QUIC */
     __u8 is_server = is_quic_server(cfg);
     __u32 quic_hdr_len;
     if (wg_type == 3)
@@ -129,23 +132,31 @@ int gut_egress(struct __sk_buff *skb)
     {
         quic_hdr_len = (wg_type == 1) ? GUT_QUIC_LONG_HEADER_SIZE : GUT_QUIC_SHORT_HEADER_SIZE;
     }
+#endif
 
     __u32 *ks69 = (__u32 *)(scratch + 64);
     chacha_block(ks69, cfg->chacha_init, 69, nonce);
     __u8 *pad_block = (__u8 *)ks69;
 
-    /* Ballast for small packets: uniform [1..64] bytes.
-     * Wire encoding: last QUIC header byte = 0x40 | (raw & 0x3F)
+    /* Ballast for small packets.
+     * Wire encoding: last header byte = 0x40 | (raw & 0x3F)
      *   bit6 (0x40) = "has ballast" flag
      *   bits[0:5]   = raw ∈ [0..63], actual ballast = raw+1 → [1..64]
      * Large packets (no ballast): the byte stays 0x00 — bit6 clear = no trim.
+     * Gost mode: 16-byte aligned → {16,32,48,64} for cleaner block structure.
+     * QUIC mode: uniform [1..64] bytes.
      * Verifier note: after bpf_skb_change_tail spills pad_len to stack the
      * tnum loses umin; explicit re-check restores [1,64] before the store. */
     __u32 pad_len = 0;
     if (wg_len < BALLAST_THRESHOLD)
     {
+#if defined(GUT_MODE_GOST)
+        __u32 raw = (pad_block[63] >> 4) & 0x03; /* [0..3] uniform */
+        pad_len = (raw + 1) << 4;                /* {16, 32, 48, 64} */
+#else
         __u32 raw = pad_block[63] & 0x3F; /* [0..63] uniform */
         pad_len = raw + 1;                /* [1..64] */
+#endif
         if (bpf_skb_change_tail(skb, skb->len + pad_len, 0) < 0)
             return TC_ACT_OK;
         /* Re-establish [1,64] for verifier after potential stack reload. */
@@ -265,6 +276,9 @@ int gut_egress(struct __sk_buff *skb)
     __u32 new_quic_off = 14 + shift_len;
     __u8 *quic = (__u8 *)data + new_quic_off;
 
+#if defined(GUT_MODE_GOST)
+    write_gost_header(quic, data_end, ppn, enc_ports, pad_len);
+#else /* GUT_MODE_QUIC */
     if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
     {
         if ((__u8 *)quic + GUT_QUIC_SHORT_HEADER_SIZE > (__u8 *)data_end)
@@ -331,24 +345,7 @@ int gut_egress(struct __sk_buff *skb)
      *   0x00           = no ballast (large packet path, pad_len==0)
      *   0x40 | raw     = has ballast; actual len = (raw & 0x3F) + 1 → [1..64] */
     quic[quic_hdr_len - 1] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
-
-    /* Per-client noise mode: in dynamic_peer mode read from client_map,
-     * otherwise fall back to global cfg->obfs_gost. */
-    __u8 use_noise = cfg->obfs_gost;
-    if (cfg->dynamic_peer)
-    {
-        struct peer_endpoint *noise_ep = bpf_map_lookup_elem(&client_map, &c_idx);
-        if (noise_ep && noise_ep->valid)
-            use_noise = noise_ep->obfs_gost;
-    }
-
-    /* Noise mode: XOR first 6 bytes with bytes [6..12] to hide QUIC signatures */
-    if (use_noise)
-    {
-#pragma unroll
-        for (int i = 0; i < 6; i++)
-            quic[i] ^= quic[6 + i];
-    }
+#endif /* GUT_MODE */
 
     if (ipver == 4)
     {
