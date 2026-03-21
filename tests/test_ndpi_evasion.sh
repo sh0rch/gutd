@@ -249,7 +249,7 @@ sleep 1
 
 log "Running ndpiReader analysis..."
 RESULTS_FILE="/tmp/ndpi_results.txt"
-ndpiReader -i $PCAP_FILE > $RESULTS_FILE
+ndpiReader -v2 -i $PCAP_FILE > $RESULTS_FILE
 
 echo ""
 echo "=== FULL nDPI REPORT ==="

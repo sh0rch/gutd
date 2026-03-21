@@ -268,8 +268,6 @@ fn xor16(p: &mut [u8], k: &[u8]) {
     }
 }
 
-
-
 #[allow(clippy::too_many_arguments)]
 pub fn obfs_encap(
     buf: &mut [u8],
@@ -288,7 +286,9 @@ pub fn obfs_encap(
     }
 
     let wg_type = buf[0] & 0x1F;
-    let quic_hdr_len = if obfs != crate::config::ObfsMode::Quic { GUT_GOST_HEADER_SIZE } else if wg_type == 3 {
+    let quic_hdr_len = if obfs != crate::config::ObfsMode::Quic {
+        GUT_GOST_HEADER_SIZE
+    } else if wg_type == 3 {
         // Cookie Reply → QUIC Retry long header (must never be dropped)
         GUT_QUIC_LONG_HEADER_SIZE
     } else if is_server {
@@ -356,7 +356,7 @@ pub fn obfs_encap(
         } else {
             0x1F // 1..32
         };
-        
+
         if max_pad > 0 {
             let raw = pad_block[63] & max_pad;
             pad_len = (raw as usize) + 1;
@@ -375,15 +375,15 @@ pub fn obfs_encap(
     }
 
     let dcid = feistel32(wg_idx, feistel_rk);
-    
+
     if quic_hdr_len == GUT_GOST_HEADER_SIZE {
         write_gost_header(buf, ppn, enc_ports, pad_len);
     } else if quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
         write_quic_short_header(buf, dcid, ppn, enc_ports, pad_len);
     } else {
         write_quic_long_header(
-            buf, wg_type, wg_idx, dcid, ppn, enc_ports, pad_len,
-            orig_len, wg_off, &pad_block, feistel_rk, sip_domain
+            buf, wg_type, wg_idx, dcid, ppn, enc_ports, pad_len, orig_len, wg_off, &pad_block,
+            feistel_rk, sip_domain,
         );
     }
 
@@ -394,13 +394,16 @@ pub fn obfs_encap(
 /// In gost mode, unmasking is applied to the first 6 bytes in-place on success;
 /// on failure, the original bytes are restored.
 
-
 #[inline]
 fn write_gost_header(buf: &mut [u8], ppn: u32, enc_ports: u32, pad_len: usize) {
     buf[0..4].copy_from_slice(&ppn.to_le_bytes());
     buf[4..8].copy_from_slice(&enc_ports.to_le_bytes());
     buf[8] = 0x00;
-    buf[9] = if pad_len > 0 { 0x40 | ((pad_len as u8 - 1) & 0x3F) } else { 0 };
+    buf[9] = if pad_len > 0 {
+        0x40 | ((pad_len as u8 - 1) & 0x3F)
+    } else {
+        0
+    };
 }
 
 #[inline]
@@ -411,7 +414,11 @@ fn write_quic_short_header(buf: &mut [u8], dcid: u32, ppn: u32, enc_ports: u32, 
     buf[6..10].copy_from_slice(&ppn.to_le_bytes());
     buf[10..14].copy_from_slice(&enc_ports.to_le_bytes());
     buf[14] = 0x00; // Reserved
-    buf[15] = if pad_len > 0 { 0x40 | ((pad_len as u8 - 1) & 0x3F) } else { 0 };
+    buf[15] = if pad_len > 0 {
+        0x40 | ((pad_len as u8 - 1) & 0x3F)
+    } else {
+        0
+    };
 }
 
 #[inline]
@@ -479,77 +486,149 @@ fn write_quic_long_header(
     buf[14] = 0x08; // SCID length 8
     buf[15..19].copy_from_slice(&scid.to_le_bytes());
     buf[19..23].copy_from_slice(&scid2.to_le_bytes());
-    
+
     buf[23] = 0x04; // Token length 4
     buf[24..28].copy_from_slice(&enc_ports.to_le_bytes()); // Hide enc_ports in Token
-    
-    // Payload Length varint 
-    let total_quic_len = (GUT_QUIC_LONG_HEADER_SIZE - 30) as u16;
-    buf[28] = 0x40 | ((total_quic_len >> 8) as u8);
-    buf[29] = (total_quic_len & 0xFF) as u8;
 
-    // --- RFC-COMPLIANT QUIC INITIAL ENCRYPTION FOR nDPI ---
+    // --- Build CRYPTO frame with TLS 1.3 ClientHello containing SNI ---
     let initial_secret = crate::proto::quic::derive_quic_initial_secret(&actual_dcid);
     let client_secret = crate::proto::quic::derive_client_initial_secret(&initial_secret);
     let (q_key, q_iv, q_hp) = crate::proto::quic::derive_quic_keys(&client_secret);
 
-    let sni_pos = 34; // Immediately after PPN!
+    let sni_pos = 34; // Immediately after PPN (pn_offset + 4 = 30 + 4)
     let mut crypto_frame = [0u8; 128];
+
+    let domain_bytes = sip_domain.as_bytes();
+    let domain_len = domain_bytes.len().min(32);
+
+    // SNI extension: type(2) + ext_len(2) + list_len(2) + name_type(1) + name_len(2) + name
+    let sni_ext_data_len = if domain_len > 0 { domain_len + 5 } else { 0 };
+    let sni_ext_total = if domain_len > 0 {
+        sni_ext_data_len + 4
+    } else {
+        0
+    };
+    // ALPN extension with "h3": type(2) + len(2) + list_len(2) + proto_len(1) + "h3"(2) = 9
+    let alpn_ext_total = 9;
+    // supported_versions: type(2) + len(2) + list_len(1) + version(2) = 7
+    let sv_ext_total = 7;
+    let extensions_len = sni_ext_total + alpn_ext_total + sv_ext_total;
+    let ch_body_len = 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + extensions_len; // 43 + extensions_len
+    let handshake_len = ch_body_len + 4; // +type(1)+length(3)
+    let crypto_data_len = handshake_len;
+    let crypto_frame_total = 4 + crypto_data_len; // CRYPTO frame header(4) + data
+
     // CRYPTO frame header
     crypto_frame[0] = 0x06; // Type: CRYPTO
     crypto_frame[1] = 0x00; // Offset 0
-    crypto_frame[2] = 0x40; // Length
-    crypto_frame[3] = 0x64;
-    
-    // Handshake: Client Hello
-    crypto_frame[4] = 0x01; // Client Hello
-    crypto_frame[7] = 0x60; // Length
-    crypto_frame[8] = 0x03; // TLS 1.3
+    crypto_frame[2] = 0x40 | ((crypto_data_len >> 8) & 0x3F) as u8;
+    crypto_frame[3] = (crypto_data_len & 0xFF) as u8;
+    // Handshake: ClientHello
+    crypto_frame[4] = 0x01;
+    crypto_frame[5] = 0;
+    crypto_frame[6] = ((ch_body_len >> 8) & 0xFF) as u8;
+    crypto_frame[7] = (ch_body_len & 0xFF) as u8;
+    // Legacy version 0x0303
+    crypto_frame[8] = 0x03;
     crypto_frame[9] = 0x03;
-    
-    // SNI Extension
-    let domain_bytes = sip_domain.as_bytes();
-    let domain_len = domain_bytes.len().min(32);
+    // Random: 32 bytes [10..42]
+    for i in 0..32 {
+        crypto_frame[10 + i] = entropy_source[i & 31];
+    }
+    // Session ID length = 0
+    crypto_frame[42] = 0x00;
+    // Cipher Suites: TLS_AES_128_GCM_SHA256 (0x1301)
+    crypto_frame[43] = 0x00;
+    crypto_frame[44] = 0x02;
+    crypto_frame[45] = 0x13;
+    crypto_frame[46] = 0x01;
+    // Compression Methods: null
+    crypto_frame[47] = 0x01;
+    crypto_frame[48] = 0x00;
+    // Extensions length
+    crypto_frame[49] = ((extensions_len >> 8) & 0xFF) as u8;
+    crypto_frame[50] = (extensions_len & 0xFF) as u8;
+    // SNI Extension (type 0x0000)
+    let mut ext_off = 51;
     if domain_len > 0 {
-        let ext_pos = 4 + 40; // Skip CRYPTO hdr + Handshake HDR + Random...
-        crypto_frame[ext_pos] = 0x00; // SNI Extension type
-        crypto_frame[ext_pos+1] = 0x00;
-        crypto_frame[ext_pos+3] = (domain_len + 5) as u8;
-        crypto_frame[ext_pos+5] = (domain_len + 3) as u8;
-        crypto_frame[ext_pos+8] = domain_len as u8;
-        crypto_frame[ext_pos+9..ext_pos+9+domain_len].copy_from_slice(&domain_bytes[..domain_len]);
+        crypto_frame[ext_off] = 0x00;
+        crypto_frame[ext_off + 1] = 0x00;
+        crypto_frame[ext_off + 2] = ((sni_ext_data_len >> 8) & 0xFF) as u8;
+        crypto_frame[ext_off + 3] = (sni_ext_data_len & 0xFF) as u8;
+        let list_len = domain_len + 3;
+        crypto_frame[ext_off + 4] = ((list_len >> 8) & 0xFF) as u8;
+        crypto_frame[ext_off + 5] = (list_len & 0xFF) as u8;
+        crypto_frame[ext_off + 6] = 0x00; // host_name type
+        crypto_frame[ext_off + 7] = ((domain_len >> 8) & 0xFF) as u8;
+        crypto_frame[ext_off + 8] = (domain_len & 0xFF) as u8;
+        crypto_frame[ext_off + 9..ext_off + 9 + domain_len]
+            .copy_from_slice(&domain_bytes[..domain_len]);
+        ext_off += sni_ext_total;
     }
+    // ALPN Extension (type 0x0010) with "h3"
+    crypto_frame[ext_off] = 0x00;
+    crypto_frame[ext_off + 1] = 0x10; // ALPN type
+    crypto_frame[ext_off + 2] = 0x00;
+    crypto_frame[ext_off + 3] = 0x05; // ext data len: list_len(2) + proto_len(1) + "h3"(2)
+    crypto_frame[ext_off + 4] = 0x00;
+    crypto_frame[ext_off + 5] = 0x03; // ALPN list len: proto_len(1) + "h3"(2)
+    crypto_frame[ext_off + 6] = 0x02; // proto string len
+    crypto_frame[ext_off + 7] = b'h';
+    crypto_frame[ext_off + 8] = b'3';
+    ext_off += alpn_ext_total;
+    // supported_versions Extension (type 0x002b)
+    crypto_frame[ext_off] = 0x00;
+    crypto_frame[ext_off + 1] = 0x2b; // supported_versions type
+    crypto_frame[ext_off + 2] = 0x00;
+    crypto_frame[ext_off + 3] = 0x03; // ext data len: list_len(1) + version(2)
+    crypto_frame[ext_off + 4] = 0x02; // list length
+    crypto_frame[ext_off + 5] = 0x03;
+    crypto_frame[ext_off + 6] = 0x04; // TLS 1.3 = 0x0304
 
-    // Encrypt with AES-GCM (simplified to CTR as it's often enough for DPI if they don't check tag)
-    // Using AES-128-CTR with q_key and q_iv
+    // Payload Length varint: PN(4) + ciphertext(crypto_frame_total) + GCM_tag(16)
+    let quic_payload_len = (4 + crypto_frame_total + 16) as u16;
+    buf[28] = 0x40 | ((quic_payload_len >> 8) as u8);
+    buf[29] = (quic_payload_len & 0xFF) as u8;
+
+    // AEAD nonce: IV XOR left-padded PPN in big-endian (RFC 9001 §5.3)
+    let ppn_be = ppn.to_be_bytes();
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&q_iv);
+    nonce[8] ^= ppn_be[0];
+    nonce[9] ^= ppn_be[1];
+    nonce[10] ^= ppn_be[2];
+    nonce[11] ^= ppn_be[3];
+
+    // AAD = unprotected header [0..30] + PN in big-endian (RFC 9001 §5.3)
+    let mut aad = [0u8; 34];
+    aad[..30].copy_from_slice(&buf[..30]);
+    aad[30..34].copy_from_slice(&ppn_be);
+
+    // AES-128-GCM encrypt
     let rk = crate::crypto::aes128_expand_key(&q_key);
-    for i in 0..8 {
-        let mut nonce_iv = [0u8; 16];
-        nonce_iv[..12].copy_from_slice(&q_iv);
-        // Packet number is at index 26..30 (4 bytes), let's use it as partial PN
-        let pn = u32::from_le_bytes(ppn.to_le_bytes()); // Use the same PPN as IV part
-        for j in 0..4 { nonce_iv[8+j] ^= ((pn >> (j*8)) & 0xFF) as u8; }
-        nonce_iv[15] ^= i as u8; // Simple block counter in last byte
-        let mut ks = [0u8; 16];
-        crate::crypto::aes128_encrypt_block(&rk, &nonce_iv, &mut ks);
-        for (j, k_val) in ks.iter().enumerate() {
-            let idx = i * 16 + j;
-            if idx < crypto_frame.len() {
-                buf[sni_pos + idx] = crypto_frame[idx] ^ *k_val;
-            }
-        }
-    }
+    let mut gcm_tag = [0u8; 16];
+    crate::crypto::aes128_gcm_encrypt(
+        &rk,
+        &nonce,
+        &aad,
+        &crypto_frame[..crypto_frame_total],
+        &mut buf[sni_pos..sni_pos + crypto_frame_total],
+        &mut gcm_tag,
+    );
+    buf[sni_pos + crypto_frame_total..sni_pos + crypto_frame_total + 16].copy_from_slice(&gcm_tag);
 
-    // Header Protection
+    // Header Protection (RFC 9001 §5.4)
     let hp_rk = crate::crypto::aes128_expand_key(&q_hp);
     let mut hp_mask = [0u8; 16];
-    // Sample from buf[sni_pos..sni_pos+16]
-    crate::crypto::aes128_encrypt_block(&hp_rk, &buf[sni_pos..sni_pos+16].try_into().unwrap(), &mut hp_mask);
-    
-    // Write the PPN so it's protected by the mask!
-    buf[30..34].copy_from_slice(&ppn.to_le_bytes());
+    crate::crypto::aes128_encrypt_block(
+        &hp_rk,
+        &buf[sni_pos..sni_pos + 16].try_into().unwrap(),
+        &mut hp_mask,
+    );
 
-    buf[0] ^= hp_mask[0] & 0x0F; // Long header mask
+    // Write PPN in big-endian, then mask with HP
+    buf[30..34].copy_from_slice(&ppn_be);
+    buf[0] ^= hp_mask[0] & 0x0F;
     for i in 0..4 {
         buf[30 + i] ^= hp_mask[1 + i];
     }
@@ -569,30 +648,46 @@ pub fn obfs_verify(
     rounds: u8,
     obfs: crate::config::ObfsMode,
 ) -> bool {
-    if orig_len == 0 { return false; }
+    if orig_len == 0 {
+        return false;
+    }
     let first_byte = buf[0];
     let hdr_len = if obfs != crate::config::ObfsMode::Quic {
         GUT_GOST_HEADER_SIZE
     } else if (first_byte & 0xC0) == 0xC0 {
-        if buf.len() <= 5 || buf[5] != 0x08 { return false; }
+        if buf.len() <= 5 || buf[5] != 0x08 {
+            return false;
+        }
         GUT_QUIC_LONG_HEADER_SIZE
     } else if (first_byte & 0x40) == 0x40 {
-        if buf.len() <= 5 || buf[5] != 0x01 { return false; }
+        if buf.len() <= 5 || buf[5] != 0x01 {
+            return false;
+        }
         GUT_QUIC_SHORT_HEADER_SIZE
     } else {
         return false;
     };
 
-    if orig_len < hdr_len + 32 { return false; }
-    
+    if orig_len < hdr_len + 32 {
+        return false;
+    }
+
     let pad_byte = buf[hdr_len - 1];
-    let ballast_len = if (pad_byte & 0x40) != 0 { ((pad_byte & 0x3F) as usize) + 1 } else { 0 };
-    
+    let ballast_len = if (pad_byte & 0x40) != 0 {
+        ((pad_byte & 0x3F) as usize) + 1
+    } else {
+        0
+    };
+
     let wg_off = hdr_len;
     let wg_len = orig_len - hdr_len;
-    if ballast_len > wg_len { return false; }
+    if ballast_len > wg_len {
+        return false;
+    }
     let actual_wg_len = wg_len - ballast_len;
-    if actual_wg_len < 32 { return false; }
+    if actual_wg_len < 32 {
+        return false;
+    }
 
     let nonce = wg_nonce32(&buf[wg_off..wg_off + actual_wg_len]);
     let ks47 = chacha_block_fast(key, 47, nonce, rounds);
@@ -631,15 +726,23 @@ pub fn obfs_verify(
         let hp_rk = crate::crypto::aes128_expand_key(&q_hp);
         let mut hp_mask = [0u8; 16];
         let sni_pos = 34; // Sample starts directly after PPN
-        crate::crypto::aes128_encrypt_block(&hp_rk, &buf[sni_pos..sni_pos+16].try_into().unwrap(), &mut hp_mask);
-        
+        crate::crypto::aes128_encrypt_block(
+            &hp_rk,
+            &buf[sni_pos..sni_pos + 16].try_into().unwrap(),
+            &mut hp_mask,
+        );
+
         let fb_unmasked = buf[0] ^ (hp_mask[0] & 0x0F);
-        if (fb_unmasked & 0x80) == 0 { return false; }
-        
+        if (fb_unmasked & 0x80) == 0 {
+            return false;
+        }
+
         // Use wrapping logic or direct bit logic instead of mutating buf!
-        let pkt_ppn = u32::from_le_bytes(buf[30..34].try_into().unwrap()) ^ u32::from_le_bytes(hp_mask[1..5].try_into().unwrap());
+        // PPN is stored in big-endian (RFC 9000 §17.1), so read as BE
+        let pkt_ppn = u32::from_be_bytes(buf[30..34].try_into().unwrap())
+            ^ u32::from_be_bytes(hp_mask[1..5].try_into().unwrap());
         let pkt_dcid = u32::from_le_bytes(buf[6..10].try_into().unwrap());
-        
+
         pkt_dcid == expected_dcid && pkt_ppn == expected_ppn
     }
 }
@@ -652,24 +755,38 @@ pub fn obfs_decap(
     rounds: u8,
     obfs: crate::config::ObfsMode,
 ) -> Option<(usize, u16, u16)> {
-    if orig_len == 0 { return None; }
+    if orig_len == 0 {
+        return None;
+    }
     let hdr_len = if obfs != crate::config::ObfsMode::Quic {
         GUT_GOST_HEADER_SIZE
     } else {
         let first_byte = buf[0];
-        if (first_byte & 0x80) == 0x80 { GUT_QUIC_LONG_HEADER_SIZE }
-        else if (first_byte & 0x40) == 0x40 { GUT_QUIC_SHORT_HEADER_SIZE }
-        else { return None; }
+        if (first_byte & 0x80) == 0x80 {
+            GUT_QUIC_LONG_HEADER_SIZE
+        } else if (first_byte & 0x40) == 0x40 {
+            GUT_QUIC_SHORT_HEADER_SIZE
+        } else {
+            return None;
+        }
     };
 
-    if orig_len < hdr_len + 16 { return None; }
+    if orig_len < hdr_len + 16 {
+        return None;
+    }
 
     let pad_byte = buf[hdr_len - 1];
-    let ballast_len = if (pad_byte & 0x40) != 0 { ((pad_byte & 0x3F) as usize) + 1 } else { 0 };
+    let ballast_len = if (pad_byte & 0x40) != 0 {
+        ((pad_byte & 0x3F) as usize) + 1
+    } else {
+        0
+    };
 
     let wg_off = hdr_len;
     let wg_len = orig_len - hdr_len;
-    if ballast_len > wg_len { return None; }
+    if ballast_len > wg_len {
+        return None;
+    }
     let actual_wg_len = wg_len - ballast_len;
 
     let enc_ports = if hdr_len == GUT_GOST_HEADER_SIZE {
@@ -722,44 +839,44 @@ fn generate_quic_version_negotiation(buf: &[u8], size: usize) -> Option<Vec<u8>>
         return None;
     }
     let dcid = &buf[6..6 + dcid_len];
-    
+
     let scid_len = buf[6 + dcid_len] as usize;
     if 6 + dcid_len + 1 + scid_len > size {
         return None;
     }
-    
-    // RFC 9000 Version Negotiation restricts SCID to 255 bytes max technically, 
+
+    // RFC 9000 Version Negotiation restricts SCID to 255 bytes max technically,
     // but QUIC Initial enforces smaller lengths typically.
     let scid = &buf[6 + dcid_len + 1..6 + dcid_len + 1 + scid_len];
 
     // Capacity = 1 (header) + 4 (version 0) + 1 (dcid_len) + scid_len + 1 (scid_len) + dcid_len + 8 (supported versions)
     let total_len = 1 + 4 + 1 + scid.len() + 1 + dcid.len() + 8;
     let mut resp = Vec::with_capacity(total_len);
-    
+
     // Header Form (1) = 1, Fixed Bit (1) = 1, Random Unused (6 bits)
     let mut rand_bits = 0x0A;
     if !dcid.is_empty() {
         rand_bits = dcid[0] & 0x3F;
     }
     resp.push(0x80 | 0x40 | rand_bits);
-    
+
     // Version = 0
     resp.extend_from_slice(&[0, 0, 0, 0]);
-    
+
     // DCID Length is length of client's SCID
     resp.push(scid.len() as u8);
     resp.extend_from_slice(scid);
-    
+
     // SCID Length is length of client's DCID
     resp.push(dcid.len() as u8);
     resp.extend_from_slice(dcid);
-    
+
     // Supported Versions
     // Advertise our internal QUIC version first
     resp.extend_from_slice(&[0x6b, 0x33, 0x43, 0xcf]);
     // Advertise standard QUIC v1
     resp.extend_from_slice(&[0, 0, 0, 1]);
-    
+
     Some(resp)
 }
 
@@ -785,8 +902,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
 
     println!(
         "Starting gutd-userspace proxy (dual-thread). is_server={} obfs={:?}",
-        is_server,
-        obfs
+        is_server, obfs
     );
 
     let wg_host_str = env::var("GUTD_WG_HOST").unwrap_or_else(|_| peer.wg_host.clone());
@@ -836,7 +952,8 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let client_map: Arc<Mutex<HashMap<u32, SocketAddr>>> = Arc::new(Mutex::new(HashMap::new()));
     let session_map: Arc<Mutex<HashMap<u32, u32>>> = Arc::new(Mutex::new(HashMap::new()));
     // Per-client gost mode (auto-detected by ingress, read by egress in server mode)
-    let client_obfs: Arc<Mutex<HashMap<SocketAddr, crate::config::ObfsMode>>> = Arc::new(Mutex::new(HashMap::new()));
+    let client_obfs: Arc<Mutex<HashMap<SocketAddr, crate::config::ObfsMode>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     // ── Thread 1: EGRESS (WG → encap → remote peer) ──────────────────
     let egress_exts: Vec<Arc<UdpSocket>> = ext_sockets.iter().map(Arc::clone).collect();
@@ -853,9 +970,34 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
             let mut buf = [0u8; 65536];
             let mut out_buf = [0u8; 65536];
 
+            // NAT keepalive: client sends a minimal QUIC Short Header every 25s of idle
+            let ka_interval = std::time::Duration::from_secs(25);
+            if !is_server {
+                let _ = egress_local.set_read_timeout(Some(ka_interval));
+            }
+            // Reusable keepalive packet: 0x40 (Short Header) + 15 zero bytes + 0x01 (PING frame)
+            let ka_pkt: [u8; 17] = {
+                let mut p = [0u8; 17];
+                p[0] = 0x40;
+                p[16] = 0x01; // QUIC PING frame type
+                p
+            };
+
             loop {
                 let (size, src) = match egress_local.recv_from(&mut buf) {
                     Ok(r) => r,
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        // Idle timeout → send NAT keepalive
+                        if !is_server {
+                            if let Some(dest) = remote_peer_addr {
+                                let _ = egress_exts[0].send_to(&ka_pkt, dest);
+                            }
+                        }
+                        continue;
+                    }
                     Err(_) => continue,
                 };
 
@@ -933,8 +1075,10 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 let seq = (ts & 0xFFFF) as u16;
                                 let ssrc = dcid; // DCID from QUIC = unique session identifier
                                 crate::proto::sip::write_rtp_header(&mut out_buf, seq, ts, ssrc);
-                                out_buf[crate::proto::sip::RTP_HEADER_LEN..crate::proto::sip::RTP_HEADER_LEN + new_size].copy_from_slice(&buf[..new_size]);
-                                
+                                out_buf[crate::proto::sip::RTP_HEADER_LEN
+                                    ..crate::proto::sip::RTP_HEADER_LEN + new_size]
+                                    .copy_from_slice(&buf[..new_size]);
+
                                 if peer.ports.len() > 1 {
                                     sock_idx = 1 + (ts as usize % (peer.ports.len() - 1));
                                     final_dest.set_port(peer.ports[sock_idx]);
@@ -949,20 +1093,24 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                     4 if orig_wg_size == 32 => crate::proto::sip::SipKind::Options,
                                     _ => crate::proto::sip::SipKind::Message,
                                 };
-                                let b64_len = if matches!(sip_kind, crate::proto::sip::SipKind::Options) {
-                                    0
-                                } else {
-                                    crate::proto::base64::encode(
-                                        &buf[..new_size],
-                                        &mut out_buf[crate::proto::sip::MAX_SIP_HEADER_LEN..],
-                                    )
-                                };
+                                let b64_len =
+                                    if matches!(sip_kind, crate::proto::sip::SipKind::Options) {
+                                        0
+                                    } else {
+                                        crate::proto::base64::encode(
+                                            &buf[..new_size],
+                                            &mut out_buf[crate::proto::sip::MAX_SIP_HEADER_LEN..],
+                                        )
+                                    };
                                 let mut sip_buf = vec![0u8; crate::proto::sip::MAX_SIP_HEADER_LEN];
                                 let src_ip_str = src.ip().to_string();
                                 let dst_ip_str = dest.ip().to_string();
                                 let rtp_port = peer.ports.get(1).copied().unwrap_or(10000);
                                 let date_str = crate::tc::maps::format_sip_date_only(
-                                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+                                    SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs(),
                                 );
                                 let sip_header_len = crate::proto::sip::write_header(
                                     &mut sip_buf,
@@ -977,8 +1125,13 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                     &feistel_rk,
                                     &date_str,
                                 );
-                                out_buf.copy_within(crate::proto::sip::MAX_SIP_HEADER_LEN..crate::proto::sip::MAX_SIP_HEADER_LEN + b64_len, sip_header_len);
-                                out_buf[..sip_header_len].copy_from_slice(&sip_buf[..sip_header_len]);
+                                out_buf.copy_within(
+                                    crate::proto::sip::MAX_SIP_HEADER_LEN
+                                        ..crate::proto::sip::MAX_SIP_HEADER_LEN + b64_len,
+                                    sip_header_len,
+                                );
+                                out_buf[..sip_header_len]
+                                    .copy_from_slice(&sip_buf[..sip_header_len]);
 
                                 final_dest.set_port(peer.ports[0]);
                                 println!("[gutd] sending SIP to port {}", peer.ports[0]);
@@ -1006,131 +1159,83 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         let ingress_session_map = Arc::clone(&session_map);
         let ingress_client_obfs = Arc::clone(&client_obfs);
         let ingress_peer = peer.clone();
-        
+
         let ingress_handle = std::thread::Builder::new()
             .name(format!("gutd-ingress-{}", port_idx))
             .spawn(move || {
-            let mut buf = [0u8; 65536];
-            let mut out_buf = [0u8; 65536];
+                let mut buf = [0u8; 65536];
+                let mut out_buf = [0u8; 65536];
 
-            loop {
-                let (mut size, src) = match ingress_ext.recv_from(&mut buf) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
+                loop {
+                    let (mut size, src) = match ingress_ext.recv_from(&mut buf) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
 
-                // Decode Prepend+Base64 before any QUIC detection
-                let mut detected_prepend = None;
-                let mut was_sip_probe = false;
-                let mut was_rtp = false;
-                let mut sip_probe_kind = crate::proto::sip::SipKind::Response401;
-                
-                if crate::proto::syslog::check_header(&buf[..size]) {
-                    if let Some(decoded_len) = crate::proto::base64::decode(&buf[crate::proto::syslog::SYSLOG_HEADER_LEN..size], &mut out_buf) {
-                        buf[..decoded_len].copy_from_slice(&out_buf[..decoded_len]);
-                        size = decoded_len;
-                        detected_prepend = Some(crate::config::ObfsMode::Syslog);
-                    } else {
-                        continue;
-                    }
-                } else if let Some(sip_len) = crate::proto::sip::check_header(&buf[..size]) {
-                    if buf[..size].starts_with(b"OPTIONS ") {
-                        sip_probe_kind = crate::proto::sip::SipKind::Response200;
-                    } else if buf[..size].starts_with(b"REGISTER ") {
-                        sip_probe_kind = crate::proto::sip::SipKind::Response401;
-                    } else {
-                        sip_probe_kind = crate::proto::sip::SipKind::Response403;
-                    }
+                    // Decode Prepend+Base64 before any QUIC detection
+                    let mut detected_prepend = None;
+                    let mut was_sip_probe = false;
+                    let mut was_rtp = false;
+                    let mut sip_probe_kind = crate::proto::sip::SipKind::Response401;
 
-                    if let Some(decoded_len) = crate::proto::base64::decode(&buf[sip_len..size], &mut out_buf) {
-                        if decoded_len > 0 {
+                    if crate::proto::syslog::check_header(&buf[..size]) {
+                        if let Some(decoded_len) = crate::proto::base64::decode(
+                            &buf[crate::proto::syslog::SYSLOG_HEADER_LEN..size],
+                            &mut out_buf,
+                        ) {
                             buf[..decoded_len].copy_from_slice(&out_buf[..decoded_len]);
                             size = decoded_len;
-                            detected_prepend = Some(crate::config::ObfsMode::Sip);
+                            detected_prepend = Some(crate::config::ObfsMode::Syslog);
+                        } else {
+                            continue;
+                        }
+                    } else if let Some(sip_len) = crate::proto::sip::check_header(&buf[..size]) {
+                        if buf[..size].starts_with(b"OPTIONS ") {
+                            sip_probe_kind = crate::proto::sip::SipKind::Response200;
+                        } else if buf[..size].starts_with(b"REGISTER ") {
+                            sip_probe_kind = crate::proto::sip::SipKind::Response401;
+                        } else {
+                            sip_probe_kind = crate::proto::sip::SipKind::Response403;
+                        }
+
+                        if let Some(decoded_len) =
+                            crate::proto::base64::decode(&buf[sip_len..size], &mut out_buf)
+                        {
+                            if decoded_len > 0 {
+                                buf[..decoded_len].copy_from_slice(&out_buf[..decoded_len]);
+                                size = decoded_len;
+                                detected_prepend = Some(crate::config::ObfsMode::Sip);
+                            } else {
+                                was_sip_probe = true;
+                            }
                         } else {
                             was_sip_probe = true;
                         }
-                    } else {
-                        was_sip_probe = true;
+                    } else if crate::proto::sip::check_rtp_header(&buf[..size]) {
+                        buf.copy_within(crate::proto::sip::RTP_HEADER_LEN..size, 0);
+                        size -= crate::proto::sip::RTP_HEADER_LEN;
+                        detected_prepend = Some(crate::config::ObfsMode::Sip);
+                        was_rtp = true;
                     }
-                } else if crate::proto::sip::check_rtp_header(&buf[..size]) {
-                    buf.copy_within(crate::proto::sip::RTP_HEADER_LEN..size, 0);
-                    size -= crate::proto::sip::RTP_HEADER_LEN;
-                    detected_prepend = Some(crate::config::ObfsMode::Sip);
-                    was_rtp = true;
-                }
 
-                if was_sip_probe {
-                    if is_server {
-                        let mut sip_resp = vec![0u8; crate::proto::sip::MAX_SIP_HEADER_LEN];
-                        let src_ip_str = "127.0.0.1".to_string();
-                        let dst_ip_str = src.ip().to_string();
-                        let date_str = crate::tc::maps::format_sip_date_only(
-                            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
-                        );
-                        let hlen = crate::proto::sip::write_header(
-                            &mut sip_resp,
-                            sip_probe_kind,
-                            ingress_peer.sip_domain.as_str(),
-                            &src_ip_str,
-                            &dst_ip_str,
-                            5060,
-                            src.port(),
-                            10000,
-                            0,
-                            &feistel_rk,
-                            &date_str,
-                        );
-                        let _ = ingress_ext.send_to(&sip_resp[..hlen], src);
-                    }
-                    continue;
-                }
-
-                // Verify this is GUT traffic — auto-detect gost mode in server mode
-                let (is_gut, detected_obfs) = if is_server {
-                    // Save first 6 bytes for fallback, as obfs_verify(Gost) modifies them
-                    let mut original_start = [0u8; 6];
-                    original_start.copy_from_slice(&buf[..6]);
-
-                    // Try plain QUIC first
-                    if ((buf[0] & 0x40) == 0x40 || (buf[0] & 0x80) == 0x80) && obfs_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Quic) {
-                        (true, crate::config::ObfsMode::Quic)
-                    } else {
-                        // Restore and try GOST/Sip/Syslog (they all use gost_mask)
-                        buf[..6].copy_from_slice(&original_start);
-                        if obfs_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Gost) {
-                            (true, detected_prepend.unwrap_or(crate::config::ObfsMode::Gost))
-                        } else {
-                            (false, crate::config::ObfsMode::Quic)
-                        }
-                    }
-                } else if obfs != crate::config::ObfsMode::Quic {
-                    let ok = size >= GUT_QUIC_SHORT_HEADER_SIZE + 16
-                        && obfs_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Gost);
-                    (ok, obfs)
-                } else {
-                    let fb = buf[0];
-                    let ok = ((fb & 0x80) == 0x80 || (fb & 0x40) == 0x40)
-                        && obfs_verify(&mut buf, size, &key_init, &feistel_rk, rounds, crate::config::ObfsMode::Quic);
-                    (ok, crate::config::ObfsMode::Quic)
-                };
-
-                if !is_gut {
-                    if is_server {
-                        if detected_prepend == Some(crate::config::ObfsMode::Sip) && !was_rtp {
+                    if was_sip_probe {
+                        if is_server {
                             let mut sip_resp = vec![0u8; crate::proto::sip::MAX_SIP_HEADER_LEN];
                             let src_ip_str = "127.0.0.1".to_string();
                             let dst_ip_str = src.ip().to_string();
                             let date_str = crate::tc::maps::format_sip_date_only(
-                                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs(),
                             );
                             let hlen = crate::proto::sip::write_header(
-                            &mut sip_resp,
-                            sip_probe_kind,
+                                &mut sip_resp,
+                                sip_probe_kind,
                                 ingress_peer.sip_domain.as_str(),
                                 &src_ip_str,
                                 &dst_ip_str,
-                                4500,
+                                5060,
                                 src.port(),
                                 10000,
                                 0,
@@ -1138,53 +1243,153 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 &date_str,
                             );
                             let _ = ingress_ext.send_to(&sip_resp[..hlen], src);
-                        } else if obfs == crate::config::ObfsMode::Quic {
-                            if let Some(vn_resp) = generate_quic_version_negotiation(&buf, size) {
-                                let _ = ingress_ext.send_to(&vn_resp, src);
-                            }
                         }
-                    }
-                    continue;
-                }
-
-                // Store detected gost mode per client
-                if is_server {
-                    ingress_client_obfs
-                        .lock()
-                        .unwrap()
-                        .insert(src, detected_obfs);
-                }
-
-                if let Some((new_size, _wg_sport, _wg_dport)) =
-                    obfs_decap(&mut buf, size, &key_init, &feistel_rk, rounds, detected_obfs)
-                {
-                    if dynamic_peer && new_size >= 8 {
-                        let wg_type = buf[0] & 0x1F;
-                        if wg_type == 1 {
-                            let c_idx = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-                            if c_idx != 0 {
-                                ingress_client_map.lock().unwrap().insert(c_idx, src);
-                            }
-                        } else if wg_type == 4 {
-                            let s_idx = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-                            if let Some(&c_idx) = ingress_session_map.lock().unwrap().get(&s_idx) {
-                                ingress_client_map.lock().unwrap().insert(c_idx, src);
-                            }
-                        }
+                        continue;
                     }
 
-                    let dest = if is_server {
-                        Some(wg_addr)
+                    // Verify this is GUT traffic — auto-detect gost mode in server mode
+                    let (is_gut, detected_obfs) = if is_server {
+                        // Save first 6 bytes for fallback, as obfs_verify(Gost) modifies them
+                        let mut original_start = [0u8; 6];
+                        original_start.copy_from_slice(&buf[..6]);
+
+                        // Try plain QUIC first
+                        if ((buf[0] & 0x40) == 0x40 || (buf[0] & 0x80) == 0x80)
+                            && obfs_verify(
+                                &mut buf,
+                                size,
+                                &key_init,
+                                &feistel_rk,
+                                rounds,
+                                crate::config::ObfsMode::Quic,
+                            )
+                        {
+                            (true, crate::config::ObfsMode::Quic)
+                        } else {
+                            // Restore and try GOST/Sip/Syslog (they all use gost_mask)
+                            buf[..6].copy_from_slice(&original_start);
+                            if obfs_verify(
+                                &mut buf,
+                                size,
+                                &key_init,
+                                &feistel_rk,
+                                rounds,
+                                crate::config::ObfsMode::Gost,
+                            ) {
+                                (
+                                    true,
+                                    detected_prepend.unwrap_or(crate::config::ObfsMode::Gost),
+                                )
+                            } else {
+                                (false, crate::config::ObfsMode::Quic)
+                            }
+                        }
+                    } else if obfs != crate::config::ObfsMode::Quic {
+                        let ok = size >= GUT_QUIC_SHORT_HEADER_SIZE + 16
+                            && obfs_verify(
+                                &mut buf,
+                                size,
+                                &key_init,
+                                &feistel_rk,
+                                rounds,
+                                crate::config::ObfsMode::Gost,
+                            );
+                        (ok, obfs)
                     } else {
-                        ingress_wg_peer.load()
+                        let fb = buf[0];
+                        let ok = ((fb & 0x80) == 0x80 || (fb & 0x40) == 0x40)
+                            && obfs_verify(
+                                &mut buf,
+                                size,
+                                &key_init,
+                                &feistel_rk,
+                                rounds,
+                                crate::config::ObfsMode::Quic,
+                            );
+                        (ok, crate::config::ObfsMode::Quic)
                     };
 
-                    if let Some(d) = dest {
-                        let _ = ingress_local.send_to(&buf[..new_size], d);
+                    if !is_gut {
+                        if is_server {
+                            if detected_prepend == Some(crate::config::ObfsMode::Sip) && !was_rtp {
+                                let mut sip_resp = vec![0u8; crate::proto::sip::MAX_SIP_HEADER_LEN];
+                                let src_ip_str = "127.0.0.1".to_string();
+                                let dst_ip_str = src.ip().to_string();
+                                let date_str = crate::tc::maps::format_sip_date_only(
+                                    SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs(),
+                                );
+                                let hlen = crate::proto::sip::write_header(
+                                    &mut sip_resp,
+                                    sip_probe_kind,
+                                    ingress_peer.sip_domain.as_str(),
+                                    &src_ip_str,
+                                    &dst_ip_str,
+                                    4500,
+                                    src.port(),
+                                    10000,
+                                    0,
+                                    &feistel_rk,
+                                    &date_str,
+                                );
+                                let _ = ingress_ext.send_to(&sip_resp[..hlen], src);
+                            } else if obfs == crate::config::ObfsMode::Quic {
+                                if let Some(vn_resp) = generate_quic_version_negotiation(&buf, size)
+                                {
+                                    let _ = ingress_ext.send_to(&vn_resp, src);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Store detected gost mode per client
+                    if is_server {
+                        ingress_client_obfs
+                            .lock()
+                            .unwrap()
+                            .insert(src, detected_obfs);
+                    }
+
+                    if let Some((new_size, _wg_sport, _wg_dport)) = obfs_decap(
+                        &mut buf,
+                        size,
+                        &key_init,
+                        &feistel_rk,
+                        rounds,
+                        detected_obfs,
+                    ) {
+                        if dynamic_peer && new_size >= 8 {
+                            let wg_type = buf[0] & 0x1F;
+                            if wg_type == 1 {
+                                let c_idx = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+                                if c_idx != 0 {
+                                    ingress_client_map.lock().unwrap().insert(c_idx, src);
+                                }
+                            } else if wg_type == 4 {
+                                let s_idx = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+                                if let Some(&c_idx) =
+                                    ingress_session_map.lock().unwrap().get(&s_idx)
+                                {
+                                    ingress_client_map.lock().unwrap().insert(c_idx, src);
+                                }
+                            }
+                        }
+
+                        let dest = if is_server {
+                            Some(wg_addr)
+                        } else {
+                            ingress_wg_peer.load()
+                        };
+
+                        if let Some(d) = dest {
+                            let _ = ingress_local.send_to(&buf[..new_size], d);
+                        }
                     }
                 }
-            }
-        })?;
+            })?;
         ingress_handles.push(ingress_handle);
     }
 
