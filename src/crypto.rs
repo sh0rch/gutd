@@ -190,15 +190,20 @@ pub fn hkdf_extract(salt: &[u8], ikm: &[u8], prk: &mut [u8; 32]) {
 
 pub fn hkdf_expand(prk: &[u8; 32], info: &[u8], okm: &mut [u8]) {
     let n = okm.len().div_ceil(32);
-    let mut t = Vec::new();
+    let mut t = [0u8; 32];
+    let mut t_len: usize = 0;
     let mut offset = 0;
+    // Max msg size: 32 (prev T) + info + 1 (counter byte)
+    let mut msg = [0u8; 256];
 
     for i in 1..=n {
-        let mut msg = Vec::with_capacity(t.len() + info.len() + 1);
-        msg.extend_from_slice(&t);
-        msg.extend_from_slice(info);
-        msg.push(i as u8);
-        t = hmac_sha256(prk, &msg).to_vec();
+        let msg_len = t_len + info.len() + 1;
+        assert!(msg_len <= msg.len());
+        msg[..t_len].copy_from_slice(&t[..t_len]);
+        msg[t_len..t_len + info.len()].copy_from_slice(info);
+        msg[t_len + info.len()] = i as u8;
+        t = hmac_sha256(prk, &msg[..msg_len]);
+        t_len = 32;
 
         let copy_len = (okm.len() - offset).min(32);
         okm[offset..offset + copy_len].copy_from_slice(&t[..copy_len]);
@@ -207,15 +212,24 @@ pub fn hkdf_expand(prk: &[u8; 32], info: &[u8], okm: &mut [u8]) {
 }
 
 pub fn hkdf_expand_label(secret: &[u8; 32], label: &[u8], context: &[u8], okm: &mut [u8]) {
-    let mut info = Vec::new();
+    // Max info: 2 (length) + 1 (label_len) + 6 ("tls13 ") + label + 1 (ctx_len) + context
+    let mut info = [0u8; 256];
+    let mut pos = 0;
     let length = okm.len() as u16;
-    info.extend_from_slice(&length.to_be_bytes());
-    let full_label = [b"tls13 ", label].concat();
-    info.push(full_label.len() as u8);
-    info.extend_from_slice(&full_label);
-    info.push(context.len() as u8);
-    info.extend_from_slice(context);
-    hkdf_expand(secret, &info, okm);
+    info[pos..pos + 2].copy_from_slice(&length.to_be_bytes());
+    pos += 2;
+    let full_label_len = 6 + label.len();
+    info[pos] = full_label_len as u8;
+    pos += 1;
+    info[pos..pos + 6].copy_from_slice(b"tls13 ");
+    pos += 6;
+    info[pos..pos + label.len()].copy_from_slice(label);
+    pos += label.len();
+    info[pos] = context.len() as u8;
+    pos += 1;
+    info[pos..pos + context.len()].copy_from_slice(context);
+    pos += context.len();
+    hkdf_expand(secret, &info[..pos], okm);
 }
 
 fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], okm: &mut [u8]) {
@@ -314,10 +328,19 @@ pub fn aes128_encrypt_block(round_keys: &[u32; 44], block: &[u8; 16], out: &mut 
         *v ^= round_keys[i];
     }
 
+    fn state_bytes(s: &[u32; 4]) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[0..4].copy_from_slice(&s[0].to_be_bytes());
+        b[4..8].copy_from_slice(&s[1].to_be_bytes());
+        b[8..12].copy_from_slice(&s[2].to_be_bytes());
+        b[12..16].copy_from_slice(&s[3].to_be_bytes());
+        b
+    }
+
     for r in 1..10 {
         // SubBytes + ShiftRows
         let mut ns = [0u32; 4];
-        let bytes: Vec<u8> = s.iter().flat_map(|w| w.to_be_bytes().to_vec()).collect();
+        let bytes = state_bytes(&s);
         let sb = |idx: usize| SBOX[bytes[idx] as usize];
         ns[0] = u32::from_be_bytes([sb(0), sb(5), sb(10), sb(15)]);
         ns[1] = u32::from_be_bytes([sb(4), sb(9), sb(14), sb(3)]);
@@ -333,7 +356,7 @@ pub fn aes128_encrypt_block(round_keys: &[u32; 44], block: &[u8; 16], out: &mut 
     }
     // Final round (no mix columns)
     let mut ns = [0u32; 4];
-    let bytes: Vec<u8> = s.iter().flat_map(|w| w.to_be_bytes().to_vec()).collect();
+    let bytes = state_bytes(&s);
     let sb = |idx: usize| SBOX[bytes[idx] as usize];
     ns[0] = u32::from_be_bytes([sb(0), sb(5), sb(10), sb(15)]);
     ns[1] = u32::from_be_bytes([sb(4), sb(9), sb(14), sb(3)]);
@@ -374,7 +397,7 @@ fn ghash(h: &[u8; 16], aad: &[u8], ct: &[u8]) -> [u8; 16] {
     let mut x = [0u8; 16];
 
     // Process AAD blocks (zero-padded to 16-byte boundary)
-    let aad_blocks = (aad.len() + 15) / 16;
+    let aad_blocks = aad.len().div_ceil(16);
     for i in 0..aad_blocks {
         let start = i * 16;
         let end = (start + 16).min(aad.len());
@@ -387,7 +410,7 @@ fn ghash(h: &[u8; 16], aad: &[u8], ct: &[u8]) -> [u8; 16] {
     }
 
     // Process ciphertext blocks (zero-padded to 16-byte boundary)
-    let ct_blocks = (ct.len() + 15) / 16;
+    let ct_blocks = ct.len().div_ceil(16);
     for i in 0..ct_blocks {
         let start = i * 16;
         let end = (start + 16).min(ct.len());
@@ -433,7 +456,7 @@ pub fn aes128_gcm_encrypt(
     j0[15] = 1;
 
     // Encrypt plaintext with counter starting at J0+1 (= nonce || 0x00000002)
-    let n_blocks = (plaintext.len() + 15) / 16;
+    let n_blocks = plaintext.len().div_ceil(16);
     for i in 0..n_blocks {
         let counter = (i as u32 + 2).to_be_bytes();
         let mut ctr_block = [0u8; 16];

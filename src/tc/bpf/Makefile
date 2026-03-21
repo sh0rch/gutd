@@ -33,18 +33,30 @@ endif
 # Disable some warnings that are common in eBPF code
 BPF_CFLAGS += -Wno-unused-value -Wno-pointer-sign -Wno-compare-distinct-pointer-types
 
-TARGETS := tc_gut_egress.o xdp_gut_ingress.o
+QUIC_TARGETS := tc_gut_egress.o xdp_gut_ingress.o
+GOST_TARGETS := tc_gut_egress_gost.o xdp_gut_ingress_gost.o
+TARGETS := $(QUIC_TARGETS) $(GOST_TARGETS)
 
-.PHONY: all clean debug
+.PHONY: all clean debug verify
 
 all: $(TARGETS)
 
+# ── QUIC mode (default) ──
 tc_gut_egress.o: tc_gut_egress.bpf.c gut_common.h
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 	$(LLVM_STRIP) -g $@
 
 xdp_gut_ingress.o: xdp_gut_ingress.bpf.c gut_common.h
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
+	$(LLVM_STRIP) -g $@
+
+# ── Gost mode ──
+tc_gut_egress_gost.o: tc_gut_egress.bpf.c gut_common.h
+	$(CLANG) $(BPF_CFLAGS) -DGUT_MODE_GOST -c $< -o $@
+	$(LLVM_STRIP) -g $@
+
+xdp_gut_ingress_gost.o: xdp_gut_ingress.bpf.c gut_common.h
+	$(CLANG) $(BPF_CFLAGS) -DGUT_MODE_GOST -c $< -o $@
 	$(LLVM_STRIP) -g $@
 
 # Debug build: enables bpf_debug() → bpf_printk traces visible in trace_pipe.
@@ -56,11 +68,19 @@ debug: $(TARGETS)
 # Verification target - load programs into kernel verifier via bpftool
 # Usage: make verify   (requires sudo / CAP_BPF)
 verify: $(TARGETS)
-	@echo "=== Verifying XDP ingress ==="
+	@echo "=== Verifying XDP ingress (QUIC) ==="
 	sudo bpftool prog load xdp_gut_ingress.o /sys/fs/bpf/gut_verify_xdp type xdp \
 		&& echo "xdp_gut_ingress: PASS" || { echo "xdp_gut_ingress: FAIL"; exit 1; }
 	sudo rm -f /sys/fs/bpf/gut_verify_xdp
-	@echo "=== Verifying TC egress ==="
+	@echo "=== Verifying TC egress (QUIC) ==="
 	sudo bpftool prog load tc_gut_egress.o /sys/fs/bpf/gut_verify_tc \
 		&& echo "tc_gut_egress: PASS" || { echo "tc_gut_egress: FAIL"; exit 1; }
+	sudo rm -f /sys/fs/bpf/gut_verify_tc
+	@echo "=== Verifying XDP ingress (Gost) ==="
+	sudo bpftool prog load xdp_gut_ingress_gost.o /sys/fs/bpf/gut_verify_xdp type xdp \
+		&& echo "xdp_gut_ingress_gost: PASS" || { echo "xdp_gut_ingress_gost: FAIL"; exit 1; }
+	sudo rm -f /sys/fs/bpf/gut_verify_xdp
+	@echo "=== Verifying TC egress (Gost) ==="
+	sudo bpftool prog load tc_gut_egress_gost.o /sys/fs/bpf/gut_verify_tc \
+		&& echo "tc_gut_egress_gost: PASS" || { echo "tc_gut_egress_gost: FAIL"; exit 1; }
 	sudo rm -f /sys/fs/bpf/gut_verify_tc

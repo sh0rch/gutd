@@ -393,7 +393,6 @@ pub fn obfs_encap(
 /// Returns `true` if the packet is authentic GUT traffic.
 /// In gost mode, unmasking is applied to the first 6 bytes in-place on success;
 /// on failure, the original bytes are restored.
-
 #[inline]
 fn write_gost_header(buf: &mut [u8], ppn: u32, enc_ports: u32, pad_len: usize) {
     buf[0..4].copy_from_slice(&ppn.to_le_bytes());
@@ -422,6 +421,7 @@ fn write_quic_short_header(buf: &mut [u8], dcid: u32, ppn: u32, enc_ports: u32, 
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn write_quic_long_header(
     buf: &mut [u8],
     wg_type: u8,
@@ -819,7 +819,7 @@ pub fn obfs_decap(
     Some((actual_wg_len, wg_sport, wg_dport))
 }
 
-fn generate_quic_version_negotiation(buf: &[u8], size: usize) -> Option<Vec<u8>> {
+fn generate_quic_version_negotiation(buf: &[u8], size: usize, out: &mut [u8; 64]) -> Option<usize> {
     if size < 14 {
         return None;
     }
@@ -851,33 +851,44 @@ fn generate_quic_version_negotiation(buf: &[u8], size: usize) -> Option<Vec<u8>>
 
     // Capacity = 1 (header) + 4 (version 0) + 1 (dcid_len) + scid_len + 1 (scid_len) + dcid_len + 8 (supported versions)
     let total_len = 1 + 4 + 1 + scid.len() + 1 + dcid.len() + 8;
-    let mut resp = Vec::with_capacity(total_len);
+    if total_len > out.len() {
+        return None;
+    }
+    let mut pos = 0;
 
     // Header Form (1) = 1, Fixed Bit (1) = 1, Random Unused (6 bits)
     let mut rand_bits = 0x0A;
     if !dcid.is_empty() {
         rand_bits = dcid[0] & 0x3F;
     }
-    resp.push(0x80 | 0x40 | rand_bits);
+    out[pos] = 0x80 | 0x40 | rand_bits;
+    pos += 1;
 
     // Version = 0
-    resp.extend_from_slice(&[0, 0, 0, 0]);
+    out[pos..pos + 4].copy_from_slice(&[0, 0, 0, 0]);
+    pos += 4;
 
     // DCID Length is length of client's SCID
-    resp.push(scid.len() as u8);
-    resp.extend_from_slice(scid);
+    out[pos] = scid.len() as u8;
+    pos += 1;
+    out[pos..pos + scid.len()].copy_from_slice(scid);
+    pos += scid.len();
 
     // SCID Length is length of client's DCID
-    resp.push(dcid.len() as u8);
-    resp.extend_from_slice(dcid);
+    out[pos] = dcid.len() as u8;
+    pos += 1;
+    out[pos..pos + dcid.len()].copy_from_slice(dcid);
+    pos += dcid.len();
 
     // Supported Versions
     // Advertise our internal QUIC version first
-    resp.extend_from_slice(&[0x6b, 0x33, 0x43, 0xcf]);
+    out[pos..pos + 4].copy_from_slice(&[0x6b, 0x33, 0x43, 0xcf]);
+    pos += 4;
     // Advertise standard QUIC v1
-    resp.extend_from_slice(&[0, 0, 0, 1]);
+    out[pos..pos + 4].copy_from_slice(&[0, 0, 0, 1]);
+    pos += 4;
 
-    Some(resp)
+    Some(pos)
 }
 
 pub fn run(config: &crate::config::Config) -> crate::Result<()> {
@@ -969,6 +980,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
             let peer = &egress_peer;
             let mut buf = [0u8; 65536];
             let mut out_buf = [0u8; 65536];
+            let mut sip_buf = [0u8; crate::proto::sip::MAX_SIP_HEADER_LEN];
 
             // NAT keepalive: client sends a minimal QUIC Short Header every 25s of idle
             let ka_interval = std::time::Duration::from_secs(25);
@@ -1102,7 +1114,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                             &mut out_buf[crate::proto::sip::MAX_SIP_HEADER_LEN..],
                                         )
                                     };
-                                let mut sip_buf = vec![0u8; crate::proto::sip::MAX_SIP_HEADER_LEN];
+                                sip_buf.fill(0);
                                 let src_ip_str = src.ip().to_string();
                                 let dst_ip_str = dest.ip().to_string();
                                 let rtp_port = peer.ports.get(1).copied().unwrap_or(10000);
@@ -1165,6 +1177,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
             .spawn(move || {
                 let mut buf = [0u8; 65536];
                 let mut out_buf = [0u8; 65536];
+                let mut sip_resp = [0u8; crate::proto::sip::MAX_SIP_HEADER_LEN];
 
                 loop {
                     let (mut size, src) = match ingress_ext.recv_from(&mut buf) {
@@ -1220,8 +1233,8 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
 
                     if was_sip_probe {
                         if is_server {
-                            let mut sip_resp = vec![0u8; crate::proto::sip::MAX_SIP_HEADER_LEN];
-                            let src_ip_str = "127.0.0.1".to_string();
+                            sip_resp.fill(0);
+                            let src_ip_str = ingress_peer.bind_ip.to_string();
                             let dst_ip_str = src.ip().to_string();
                             let date_str = crate::tc::maps::format_sip_date_only(
                                 SystemTime::now()
@@ -1256,7 +1269,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         // Try plain QUIC first
                         if ((buf[0] & 0x40) == 0x40 || (buf[0] & 0x80) == 0x80)
                             && obfs_verify(
-                                &mut buf,
+                                &buf,
                                 size,
                                 &key_init,
                                 &feistel_rk,
@@ -1269,7 +1282,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                             // Restore and try GOST/Sip/Syslog (they all use gost_mask)
                             buf[..6].copy_from_slice(&original_start);
                             if obfs_verify(
-                                &mut buf,
+                                &buf,
                                 size,
                                 &key_init,
                                 &feistel_rk,
@@ -1287,7 +1300,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     } else if obfs != crate::config::ObfsMode::Quic {
                         let ok = size >= GUT_QUIC_SHORT_HEADER_SIZE + 16
                             && obfs_verify(
-                                &mut buf,
+                                &buf,
                                 size,
                                 &key_init,
                                 &feistel_rk,
@@ -1299,7 +1312,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         let fb = buf[0];
                         let ok = ((fb & 0x80) == 0x80 || (fb & 0x40) == 0x40)
                             && obfs_verify(
-                                &mut buf,
+                                &buf,
                                 size,
                                 &key_init,
                                 &feistel_rk,
@@ -1312,8 +1325,8 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     if !is_gut {
                         if is_server {
                             if detected_prepend == Some(crate::config::ObfsMode::Sip) && !was_rtp {
-                                let mut sip_resp = vec![0u8; crate::proto::sip::MAX_SIP_HEADER_LEN];
-                                let src_ip_str = "127.0.0.1".to_string();
+                                sip_resp.fill(0);
+                                let src_ip_str = ingress_peer.bind_ip.to_string();
                                 let dst_ip_str = src.ip().to_string();
                                 let date_str = crate::tc::maps::format_sip_date_only(
                                     SystemTime::now()
@@ -1336,9 +1349,11 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 );
                                 let _ = ingress_ext.send_to(&sip_resp[..hlen], src);
                             } else if obfs == crate::config::ObfsMode::Quic {
-                                if let Some(vn_resp) = generate_quic_version_negotiation(&buf, size)
+                                let mut vn_buf = [0u8; 64];
+                                if let Some(vn_len) =
+                                    generate_quic_version_negotiation(&buf, size, &mut vn_buf)
                                 {
-                                    let _ = ingress_ext.send_to(&vn_resp, src);
+                                    let _ = ingress_ext.send_to(&vn_buf[..vn_len], src);
                                 }
                             }
                         }

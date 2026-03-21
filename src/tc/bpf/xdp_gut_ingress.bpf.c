@@ -109,34 +109,29 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     if (wg + 12 > (__u8 *)data_end)
         return -1;
 
-    __u8 detected_gost = cfg->obfs_gost;
+#if defined(GUT_MODE_GOST)
+    __u32 quic_hdr_len = GUT_GOST_HEADER_SIZE;
+#else /* GUT_MODE_QUIC */
     __u32 quic_hdr_len = 0;
-
-    if (detected_gost)
+    if (wg[0] == 0x40)
     {
-        quic_hdr_len = GUT_GOST_HEADER_SIZE;
+        quic_hdr_len = GUT_QUIC_SHORT_HEADER_SIZE;
+    }
+    else if (wg[0] == 0xF0)
+    {
+        quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
+    }
+    else if ((wg[0] & 0x80) == 0x80)
+    {
+        if (!is_quic_server(cfg))
+            return -1;
+        quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
     }
     else
     {
-        if (wg[0] == 0x40)
-        {
-            quic_hdr_len = GUT_QUIC_SHORT_HEADER_SIZE;
-        }
-        else if (wg[0] == 0xF0)
-        {
-            quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
-        }
-        else if ((wg[0] & 0x80) == 0x80)
-        {
-            if (!is_quic_server(cfg))
-                return -1;
-            quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
-        }
-        else
-        {
-            return -1; /* not GUT traffic */
-        }
+        return -1; /* not GUT traffic */
     }
+#endif
 
     __u8 pad_byte = wg[quic_hdr_len - 1];
     /* bit6 (0x40) = has-ballast flag; bits[0:5]+1 = actual ballast len [1..64].
@@ -169,18 +164,22 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         __builtin_memcpy(&wg_idx, wg + 8, 4);
     }
 
-    __u32 expected_dcid = feistel32(wg_idx, cfg->feistel_rk);
     __u32 expected_ppn = ks47[10];
+#if !defined(GUT_MODE_GOST)
+    __u32 expected_dcid = feistel32(wg_idx, cfg->feistel_rk);
+#endif
 
     __u8 *quic = wg - quic_hdr_len;
-    if (detected_gost)
+
+#if defined(GUT_MODE_GOST)
     {
         __u32 pkt_ppn = 0;
         __builtin_memcpy(&pkt_ppn, quic + 0, 4);
         if (pkt_ppn != expected_ppn)
             return -1;
     }
-    else if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
+#else /* GUT_MODE_QUIC */
+    if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
     {
         __u32 pkt_dcid = 0;
         __builtin_memcpy(&pkt_dcid, quic + 1, 4);
@@ -210,6 +209,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         if (pkt_ppn != expected_ppn)
             return -1;
     }
+#endif
 
     /* ── Dynamic peer endpoint learning (multi-client) ──────────────
      * When dynamic_peer==1, learn which external IP:port belongs to each
@@ -262,7 +262,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             ep.port = bpf_ntohs(udph->source);
             ep.server_port = bpf_ntohs(udph->dest);
             ep.valid = 1;
-            ep.obfs_gost = detected_gost;
+            ep.obfs_gost = 0;
             bpf_map_update_elem(&client_map, &client_idx, &ep, BPF_ANY);
             bpf_debug("XDP: client_map[%u] updated wg_type=%u port=%u", client_idx, wg_type, ep.port);
         }
@@ -275,13 +275,18 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
      * On bpf_xdp_load_bytes failure enc_ports stays 0 and ports_ok=0 prevents restore. */
     __u32 enc_ports = 0;
     int ports_ok = 1;
-    if (quic_hdr_len == GUT_GOST_HEADER_SIZE) {
-        __builtin_memcpy(&enc_ports, quic + 4, 4);
-    } else if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE) {
+#if defined(GUT_MODE_GOST)
+    __builtin_memcpy(&enc_ports, quic + 4, 4);
+#else /* GUT_MODE_QUIC */
+    if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
+    {
         __builtin_memcpy(&enc_ports, quic + 10, 4);
-    } else {
+    }
+    else
+    {
         __builtin_memcpy(&enc_ports, quic + 24, 4);
     }
+#endif
     __u32 plain_ports = feistel32_inv(enc_ports, cfg->feistel_rk) ^ FEISTEL_SALT_PORTS;
     __be16 inner_sport_ne = ports_ok ? bpf_htons((__u16)(plain_ports >> 16)) : 0;
     __be16 inner_dport_ne = ports_ok ? bpf_htons((__u16)(plain_ports & 0xFFFF)) : 0;
@@ -442,6 +447,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     return 0;
 }
 
+#if defined(GUT_MODE_QUIC)
 static __always_inline int handle_quic_probe(struct xdp_md *ctx)
 {
     void *data = (void *)(__u64)ctx->data;
@@ -662,6 +668,7 @@ static __always_inline int handle_quic_probe(struct xdp_md *ctx)
     bpf_debug("XDP_TX QUIC VerNeg, new_len=%d", new_pkt_len);
     return XDP_TX;
 }
+#endif /* GUT_MODE_QUIC */
 
 SEC("xdp")
 int xdp_gut_ingress(struct xdp_md *ctx)
@@ -674,13 +681,14 @@ int xdp_gut_ingress(struct xdp_md *ctx)
 
     if (gut_xdp_core(ctx, cfg) != 0)
     {
-        // If we use gost mode (GOST/IPsec spoofing), we MUST NOT reply 
-        // with pure QUIC Version Negotiation packets to active probes.
-        if (cfg->own_http3 == 1 && cfg->obfs_gost == 0)
+#if defined(GUT_MODE_QUIC)
+        /* QUIC mode: respond to DPI probes with Version Negotiation */
+        if (cfg->own_http3 == 1)
         {
             if (handle_quic_probe(ctx) == XDP_TX)
                 return XDP_TX;
         }
+#endif
         if (cfg->default_xdp_action == 1)
             return XDP_DROP;
         return XDP_PASS;
