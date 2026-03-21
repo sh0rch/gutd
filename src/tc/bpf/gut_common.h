@@ -28,8 +28,8 @@
  * TC egress stores the original WG UDP src/dst ports so XDP can restore them
  * after decapsulation, preserving the conntrack/WG port numbers end-to-end. */
 #define GUT_QUIC_SHORT_HEADER_SIZE 16
-#define GUT_GOST_HEADER_SIZE 10
 #define GUT_QUIC_LONG_HEADER_SIZE 1200
+#define GUT_GOST_HEADER_SIZE 10
 #define GUT_KEY_SIZE 32
 #define MAX_PACKET_SIZE 1500
 #define SCRATCH_SIZE 4096                    /* scratch buffer: power-of-2.  Must be > MAX_PACKET_SIZE + 1 \
@@ -48,7 +48,9 @@
 #define GUT_MIN_OVERHEAD 0
 
 /* Variable-length ballast: ChaCha-derived 0..63 bytes appended inside masked body
+ * for packets with inner_len < BALLAST_THRESHOLD.  Receiver determines
  * inner length from IP header; remainder is ballast (ignored). */
+#define BALLAST_THRESHOLD 220
 #define BALLAST_MAX 63
 #define GUT_PMTU_RESERVE 20
 #define GUT_OUTER_OVERHEAD_V4 (8 + 20 + GUT_PMTU_RESERVE)
@@ -100,7 +102,7 @@ struct gut_config
     __u8 tun_peer_ip6[16];       /* Remote veth peer IPv6 (zero if v4 only) */
     __u8 own_http3;              /* Respond to DPI probes via XDP_TX (1=yes) */
     __u8 dynamic_peer;           /* 1 = peer_ip unknown, learn from validated inbound packets */
-    __u8 obfs_gost;             /* 1 = gost mode: XOR quic[0..6] with quic[6..12] to hide QUIC signatures */
+    __u8 obfs_gost;             /* 1 = noise mode: XOR quic[0..6] with quic[6..12] to hide QUIC signatures */
 } __attribute__((packed));
 
 /* Dynamic peer endpoint — learned from validated inbound packets.
@@ -117,7 +119,7 @@ struct peer_endpoint
     __u8 server_ip6[16]; /* Last-seen IPv6 dest (server) */
     __u16 server_port;   /* Last-seen UDP dest port (server) */
     __u8 valid;          /* 1 = endpoint learned, 0 = not yet */
-    __u8 obfs_gost;     /* 1 = this client uses gost mode, 0 = plain quic (auto-detected) */
+    __u8 obfs_gost;     /* 1 = this client uses noise mode, 0 = plain quic (auto-detected) */
 };
 
 /* Per-CPU statistics */
@@ -467,6 +469,7 @@ static __always_inline void mask_data_chacha(__u8 *data, __u32 len,
  * Block 99 (counter=99, same nonce):
  *   bytes  0..62 = ballast data (up to 63 bytes)
  *   byte  63 bits[0:5] = ballast_len (0..63)
+ *   Only computed for small packets (inner_len < BALLAST_THRESHOLD).
  *
  * Block 111 (counter=111, same nonce):
  *   words[0] = next_nonce (u32 LE), guaranteed non-zero
@@ -486,6 +489,7 @@ static __always_inline __u32 chacha_ballast(
     __u8 *ballast_out, __u32 inner_len, __u32 max_body,
     const __u32 chacha_init[12], __u32 nonce)
 {
+    if (inner_len >= BALLAST_THRESHOLD)
         return 0;
 
     __u32 ks[16];
@@ -1050,3 +1054,78 @@ static __always_inline __u8 is_quic_server(const struct gut_config *cfg)
 }
 
 #endif /* __GUT_COMMON_H__ */
+
+
+static __always_inline void write_gost_header(__u8 *quic, void *data_end, __u32 ppn, __u32 enc_ports, __u32 pad_len)
+{
+    if ((__u8 *)quic + GUT_GOST_HEADER_SIZE > (__u8 *)data_end)
+        return;
+    __builtin_memcpy((__u8 *)quic + 0, &ppn, 4);
+    __builtin_memcpy((__u8 *)quic + 4, &enc_ports, 4);
+    quic[8] = 0x00;
+    quic[9] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
+}
+
+static __always_inline void write_quic_short_header(__u8 *quic, void *data_end, __u32 dcid, __u32 ppn, __u32 enc_ports, __u32 pad_len)
+{
+    if ((__u8 *)quic + GUT_QUIC_SHORT_HEADER_SIZE > (__u8 *)data_end)
+        return;
+    quic[0] = 0x40; // Short
+    __builtin_memcpy((__u8 *)quic + 1, &dcid, 4);
+    quic[5] = 0x01; // DCID Length 1 (RFC compliant)
+    __builtin_memcpy((__u8 *)quic + 6, &ppn, 4);
+    __builtin_memcpy((__u8 *)quic + 10, &enc_ports, 4);
+    quic[14] = 0x00;
+    quic[15] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
+}
+
+static __always_inline void write_quic_long_header(__u8 *quic, void *data_end, __u8 wg_type, __u32 wg_idx, __u32 ppn, __u32 enc_ports, __u32 pad_len, const struct gut_config *cfg, __u8 *pad_block)
+{
+    if ((__u8 *)quic + GUT_QUIC_LONG_HEADER_SIZE > (__u8 *)data_end)
+        return;
+
+    quic[0] = (wg_type == 3) ? 0xF0 : 0xC3;
+    
+    __u32 time_gost = feistel32((__u32)bpf_ktime_get_ns(), cfg->feistel_rk);
+    __u8 *gost_b = (__u8 *)&time_gost;
+
+#pragma unroll
+    for (int i = 1; i < 64; i++) {
+        quic[i] = pad_block[(i * 13) & 0x3F] ^ gost_b[i & 3];
+    }
+
+    quic[1] = 0x00;
+    quic[2] = 0x00;
+    quic[3] = 0x00;
+    quic[4] = 0x01; // QUIC v1
+
+    __u32 dcid2 = feistel32(wg_idx ^ 0xDEADBEEF, cfg->feistel_rk);
+    __u32 scid = feistel32(wg_idx ^ 0xCAFEBABE, cfg->feistel_rk);
+    __u32 scid2 = feistel32(wg_idx ^ 0x12345678, cfg->feistel_rk);
+
+    quic[5] = 0x08; // DCID length 8
+    __builtin_memcpy(quic + 6, &wg_idx, 4);
+    __builtin_memcpy(quic + 10, &dcid2, 4);
+    quic[14] = 0x08; // SCID length 8
+    __builtin_memcpy(quic + 15, &scid, 4);
+    __builtin_memcpy(quic + 19, &scid2, 4);
+
+    quic[23] = 0x04; // Token length 4
+    __builtin_memcpy(quic + 24, &enc_ports, 4);
+
+    __u16 total_quic_len = GUT_QUIC_LONG_HEADER_SIZE - 30;
+    quic[28] = 0x40 | ((total_quic_len >> 8) & 0xFF);
+    quic[29] = total_quic_len & 0xFF;
+
+    __builtin_memcpy(quic + 30, &ppn, 4);
+    
+    // Simplistic fake Crypto frame to deceive some fast DPIs
+    quic[34] = 0x06; // CRYPTO
+    quic[35] = 0x00;
+    quic[36] = 0x40;
+    quic[37] = 0x64;
+    quic[38] = 0x01; // Client Hello
+    quic[41] = 0x60;
+    quic[42] = 0x03; // TLS 1.3
+    quic[43] = 0x03;
+}
