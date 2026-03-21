@@ -248,7 +248,12 @@ const SBOX: [u8; 256] = [
 
 fn sub_word(w: u32) -> u32 {
     let b = w.to_be_bytes();
-    u32::from_be_bytes([SBOX[b[0] as usize], SBOX[b[1] as usize], SBOX[b[2] as usize], SBOX[b[3] as usize]])
+    u32::from_be_bytes([
+        SBOX[b[0] as usize],
+        SBOX[b[1] as usize],
+        SBOX[b[2] as usize],
+        SBOX[b[3] as usize],
+    ])
 }
 
 fn rot_word(w: u32) -> u32 {
@@ -261,8 +266,8 @@ pub fn aes128_expand_key(key: &[u8; 16]) -> [u32; 44] {
         w[i] = u32::from_be_bytes([key[4 * i], key[4 * i + 1], key[4 * i + 2], key[4 * i + 3]]);
     }
     let rcon = [
-        0x01000000, 0x02000000, 0x04000000, 0x08000000, 0x10000000,
-        0x20000000, 0x40000000, 0x80000000, 0x1b000000, 0x36000000,
+        0x01000000, 0x02000000, 0x04000000, 0x08000000, 0x10000000, 0x20000000, 0x40000000,
+        0x80000000, 0x1b000000, 0x36000000,
     ];
     for i in 4..44 {
         let mut temp = w[i - 1];
@@ -277,8 +282,17 @@ pub fn aes128_expand_key(key: &[u8; 16]) -> [u32; 44] {
 fn mix_columns(s: &mut [u32; 4]) {
     for col_val in s.iter_mut() {
         let col = col_val.to_be_bytes();
-        let a = col[0]; let b = col[1]; let c = col[2]; let d = col[3];
-        let h = |x: u8| if (x & 0x80) != 0 { (x << 1) ^ 0x1b } else { x << 1 };
+        let a = col[0];
+        let b = col[1];
+        let c = col[2];
+        let d = col[3];
+        let h = |x: u8| {
+            if (x & 0x80) != 0 {
+                (x << 1) ^ 0x1b
+            } else {
+                x << 1
+            }
+        };
         *col_val = u32::from_be_bytes([
             h(a) ^ (h(b) ^ b) ^ c ^ d,
             a ^ h(b) ^ (h(c) ^ c) ^ d,
@@ -291,7 +305,12 @@ fn mix_columns(s: &mut [u32; 4]) {
 pub fn aes128_encrypt_block(round_keys: &[u32; 44], block: &[u8; 16], out: &mut [u8; 16]) {
     let mut s = [0u32; 4];
     for (i, v) in s.iter_mut().take(4).enumerate() {
-        *v = u32::from_be_bytes([block[4 * i], block[4 * i + 1], block[4 * i + 2], block[4 * i + 3]]);
+        *v = u32::from_be_bytes([
+            block[4 * i],
+            block[4 * i + 1],
+            block[4 * i + 2],
+            block[4 * i + 3],
+        ]);
         *v ^= round_keys[i];
     }
 
@@ -304,9 +323,13 @@ pub fn aes128_encrypt_block(round_keys: &[u32; 44], block: &[u8; 16], out: &mut 
         ns[1] = u32::from_be_bytes([sb(4), sb(9), sb(14), sb(3)]);
         ns[2] = u32::from_be_bytes([sb(8), sb(13), sb(2), sb(7)]);
         ns[3] = u32::from_be_bytes([sb(12), sb(1), sb(6), sb(11)]);
-        
-        if r < 10 { mix_columns(&mut ns); }
-        for i in 0..4 { s[i] = ns[i] ^ round_keys[r * 4 + i]; }
+
+        if r < 10 {
+            mix_columns(&mut ns);
+        }
+        for i in 0..4 {
+            s[i] = ns[i] ^ round_keys[r * 4 + i];
+        }
     }
     // Final round (no mix columns)
     let mut ns = [0u32; 4];
@@ -319,6 +342,120 @@ pub fn aes128_encrypt_block(round_keys: &[u32; 44], block: &[u8; 16], out: &mut 
     for i in 0..4 {
         let final_w = ns[i] ^ round_keys[40 + i];
         out[4 * i..4 * i + 4].copy_from_slice(&final_w.to_be_bytes());
+    }
+}
+
+// ──── AES-128-GCM (RFC 5116 / NIST SP 800-38D) ────────────────────
+
+/// Multiply two 128-bit blocks in GF(2^128) with reduction polynomial x^128 + x^7 + x^2 + x + 1.
+fn gf128_mul(x: &[u8; 16], y: &[u8; 16]) -> [u8; 16] {
+    let mut z = [0u8; 16];
+    let mut v = *y;
+    for i in 0..128 {
+        if (x[i / 8] >> (7 - (i % 8))) & 1 == 1 {
+            for j in 0..16 {
+                z[j] ^= v[j];
+            }
+        }
+        let carry = v[15] & 1;
+        for j in (1..16).rev() {
+            v[j] = (v[j] >> 1) | (v[j - 1] << 7);
+        }
+        v[0] >>= 1;
+        if carry == 1 {
+            v[0] ^= 0xE1;
+        }
+    }
+    z
+}
+
+/// Compute GHASH(H, aad, ciphertext) for AES-GCM.
+fn ghash(h: &[u8; 16], aad: &[u8], ct: &[u8]) -> [u8; 16] {
+    let mut x = [0u8; 16];
+
+    // Process AAD blocks (zero-padded to 16-byte boundary)
+    let aad_blocks = (aad.len() + 15) / 16;
+    for i in 0..aad_blocks {
+        let start = i * 16;
+        let end = (start + 16).min(aad.len());
+        let mut block = [0u8; 16];
+        block[..end - start].copy_from_slice(&aad[start..end]);
+        for j in 0..16 {
+            x[j] ^= block[j];
+        }
+        x = gf128_mul(&x, h);
+    }
+
+    // Process ciphertext blocks (zero-padded to 16-byte boundary)
+    let ct_blocks = (ct.len() + 15) / 16;
+    for i in 0..ct_blocks {
+        let start = i * 16;
+        let end = (start + 16).min(ct.len());
+        let mut block = [0u8; 16];
+        block[..end - start].copy_from_slice(&ct[start..end]);
+        for j in 0..16 {
+            x[j] ^= block[j];
+        }
+        x = gf128_mul(&x, h);
+    }
+
+    // Length block: len(A) in bits (8 bytes BE) || len(C) in bits (8 bytes BE)
+    let mut len_block = [0u8; 16];
+    let aad_bits = (aad.len() as u64) * 8;
+    let ct_bits = (ct.len() as u64) * 8;
+    len_block[0..8].copy_from_slice(&aad_bits.to_be_bytes());
+    len_block[8..16].copy_from_slice(&ct_bits.to_be_bytes());
+    for j in 0..16 {
+        x[j] ^= len_block[j];
+    }
+    gf128_mul(&x, h)
+}
+
+/// AES-128-GCM encrypt. Writes ciphertext (same length as plaintext) and 16-byte tag.
+pub fn aes128_gcm_encrypt(
+    rk: &[u32; 44],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8],
+    ciphertext: &mut [u8],
+    tag: &mut [u8; 16],
+) {
+    assert_eq!(ciphertext.len(), plaintext.len());
+
+    // H = AES_K(0^128)
+    let mut h = [0u8; 16];
+    let zero = [0u8; 16];
+    aes128_encrypt_block(rk, &zero, &mut h);
+
+    // J0 = nonce || 0x00000001
+    let mut j0 = [0u8; 16];
+    j0[..12].copy_from_slice(nonce);
+    j0[15] = 1;
+
+    // Encrypt plaintext with counter starting at J0+1 (= nonce || 0x00000002)
+    let n_blocks = (plaintext.len() + 15) / 16;
+    for i in 0..n_blocks {
+        let counter = (i as u32 + 2).to_be_bytes();
+        let mut ctr_block = [0u8; 16];
+        ctr_block[..12].copy_from_slice(nonce);
+        ctr_block[12..16].copy_from_slice(&counter);
+        let mut ks = [0u8; 16];
+        aes128_encrypt_block(rk, &ctr_block, &mut ks);
+        let start = i * 16;
+        let end = (start + 16).min(plaintext.len());
+        for j in start..end {
+            ciphertext[j] = plaintext[j] ^ ks[j - start];
+        }
+    }
+
+    // GHASH(H, AAD, ciphertext)
+    let ghash_result = ghash(&h, aad, ciphertext);
+
+    // Tag = AES_K(J0) XOR GHASH
+    let mut enc_j0 = [0u8; 16];
+    aes128_encrypt_block(rk, &j0, &mut enc_j0);
+    for i in 0..16 {
+        tag[i] = enc_j0[i] ^ ghash_result[i];
     }
 }
 
