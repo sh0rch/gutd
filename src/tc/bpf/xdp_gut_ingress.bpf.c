@@ -126,7 +126,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         {
             quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
         }
-        else if (wg[0] == 0xC3 || wg[0] >= 0xC0)
+        else if ((wg[0] & 0x80) == 0x80)
         {
             if (!is_quic_server(cfg))
                 return -1;
@@ -275,17 +275,12 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
      * On bpf_xdp_load_bytes failure enc_ports stays 0 and ports_ok=0 prevents restore. */
     __u32 enc_ports = 0;
     int ports_ok = 1;
-    if (detected_gost)
-    {
+    if (quic_hdr_len == GUT_GOST_HEADER_SIZE) {
         __builtin_memcpy(&enc_ports, quic + 4, 4);
-    }
-    else if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
-    {
+    } else if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE) {
         __builtin_memcpy(&enc_ports, quic + 10, 4);
-    }
-    else
-    {
-        __builtin_memcpy(&enc_ports, quic + 30, 4);
+    } else {
+        __builtin_memcpy(&enc_ports, quic + 24, 4);
     }
     __u32 plain_ports = feistel32_inv(enc_ports, cfg->feistel_rk) ^ FEISTEL_SALT_PORTS;
     __be16 inner_sport_ne = ports_ok ? bpf_htons((__u16)(plain_ports >> 16)) : 0;
@@ -500,12 +495,13 @@ static __always_inline int handle_quic_probe(struct xdp_md *ctx)
         return XDP_PASS;
 
     /* Check for QUIC Initial (Long Header: 11xxxxxx) */
-    if ((quic[0] & 0xC0) != 0xC0)
+    if ((quic[0] & 0x80) != 0x80)
         return XDP_PASS;
 
     __u8 dcid_len = quic[5];
     if (dcid_len > 20)
         return XDP_PASS;
+    dcid_len &= 0x1F;
 
     /* Read scid_len at variable packet offset via bpf_xdp_load_bytes.
      * The helper takes a plain u32 offset — no packet-pointer arithmetic,
@@ -516,6 +512,7 @@ static __always_inline int handle_quic_probe(struct xdp_md *ctx)
     __u8 scid_len = scid_len_byte;
     if (scid_len > 20)
         return XDP_PASS;
+    scid_len &= 0x1F;
 
     /* Save header byte and DCID before bpf_xdp_adjust_tail invalidates
      * packet pointers.
@@ -595,7 +592,8 @@ static __always_inline int handle_quic_probe(struct xdp_md *ctx)
      * new_quic_len = 1+4+1+scid_len+1+dcid_len+4+4, range [15, 59].
      * Explicit range pair (not bitmask) preserves umin for the verifier. */
     if (new_quic_len < 15 || new_quic_len > 63)
-        return XDP_PASS; /* dead branch: enforces [15,63] for verifier */
+        return XDP_PASS;
+    new_quic_len &= 0x3F; /* dead branch: enforces [15,63] for verifier */
     if (bpf_xdp_store_bytes(ctx, quic_off, response, new_quic_len))
         return XDP_PASS;
 

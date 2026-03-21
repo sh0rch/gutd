@@ -40,12 +40,12 @@ TARGETS := tc_gut_egress.o xdp_gut_ingress.o
 all: $(TARGETS)
 
 tc_gut_egress.o: tc_gut_egress.bpf.c gut_common.h
-        $(CLANG) $(BPF_CFLAGS) -c $< -o $@
-        $(LLVM_STRIP) -g $@
+	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
+	$(LLVM_STRIP) -g $@
 
 xdp_gut_ingress.o: xdp_gut_ingress.bpf.c gut_common.h
-        $(CLANG) $(BPF_CFLAGS) -c $< -o $@
-        $(LLVM_STRIP) -g $@
+	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
+	$(LLVM_STRIP) -g $@
 
 # Debug build: enables bpf_debug() → bpf_printk traces visible in trace_pipe.
 # Usage: make debug  (then: sudo cat /sys/kernel/debug/tracing/trace_pipe)

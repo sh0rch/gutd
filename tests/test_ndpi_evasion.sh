@@ -75,7 +75,7 @@ cleanup() {
     kill $(jobs -p) 2>/dev/null || true
     rm -f /tmp/gutd_c.conf /tmp/gutd_s.conf
 }
-trap "ls -l /tmp/gutd_*.conf; cat /tmp/gutd_c.conf; cat /tmp/gutd_s.conf; cleanup" EXIT
+trap "cleanup" EXIT
 cleanup
 
 log "Setting up network namespaces..."
