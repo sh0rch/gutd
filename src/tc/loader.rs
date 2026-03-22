@@ -1355,6 +1355,45 @@ impl TcBpfManager {
             }
         }
 
+        // ── QUIC AEAD: precompute keys from fixed DCID so BPF only needs AES-GCM ──
+        {
+            // Fixed DCID derived from GUT key (ChaCha block 99, nonce 0)
+            let chacha_init = gut_config.chacha_init;
+            let chacha_rounds = gut_config.chacha_rounds;
+            let ks99 =
+                crate::proto::mask_balanced::chacha_block_fast(&chacha_init, 99, 0, chacha_rounds);
+            gut_config.quic_dcid[0..4].copy_from_slice(&ks99[0].to_le_bytes());
+            gut_config.quic_dcid[4..8].copy_from_slice(&ks99[1].to_le_bytes());
+
+            // QUIC v1 key derivation: DCID → Initial Secret → Client Secret → keys
+            let initial_secret =
+                crate::proto::quic::derive_quic_initial_secret(&gut_config.quic_dcid);
+            let client_secret = crate::proto::quic::derive_client_initial_secret(&initial_secret);
+            let (q_key, q_iv, q_hp) = crate::proto::quic::derive_quic_keys(&client_secret);
+            gut_config.quic_key_rk = crate::crypto::aes128_expand_key(&q_key);
+            gut_config.quic_hp_rk = crate::crypto::aes128_expand_key(&q_hp);
+            gut_config.quic_iv = q_iv;
+
+            // SNI domain (= sip_domain from config)
+            let sni = config.peer().sip_domain.as_bytes();
+            let sni_len = sni.len().min(31);
+            gut_config.sni_domain[..sni_len].copy_from_slice(&sni[..sni_len]);
+            gut_config.sni_domain_len = sni_len as u8;
+
+            eprintln!(
+                "  QUIC AEAD: dcid={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} sni=\"{}\"",
+                gut_config.quic_dcid[0],
+                gut_config.quic_dcid[1],
+                gut_config.quic_dcid[2],
+                gut_config.quic_dcid[3],
+                gut_config.quic_dcid[4],
+                gut_config.quic_dcid[5],
+                gut_config.quic_dcid[6],
+                gut_config.quic_dcid[7],
+                &config.peer().sip_domain,
+            );
+        }
+
         Ok(gut_config)
     }
 

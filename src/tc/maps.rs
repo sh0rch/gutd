@@ -24,12 +24,14 @@ pub const CHACHA_ROUNDS: u8 = 4;
 /// Format Unix timestamp as RFC 2822 date (only date part, no time)
 pub fn format_sip_date_only(timestamp: u64) -> String {
     const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
     let secs_per_day = 86400u64;
     let days_since_epoch = timestamp / secs_per_day;
     let day_of_week = ((days_since_epoch + 4) % 7) as usize; // 1970-01-01 was Thursday
-    
+
     // Simplified date calculation (works for 2000-2099)
     let days = days_since_epoch as i64 + 719468; // Days since 0000-03-01
     let era = (if days >= 0 { days } else { days - 146096 }) / 146097;
@@ -41,8 +43,11 @@ pub fn format_sip_date_only(timestamp: u64) -> String {
     let day = (doy - (153 * mp + 2) / 5 + 1) as u8;
     let month = if mp < 10 { mp + 3 } else { mp - 9 } as usize - 1;
     let year = if month <= 1 { year + 1 } else { year };
-    
-    format!("{}, {:02} {} {}", DAYS[day_of_week], day, MONTHS[month], year)
+
+    format!(
+        "{}, {:02} {} {}",
+        DAYS[day_of_week], day, MONTHS[month], year
+    )
 }
 
 #[repr(C, packed)]
@@ -77,7 +82,16 @@ pub struct GutConfig {
     pub tun_peer_ip6: [u8; 16], // Remote veth peer IPv6 (zero if v4 only)
     pub own_http3: u8,          // Whether to respond to active DPI probes via XDP_TX
     pub dynamic_peer: u8,       // 1 = peer_ip unknown, learn from validated inbound packets
-    pub obfs_gost: u8,         // 1 = gost mode: XOR quic[0..6] with quic[6..12]
+    pub obfs_gost: u8,          // 1 = gost mode: XOR quic[0..6] with quic[6..12]
+
+    // ── QUIC crypto: precomputed by loader for BPF AEAD on Long Headers ──
+    pub sni_domain: [u8; 32], // SNI domain for ClientHello (null-terminated)
+    pub sni_domain_len: u8,   // Actual length of sni_domain
+    pub _pad_quic: [u8; 3],   // Alignment padding
+    pub quic_dcid: [u8; 8],   // Fixed 8-byte DCID for Long Headers
+    pub quic_key_rk: [u32; 44], // AES-128 expanded round keys for AEAD (q_key)
+    pub quic_hp_rk: [u32; 44], // AES-128 expanded round keys for HP (q_hp)
+    pub quic_iv: [u8; 12],    // AEAD IV — XOR with PPN(BE) for GCM nonce
 }
 
 /// Dynamic peer endpoint — stored in `client_map` (LRU_HASH, key=C_idx).
@@ -140,23 +154,30 @@ impl GutConfig {
             own_http3: 1,
             dynamic_peer: 0,
             obfs_gost: 0,
+            sni_domain: [0u8; 32],
+            sni_domain_len: 0,
+            _pad_quic: [0u8; 3],
+            quic_dcid: [0u8; 8],
+            quic_key_rk: [0u32; 44],
+            quic_hp_rk: [0u32; 44],
+            quic_iv: [0u8; 12],
         };
 
         for (i, &port) in ports.iter().enumerate().take(MAX_PORTS) {
             cfg.ports[i] = port;
         }
-        
+
         // Initialize SIP date string with current date
         cfg.update_sip_date();
 
         cfg
     }
-    
+
     /// Update SIP date string with current date (should be called at midnight)
     pub fn update_sip_date(&mut self) {
         // Now handled by userspace logic, not stored in BPF config map
     }
-    
+
     /// Get SIP date string as &str
     pub fn get_sip_date(&self) -> &str {
         "Mon, 01 Jan 2024"
@@ -217,7 +238,7 @@ fn compute_chacha_init(key: &[u8; 32]) -> [u32; 12] {
     init
 }
 
-const _: [(); 236] = [(); std::mem::size_of::<GutConfig>()];
+const _: [(); 644] = [(); std::mem::size_of::<GutConfig>()];
 const _: [(); 56] = [(); std::mem::size_of::<GutStats>()];
 
 impl GutStats {

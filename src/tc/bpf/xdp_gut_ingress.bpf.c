@@ -117,14 +117,8 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     {
         quic_hdr_len = GUT_QUIC_SHORT_HEADER_SIZE;
     }
-    else if (wg[0] == 0xF0)
-    {
-        quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
-    }
     else if ((wg[0] & 0x80) == 0x80)
     {
-        if (!is_quic_server(cfg))
-            return -1;
         quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
     }
     else
@@ -196,16 +190,20 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     }
     else
     {
+        /* Long Header: DCID is fixed from config (precomputed for QUIC key derivation) */
         __u32 pkt_dcid = 0;
         __builtin_memcpy(&pkt_dcid, quic + 6, 4);
-        if (pkt_dcid != expected_dcid)
+        __u32 cfg_dcid = 0;
+        __builtin_memcpy(&cfg_dcid, cfg->quic_dcid, 4);
+        if (pkt_dcid != cfg_dcid)
             return -1;
 
         if (quic[5] != 0x08) // DCID length 8
             return -1;
 
+        /* PPN stored unmasked in SCID[0..3] (quic+15) by egress for fast ingress path */
         __u32 pkt_ppn = 0;
-        __builtin_memcpy(&pkt_ppn, quic + 26, 4);
+        __builtin_memcpy(&pkt_ppn, quic + 15, 4);
         if (pkt_ppn != expected_ppn)
             return -1;
     }
@@ -269,8 +267,8 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     }
 
     /* Read feistel-encrypted ports from the QUIC header (4 bytes, stored by TC egress).
-     * Short header (GUT_QUIC_SHORT_HEADER_SIZE=14): enc_ports at bytes [9-12].
-     * Long header  (GUT_QUIC_LONG_HEADER_SIZE=100): enc_ports at bytes [30-33].
+     * Short header (GUT_QUIC_SHORT_HEADER_SIZE=16): enc_ports at bytes [10-13].
+     * Long header  (GUT_QUIC_LONG_HEADER_SIZE=1200): enc_ports at bytes [24-27] (token field).
      * Decrypt: feistel32_inv(enc, rk) ^ FEISTEL_SALT_PORTS -> (sport<<16)|dport host-order.
      * On bpf_xdp_load_bytes failure enc_ports stays 0 and ports_ok=0 prevents restore. */
     __u32 enc_ports = 0;
