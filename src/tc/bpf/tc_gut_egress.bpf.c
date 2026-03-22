@@ -117,20 +117,15 @@ int gut_egress(struct __sk_buff *skb)
 #if defined(GUT_MODE_GOST)
     __u32 quic_hdr_len = GUT_GOST_HEADER_SIZE;
 #else /* GUT_MODE_QUIC */
-    __u8 is_server = is_quic_server(cfg);
     __u32 quic_hdr_len;
-    if (wg_type == 3)
+    if (wg_type == 1 || wg_type == 3)
     {
-        /* Cookie Reply → QUIC Retry long header (must never be dropped) */
+        /* WG Init / Cookie Reply → QUIC Initial long header (ClientHello + AEAD) */
         quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
-    }
-    else if (is_server)
-    {
-        quic_hdr_len = GUT_QUIC_SHORT_HEADER_SIZE;
     }
     else
     {
-        quic_hdr_len = (wg_type == 1) ? GUT_QUIC_LONG_HEADER_SIZE : GUT_QUIC_SHORT_HEADER_SIZE;
+        quic_hdr_len = GUT_QUIC_SHORT_HEADER_SIZE;
     }
 #endif
 
@@ -278,73 +273,16 @@ int gut_egress(struct __sk_buff *skb)
 
 #if defined(GUT_MODE_GOST)
     write_gost_header(quic, data_end, ppn, enc_ports, pad_len);
-#else /* GUT_MODE_QUIC */
+#else  /* GUT_MODE_QUIC */
     if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
     {
-        if ((__u8 *)quic + GUT_QUIC_SHORT_HEADER_SIZE > (__u8 *)data_end)
-            return TC_ACT_OK;
-        quic[0] = 0x40; // Short
-
-        // Generate stable DCID from feistel
         __u32 dcid = feistel32(wg_idx, cfg->feistel_rk);
-        __builtin_memcpy((__u8 *)quic + 1, &dcid, 4);
-
-        // Inject 4-byte PPN
-        __builtin_memcpy((__u8 *)quic + 5, &ppn, 4);
-
-        // Bytes 9-12: feistel-encrypted ports (sport<<16|dport); XDP decrypts with feistel32_inv
-        __builtin_memcpy((__u8 *)quic + 9, &enc_ports, 4);
+        write_quic_short_header(quic, data_end, dcid, ppn, enc_ports, pad_len);
     }
     else
     {
-        if ((__u8 *)quic + GUT_QUIC_LONG_HEADER_SIZE > (__u8 *)data_end)
-            return TC_ACT_OK;
-        /* 0xC0 = QUIC Initial (client Type 1), 0xF0 = QUIC Retry (Cookie Reply Type 3) */
-        quic[0] = (wg_type == 3) ? 0xF0 : 0xC0;
-
-        __u32 time_gost = feistel32((__u32)bpf_ktime_get_ns(), cfg->feistel_rk);
-        __u8 *gost_b = (__u8 *)&time_gost;
-
-#pragma unroll
-        for (int i = 1; i < 90; i++)
-            quic[i] = pad_block[(i * 7) & 0x3F] ^ gost_b[i & 3]; // fill with PRNG gost
-
-        // Version (QUICv2 = 0x6b3343cf)
-        quic[1] = 0x6b;
-        quic[2] = 0x33;
-        quic[3] = 0x43;
-        quic[4] = 0xcf;
-
-        // Generate stable pseudo-random IDs
-        __u32 dcid = feistel32(wg_idx, cfg->feistel_rk);
-        __u32 dcid2 = feistel32(wg_idx ^ 0xDEADBEEF, cfg->feistel_rk);
-        __u32 scid = feistel32(wg_idx ^ 0xCAFEBABE, cfg->feistel_rk);
-        __u32 scid2 = feistel32(wg_idx ^ 0x12345678, cfg->feistel_rk);
-
-        quic[5] = 0x08; // DCID Len 8
-        __builtin_memcpy((__u8 *)quic + 6, &dcid, 4);
-        __builtin_memcpy((__u8 *)quic + 10, &dcid2, 4);
-
-        quic[14] = 0x08; // SCID Len 8
-        __builtin_memcpy((__u8 *)quic + 15, &scid, 4);
-        __builtin_memcpy((__u8 *)quic + 19, &scid2, 4);
-
-        quic[23] = 0x00; // token len 0
-        quic[24] = 0x40; // length (approx)
-        quic[25] = 0x00;
-
-        // 4-byte PPN
-        __builtin_memcpy((__u8 *)quic + 26, &ppn, 4);
-
-        // Bytes 30-33: feistel-encrypted ports (sport<<16|dport); XDP decrypts with feistel32_inv
-        __builtin_memcpy((__u8 *)quic + 30, &enc_ports, 4);
-
-        // Keep the rest filled with the PRNG gost generated above. No open text SNI!
+        write_quic_long_header(quic, data_end, wg_type, wg_idx, ppn, enc_ports, pad_len, cfg, pad_block, scratch);
     }
-    /* Encode ballast info in the last QUIC header byte:
-     *   0x00           = no ballast (large packet path, pad_len==0)
-     *   0x40 | raw     = has ballast; actual len = (raw & 0x3F) + 1 → [1..64] */
-    quic[quic_hdr_len - 1] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
 #endif /* GUT_MODE */
 
     if (ipver == 4)

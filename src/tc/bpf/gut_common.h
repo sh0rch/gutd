@@ -27,12 +27,12 @@
 #endif
 
 #define MAX_PORTS 6
-/* Short header layout (14 bytes):
- * [0]=0x40 [1-4]=DCID [5-8]=PPN [9-10]=inner_sport_be [11-12]=inner_dport_be [13]=pad_len
- * Long header layout (100 bytes):
- * [0]=0xC0 [1-4]=version [5]=dcid_len [6-13]=dcid [14]=scid_len [15-22]=scid
- * [23]=token_len [24-25]=length [26-29]=PPN [30-31]=inner_sport_be [32-33]=inner_dport_be
- * [34-98]=PRNG gost [99]=pad_len
+/* Short header layout (16 bytes):
+ * [0]=0x40 [1-4]=DCID [5]=dcid_len(0x01) [6-9]=PPN [10-13]=enc_ports [14]=reserved [15]=pad_len
+ * Long header layout (1200 bytes):
+ * [0]=0xC3 [1-4]=version(QUICv1) [5]=dcid_len(0x08) [6-13]=DCID [14]=scid_len(0x08) [15-22]=SCID
+ * [23]=token_len(0x04) [24-27]=enc_ports [28-29]=length [30-33]=PPN
+ * [34-43]=fake CRYPTO frame [44..1198]=PRNG fill [1199]=pad_len
  * TC egress stores the original WG UDP src/dst ports so XDP can restore them
  * after decapsulation, preserving the conntrack/WG port numbers end-to-end. */
 #define GUT_QUIC_SHORT_HEADER_SIZE 16
@@ -111,6 +111,15 @@ struct gut_config
     __u8 own_http3;              /* Respond to DPI probes via XDP_TX (1=yes) */
     __u8 dynamic_peer;           /* 1 = peer_ip unknown, learn from validated inbound packets */
     __u8 obfs_gost;              /* 1 = noise mode: XOR quic[0..6] with quic[6..12] to hide QUIC signatures */
+
+    /* ── QUIC crypto: precomputed by loader for BPF AEAD on Long Headers ── */
+    __u8 sni_domain[32];   /* SNI domain for ClientHello (null-terminated) */
+    __u8 sni_domain_len;   /* Actual length of sni_domain */
+    __u8 _pad_quic[3];     /* Alignment padding for u32 arrays below */
+    __u8 quic_dcid[8];     /* Fixed 8-byte DCID for Long Headers */
+    __u32 quic_key_rk[44]; /* AES-128 expanded round keys for AEAD (q_key) */
+    __u32 quic_hp_rk[44];  /* AES-128 expanded round keys for HP (q_hp) */
+    __u8 quic_iv[12];      /* AEAD IV — XOR with PPN(BE) for GCM nonce */
 } __attribute__((packed));
 
 /* Dynamic peer endpoint — learned from validated inbound packets.
@@ -1061,6 +1070,520 @@ static __always_inline __u8 is_quic_server(const struct gut_config *cfg)
     }
 }
 
+/* ── AES-128 (FIPS 197) for QUIC AEAD + Header Protection ──────────── */
+#if defined(GUT_MODE_QUIC)
+
+static const __u8 AES_SBOX[256] = {
+    0x63,
+    0x7c,
+    0x77,
+    0x7b,
+    0xf2,
+    0x6b,
+    0x6f,
+    0xc5,
+    0x30,
+    0x01,
+    0x67,
+    0x2b,
+    0xfe,
+    0xd7,
+    0xab,
+    0x76,
+    0xca,
+    0x82,
+    0xc9,
+    0x7d,
+    0xfa,
+    0x59,
+    0x47,
+    0xf0,
+    0xad,
+    0xd4,
+    0xa2,
+    0xaf,
+    0x9c,
+    0xa4,
+    0x72,
+    0xc0,
+    0xb7,
+    0xfd,
+    0x93,
+    0x26,
+    0x36,
+    0x3f,
+    0xf7,
+    0xcc,
+    0x34,
+    0xa5,
+    0xe5,
+    0xf1,
+    0x71,
+    0xd8,
+    0x31,
+    0x15,
+    0x04,
+    0xc7,
+    0x23,
+    0xc3,
+    0x18,
+    0x96,
+    0x05,
+    0x9a,
+    0x07,
+    0x12,
+    0x80,
+    0xe2,
+    0xeb,
+    0x27,
+    0xb2,
+    0x75,
+    0x09,
+    0x83,
+    0x2c,
+    0x1a,
+    0x1b,
+    0x6e,
+    0x5a,
+    0xa0,
+    0x52,
+    0x3b,
+    0xd6,
+    0xb3,
+    0x29,
+    0xe3,
+    0x2f,
+    0x84,
+    0x53,
+    0xd1,
+    0x00,
+    0xed,
+    0x20,
+    0xfc,
+    0xb1,
+    0x5b,
+    0x6a,
+    0xcb,
+    0xbe,
+    0x39,
+    0x4a,
+    0x4c,
+    0x58,
+    0xcf,
+    0xd0,
+    0xef,
+    0xaa,
+    0xfb,
+    0x43,
+    0x4d,
+    0x33,
+    0x85,
+    0x45,
+    0xf9,
+    0x02,
+    0x7f,
+    0x50,
+    0x3c,
+    0x9f,
+    0xa8,
+    0x51,
+    0xa3,
+    0x40,
+    0x8f,
+    0x92,
+    0x9d,
+    0x38,
+    0xf5,
+    0xbc,
+    0xb6,
+    0xda,
+    0x21,
+    0x10,
+    0xff,
+    0xf3,
+    0xd2,
+    0xcd,
+    0x0c,
+    0x13,
+    0xec,
+    0x5f,
+    0x97,
+    0x44,
+    0x17,
+    0xc4,
+    0xa7,
+    0x7e,
+    0x3d,
+    0x64,
+    0x5d,
+    0x19,
+    0x73,
+    0x60,
+    0x81,
+    0x4f,
+    0xdc,
+    0x22,
+    0x2a,
+    0x90,
+    0x88,
+    0x46,
+    0xee,
+    0xb8,
+    0x14,
+    0xde,
+    0x5e,
+    0x0b,
+    0xdb,
+    0xe0,
+    0x32,
+    0x3a,
+    0x0a,
+    0x49,
+    0x06,
+    0x24,
+    0x5c,
+    0xc2,
+    0xd3,
+    0xac,
+    0x62,
+    0x91,
+    0x95,
+    0xe4,
+    0x79,
+    0xe7,
+    0xc8,
+    0x37,
+    0x6d,
+    0x8d,
+    0xd5,
+    0x4e,
+    0xa9,
+    0x6c,
+    0x56,
+    0xf4,
+    0xea,
+    0x65,
+    0x7a,
+    0xae,
+    0x08,
+    0xba,
+    0x78,
+    0x25,
+    0x2e,
+    0x1c,
+    0xa6,
+    0xb4,
+    0xc6,
+    0xe8,
+    0xdd,
+    0x74,
+    0x1f,
+    0x4b,
+    0xbd,
+    0x8b,
+    0x8a,
+    0x70,
+    0x3e,
+    0xb5,
+    0x66,
+    0x48,
+    0x03,
+    0xf6,
+    0x0e,
+    0x61,
+    0x35,
+    0x57,
+    0xb9,
+    0x86,
+    0xc1,
+    0x1d,
+    0x9e,
+    0xe1,
+    0xf8,
+    0x98,
+    0x11,
+    0x69,
+    0xd9,
+    0x8e,
+    0x94,
+    0x9b,
+    0x1e,
+    0x87,
+    0xe9,
+    0xce,
+    0x55,
+    0x28,
+    0xdf,
+    0x8c,
+    0xa1,
+    0x89,
+    0x0d,
+    0xbf,
+    0xe6,
+    0x42,
+    0x68,
+    0x41,
+    0x99,
+    0x2d,
+    0x0f,
+    0xb0,
+    0x54,
+    0xbb,
+    0x16,
+};
+
+#define SB(b) AES_SBOX[(b) & 0xFF]
+
+/* AES-128 encrypt a single 16-byte block using precomputed round keys.
+ * noinline: BPF subprogram — keeps stack in its own frame (~200B), called from
+ * gut_egress at call depth 1.  AES-CTR keystreams are precomputed BEFORE calling
+ * the GHASH function, so AES and GHASH never nest (max 2 call depth). */
+static __attribute__((noinline)) void aes128_encrypt_block(const __u32 *rk, const __u8 *in, __u8 *out)
+{
+    /* Load state as 4 column-major u32, AddRoundKey(0) */
+    __u32 s0 = ((__u32)in[0] << 24 | (__u32)in[1] << 16 | (__u32)in[2] << 8 | in[3]) ^ rk[0];
+    __u32 s1 = ((__u32)in[4] << 24 | (__u32)in[5] << 16 | (__u32)in[6] << 8 | in[7]) ^ rk[1];
+    __u32 s2 = ((__u32)in[8] << 24 | (__u32)in[9] << 16 | (__u32)in[10] << 8 | in[11]) ^ rk[2];
+    __u32 s3 = ((__u32)in[12] << 24 | (__u32)in[13] << 16 | (__u32)in[14] << 8 | in[15]) ^ rk[3];
+
+    /* Rounds 1-9: SubBytes + ShiftRows + MixColumns + AddRoundKey */
+#define XTIME(x) (((x) << 1) ^ ((((x) >> 7) & 1) * 0x1b))
+#define AES_ROUND(r)                                                                  \
+    do                                                                                \
+    {                                                                                 \
+        __u8 b0 = SB(s0 >> 24), b1 = SB(s1 >> 16), b2 = SB(s2 >> 8), b3 = SB(s3);     \
+        __u8 b4 = SB(s1 >> 24), b5 = SB(s2 >> 16), b6 = SB(s3 >> 8), b7 = SB(s0);     \
+        __u8 b8 = SB(s2 >> 24), b9 = SB(s3 >> 16), b10 = SB(s0 >> 8), b11 = SB(s1);   \
+        __u8 b12 = SB(s3 >> 24), b13 = SB(s0 >> 16), b14 = SB(s1 >> 8), b15 = SB(s2); \
+        __u8 h0, h1, h2, h3;                                                          \
+        /* MixColumns col 0 */                                                        \
+        h0 = XTIME(b0);                                                               \
+        h1 = XTIME(b1);                                                               \
+        h2 = XTIME(b2);                                                               \
+        h3 = XTIME(b3);                                                               \
+        s0 = ((__u32)(h0 ^ (h1 ^ b1) ^ b2 ^ b3) << 24) |                              \
+             ((__u32)(b0 ^ h1 ^ (h2 ^ b2) ^ b3) << 16) |                              \
+             ((__u32)(b0 ^ b1 ^ h2 ^ (h3 ^ b3)) << 8) |                               \
+             ((__u32)((h0 ^ b0) ^ b1 ^ b2 ^ h3));                                     \
+        s0 ^= rk[(r) * 4 + 0];                                                        \
+        /* MixColumns col 1 */                                                        \
+        h0 = XTIME(b4);                                                               \
+        h1 = XTIME(b5);                                                               \
+        h2 = XTIME(b6);                                                               \
+        h3 = XTIME(b7);                                                               \
+        s1 = ((__u32)(h0 ^ (h1 ^ b5) ^ b6 ^ b7) << 24) |                              \
+             ((__u32)(b4 ^ h1 ^ (h2 ^ b6) ^ b7) << 16) |                              \
+             ((__u32)(b4 ^ b5 ^ h2 ^ (h3 ^ b7)) << 8) |                               \
+             ((__u32)((h0 ^ b4) ^ b5 ^ b6 ^ h3));                                     \
+        s1 ^= rk[(r) * 4 + 1];                                                        \
+        /* MixColumns col 2 */                                                        \
+        h0 = XTIME(b8);                                                               \
+        h1 = XTIME(b9);                                                               \
+        h2 = XTIME(b10);                                                              \
+        h3 = XTIME(b11);                                                              \
+        s2 = ((__u32)(h0 ^ (h1 ^ b9) ^ b10 ^ b11) << 24) |                            \
+             ((__u32)(b8 ^ h1 ^ (h2 ^ b10) ^ b11) << 16) |                            \
+             ((__u32)(b8 ^ b9 ^ h2 ^ (h3 ^ b11)) << 8) |                              \
+             ((__u32)((h0 ^ b8) ^ b9 ^ b10 ^ h3));                                    \
+        s2 ^= rk[(r) * 4 + 2];                                                        \
+        /* MixColumns col 3 */                                                        \
+        h0 = XTIME(b12);                                                              \
+        h1 = XTIME(b13);                                                              \
+        h2 = XTIME(b14);                                                              \
+        h3 = XTIME(b15);                                                              \
+        s3 = ((__u32)(h0 ^ (h1 ^ b13) ^ b14 ^ b15) << 24) |                           \
+             ((__u32)(b12 ^ h1 ^ (h2 ^ b14) ^ b15) << 16) |                           \
+             ((__u32)(b12 ^ b13 ^ h2 ^ (h3 ^ b15)) << 8) |                            \
+             ((__u32)((h0 ^ b12) ^ b13 ^ b14 ^ h3));                                  \
+        s3 ^= rk[(r) * 4 + 3];                                                        \
+    } while (0)
+
+    AES_ROUND(1);
+    AES_ROUND(2);
+    AES_ROUND(3);
+    AES_ROUND(4);
+    AES_ROUND(5);
+    AES_ROUND(6);
+    AES_ROUND(7);
+    AES_ROUND(8);
+    AES_ROUND(9);
+
+#undef AES_ROUND
+
+    /* Round 10: SubBytes + ShiftRows + AddRoundKey (no MixColumns) */
+    out[0] = SB(s0 >> 24) ^ (rk[40] >> 24);
+    out[1] = SB(s1 >> 16) ^ (rk[40] >> 16);
+    out[2] = SB(s2 >> 8) ^ (rk[40] >> 8);
+    out[3] = SB(s3) ^ rk[40];
+    out[4] = SB(s1 >> 24) ^ (rk[41] >> 24);
+    out[5] = SB(s2 >> 16) ^ (rk[41] >> 16);
+    out[6] = SB(s3 >> 8) ^ (rk[41] >> 8);
+    out[7] = SB(s0) ^ rk[41];
+    out[8] = SB(s2 >> 24) ^ (rk[42] >> 24);
+    out[9] = SB(s3 >> 16) ^ (rk[42] >> 16);
+    out[10] = SB(s0 >> 8) ^ (rk[42] >> 8);
+    out[11] = SB(s1) ^ rk[42];
+    out[12] = SB(s3 >> 24) ^ (rk[43] >> 24);
+    out[13] = SB(s0 >> 16) ^ (rk[43] >> 16);
+    out[14] = SB(s1 >> 8) ^ (rk[43] >> 8);
+    out[15] = SB(s2) ^ rk[43];
+
+#undef XTIME
+#undef SB
+}
+
+/* ── GF(2^128) multiply via bpf_loop ──────────────────────────────────
+ * Using bpf_loop(32, callback, ctx, 0) the verifier checks the callback body
+ * ONCE regardless of iteration count, eliminating the state explosion that
+ * killed the verifier budget with schoolbook-unroll or bounded-loop approaches.
+ * Available since kernel 5.17; target is 6.1+. */
+
+struct gf_ctx
+{
+    __u32 z0, z1, z2, z3;
+    __u32 v0, v1, v2, v3;
+    __u32 xw; /* current 32-bit word of x being processed */
+};
+
+static long gf_step_cb(__u32 bit, void *_ctx)
+{
+    struct gf_ctx *c = (struct gf_ctx *)_ctx;
+    __u32 b = bit & 31; /* ensure [0,31] for shift safety */
+    __u32 mask = -((__u32)((c->xw >> (31 - b)) & 1));
+    c->z0 ^= c->v0 & mask;
+    c->z1 ^= c->v1 & mask;
+    c->z2 ^= c->v2 & mask;
+    c->z3 ^= c->v3 & mask;
+    __u32 carry = -(c->v3 & 1);
+    c->v3 = (c->v3 >> 1) | (c->v2 << 31);
+    c->v2 = (c->v2 >> 1) | (c->v1 << 31);
+    c->v1 = (c->v1 >> 1) | (c->v0 << 31);
+    c->v0 = (c->v0 >> 1) ^ (0xE1000000U & carry);
+    return 0;
+}
+
+/* GF(2^128) multiply: z = x * h, reduction polynomial x^128+x^7+x^2+x+1.
+ * All 128-bit values in big-endian byte order (GCM convention).
+ * 32-bit safe. Uses bpf_loop for verifier-friendly iteration. */
+static __always_inline void gf128_mul(const __u8 *x, const __u8 *h, __u8 *z)
+{
+    struct gf_ctx ctx;
+    __u32 x0, x1, x2, x3;
+
+    __builtin_memcpy(&x0, x, 4);
+    x0 = __builtin_bswap32(x0);
+    __builtin_memcpy(&x1, x + 4, 4);
+    x1 = __builtin_bswap32(x1);
+    __builtin_memcpy(&x2, x + 8, 4);
+    x2 = __builtin_bswap32(x2);
+    __builtin_memcpy(&x3, x + 12, 4);
+    x3 = __builtin_bswap32(x3);
+
+    __builtin_memcpy(&ctx.v0, h, 4);
+    ctx.v0 = __builtin_bswap32(ctx.v0);
+    __builtin_memcpy(&ctx.v1, h + 4, 4);
+    ctx.v1 = __builtin_bswap32(ctx.v1);
+    __builtin_memcpy(&ctx.v2, h + 8, 4);
+    ctx.v2 = __builtin_bswap32(ctx.v2);
+    __builtin_memcpy(&ctx.v3, h + 12, 4);
+    ctx.v3 = __builtin_bswap32(ctx.v3);
+
+    ctx.z0 = ctx.z1 = ctx.z2 = ctx.z3 = 0;
+
+    /* Memory barriers after each bpf_loop: the callback modifies ctx
+     * through a pointer, but Clang -O2 may keep z/v fields in callee-saved
+     * registers across the helper call and use stale values.  The barrier
+     * forces a reload from the stack where the callback actually wrote. */
+    ctx.xw = x0;
+    bpf_loop(32, gf_step_cb, &ctx, 0);
+    asm volatile("" : "+m"(ctx));
+    ctx.xw = x1;
+    bpf_loop(32, gf_step_cb, &ctx, 0);
+    asm volatile("" : "+m"(ctx));
+    ctx.xw = x2;
+    bpf_loop(32, gf_step_cb, &ctx, 0);
+    asm volatile("" : "+m"(ctx));
+    ctx.xw = x3;
+    bpf_loop(32, gf_step_cb, &ctx, 0);
+    asm volatile("" : "+m"(ctx));
+
+    ctx.z0 = __builtin_bswap32(ctx.z0);
+    ctx.z1 = __builtin_bswap32(ctx.z1);
+    ctx.z2 = __builtin_bswap32(ctx.z2);
+    ctx.z3 = __builtin_bswap32(ctx.z3);
+    __builtin_memcpy(z, &ctx.z0, 4);
+    __builtin_memcpy(z + 4, &ctx.z1, 4);
+    __builtin_memcpy(z + 8, &ctx.z2, 4);
+    __builtin_memcpy(z + 12, &ctx.z3, 4);
+}
+
+/* GHASH: update accumulator x with block b using hash subkey H.
+ * x = gf128_mul(x XOR b, H). */
+static __always_inline void ghash_update(const __u8 *H, __u8 *x, const __u8 *block, __u8 *tmp)
+{
+    for (int j = 0; j < 16; j++)
+        x[j] ^= block[j];
+    gf128_mul(x, H, tmp);
+    __builtin_memcpy(x, tmp, 16);
+}
+
+/* GCM-GHASH + tag computation over pre-encrypted ciphertext.
+ * AES-CTR XOR and AES(H)/AES(J0) are precomputed by the caller so this
+ * function contains NO AES calls — only XOR + GHASH (via bpf_loop).
+ * noinline: separate stack frame (~80B), called from gut_egress at depth 1.
+ * bpf_loop callback adds depth +1 → max depth 2.
+ *
+ * scratch_ghash layout (≥80 bytes):
+ *   [0..15]=ghash_x, [16..31]=tmp, [32..47]=blk, [48..63]=tag_out, [64..99]=gf_ctx
+ *
+ * @H:           precomputed hash subkey AES(K, 0^128), 16 bytes
+ * @aad:         AAD buffer, exactly 34 bytes
+ * @ct:          ciphertext buffer, exactly 128 bytes (already XOR'd with CTR keystreams)
+ * @j0_ks:       precomputed AES(K, J0) for tag finalization, 16 bytes
+ * @scratch_ghash: working area (≥100 bytes, in per-cpu scratch map) */
+static __attribute__((noinline)) void gcm_ghash_tag_128(
+    const __u8 *H,
+    const __u8 *aad,
+    const __u8 *ct,
+    const __u8 *j0_ks,
+    __u8 *scratch_ghash)
+{
+    __u8 *ghash_x = scratch_ghash;
+    __u8 *tmp = scratch_ghash + 16;
+    __u8 *blk = scratch_ghash + 32;
+
+    __builtin_memset(ghash_x, 0, 16);
+
+    /* GHASH over AAD: 34 bytes = 3 blocks (last padded with zeros) */
+    __builtin_memcpy(blk, aad, 16);
+    ghash_update(H, ghash_x, blk, tmp);
+    __builtin_memcpy(blk, aad + 16, 16);
+    ghash_update(H, ghash_x, blk, tmp);
+    __builtin_memset(blk, 0, 16);
+    blk[0] = aad[32];
+    blk[1] = aad[33];
+    ghash_update(H, ghash_x, blk, tmp);
+
+    /* GHASH over 8 ciphertext blocks */
+    for (__u32 i = 0; i < 8; i++)
+        ghash_update(H, ghash_x, ct + i * 16, tmp);
+
+    /* Length block: AAD=272 bits, CT=1024 bits */
+    __builtin_memset(blk, 0, 16);
+    blk[6] = 0x01;
+    blk[7] = 0x10;
+    blk[14] = 0x04;
+    blk[15] = 0x00;
+    ghash_update(H, ghash_x, blk, tmp);
+
+    /* Tag = AES(K, J0) XOR GHASH — AES(K,J0) is precomputed in j0_ks */
+    __u8 *tag_out = scratch_ghash + 48;
+    for (int j = 0; j < 16; j++)
+        tag_out[j] = j0_ks[j] ^ ghash_x[j];
+}
+
+#endif /* GUT_MODE_QUIC */
+
 #endif /* __GUT_COMMON_H__ */
 
 static __always_inline void write_gost_header(__u8 *quic, void *data_end, __u32 ppn, __u32 enc_ports, __u32 pad_len)
@@ -1086,54 +1609,218 @@ static __always_inline void write_quic_short_header(__u8 *quic, void *data_end, 
     quic[15] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
 }
 
-static __always_inline void write_quic_long_header(__u8 *quic, void *data_end, __u8 wg_type, __u32 wg_idx, __u32 ppn, __u32 enc_ports, __u32 pad_len, const struct gut_config *cfg, __u8 *pad_block)
+#if defined(GUT_MODE_QUIC)
+static __always_inline void write_quic_long_header(__u8 *quic, void *data_end, __u8 wg_type, __u32 wg_idx, __u32 ppn, __u32 enc_ports, __u32 pad_len, const struct gut_config *cfg, __u8 *pad_block, __u8 *scratch)
 {
     if ((__u8 *)quic + GUT_QUIC_LONG_HEADER_SIZE > (__u8 *)data_end)
         return;
 
-    quic[0] = (wg_type == 3) ? 0xF0 : 0xC3;
-
+    /* Fill entire header with PRNG first */
     __u32 time_gost = feistel32((__u32)bpf_ktime_get_ns(), cfg->feistel_rk);
-    __u8 *gost_b = (__u8 *)&time_gost;
+    __u8 gb0 = (__u8)(time_gost);
+    __u8 gb1 = (__u8)(time_gost >> 8);
+    __u8 gb2 = (__u8)(time_gost >> 16);
+    __u8 gb3 = (__u8)(time_gost >> 24);
+    __u8 gost_bytes[4] = {gb0, gb1, gb2, gb3};
 
 #pragma unroll
-    for (int i = 1; i < 64; i++)
-    {
-        quic[i] = pad_block[(i * 13) & 0x3F] ^ gost_b[i & 3];
-    }
+    for (int i = 0; i < 64; i++)
+        quic[i] = pad_block[(i * 13) & 0x3F] ^ gost_bytes[i & 3];
 
+    /* Unprotected header: RFC 9000 QUIC Initial */
+    quic[0] = (wg_type == 3) ? 0xF3 : 0xC3; /* Long Header, 4-byte PN */
     quic[1] = 0x00;
     quic[2] = 0x00;
     quic[3] = 0x00;
-    quic[4] = 0x01; // QUIC v1
+    quic[4] = 0x01; /* QUIC v1 */
 
-    __u32 dcid2 = feistel32(wg_idx ^ 0xDEADBEEF, cfg->feistel_rk);
-    __u32 scid = feistel32(wg_idx ^ 0xCAFEBABE, cfg->feistel_rk);
+    /* Fixed DCID from config (precomputed, QUIC keys derived from it) */
+    quic[5] = 0x08;
+    __builtin_memcpy(quic + 6, cfg->quic_dcid, 8);
+
+    /* SCID: PPN (host-order) in first 4 bytes for ingress fast-path, rest random */
+    quic[14] = 0x08;
+    __builtin_memcpy(quic + 15, &ppn, 4);
     __u32 scid2 = feistel32(wg_idx ^ 0x12345678, cfg->feistel_rk);
-
-    quic[5] = 0x08; // DCID length 8
-    __builtin_memcpy(quic + 6, &wg_idx, 4);
-    __builtin_memcpy(quic + 10, &dcid2, 4);
-    quic[14] = 0x08; // SCID length 8
-    __builtin_memcpy(quic + 15, &scid, 4);
     __builtin_memcpy(quic + 19, &scid2, 4);
 
-    quic[23] = 0x04; // Token length 4
+    /* Token: enc_ports (4 bytes, readable without AEAD decryption) */
+    quic[23] = 0x04;
     __builtin_memcpy(quic + 24, &enc_ports, 4);
 
-    __u16 total_quic_len = GUT_QUIC_LONG_HEADER_SIZE - 30;
-    quic[28] = 0x40 | ((total_quic_len >> 8) & 0xFF);
-    quic[29] = total_quic_len & 0xFF;
+    /* ── Build CRYPTO frame with TLS 1.3 ClientHello + SNI ── */
+    /* Use scratch[320..448] for CRYPTO frame plaintext (max 128 bytes) */
+    __u8 *cf = scratch + 320;
+    __u32 dlen = cfg->sni_domain_len;
+    if (dlen > 32)
+        dlen = 32;
 
-    __builtin_memcpy(quic + 30, &ppn, 4);
+    /* SNI extension: type(2)+ext_len(2)+list_len(2)+name_type(1)+name_len(2)+name */
+    __u32 sni_ext_data = (dlen > 0) ? (dlen + 5) : 0;
+    __u32 sni_ext_total = (dlen > 0) ? (sni_ext_data + 4) : 0;
+    /* ALPN "h3": type(2)+len(2)+list(2)+proto_len(1)+"h3"(2) = 9 */
+    /* supported_versions: type(2)+len(2)+list_len(1)+ver(2) = 7 */
+    __u32 ext_len = sni_ext_total + 9 + 7;
+    __u32 ch_body = 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + ext_len; /* 43 + ext_len */
+    __u32 hs_len = ch_body + 4;                               /* type(1)+length(3) */
+    __u32 cf_data = hs_len;
+    __u32 cf_total = 4 + cf_data; /* CRYPTO header(4) + data */
+    if (cf_total > 128)
+        cf_total = 128;
 
-    // Simplistic fake Crypto frame to deceive some fast DPIs
-    quic[34] = 0x06; // CRYPTO
-    quic[35] = 0x00;
-    quic[36] = 0x40;
-    quic[37] = 0x64;
-    quic[38] = 0x01; // Client Hello
-    quic[41] = 0x60;
-    quic[42] = 0x03; // TLS 1.3
-    quic[43] = 0x03;
+    __builtin_memset(cf, 0, 128);
+
+    /* CRYPTO frame header */
+    cf[0] = 0x06;
+    cf[1] = 0x00;
+    cf[2] = 0x40 | ((cf_data >> 8) & 0x3F);
+    cf[3] = cf_data & 0xFF;
+    /* ClientHello */
+    cf[4] = 0x01;
+    cf[5] = 0;
+    cf[6] = (ch_body >> 8) & 0xFF;
+    cf[7] = ch_body & 0xFF;
+    cf[8] = 0x03;
+    cf[9] = 0x03; /* legacy version 0x0303 */
+    /* Random 32 bytes from pad_block + time */
+    for (int i = 0; i < 32; i++)
+        cf[10 + i] = pad_block[i & 0x3F] ^ gost_bytes[(i + 1) & 3];
+    cf[42] = 0x00; /* session ID len = 0 */
+    cf[43] = 0x00;
+    cf[44] = 0x02; /* cipher suites len = 2 */
+    cf[45] = 0x13;
+    cf[46] = 0x01; /* TLS_AES_128_GCM_SHA256 */
+    cf[47] = 0x01;
+    cf[48] = 0x00; /* compression: null */
+    cf[49] = (ext_len >> 8) & 0xFF;
+    cf[50] = ext_len & 0xFF;
+
+    __u32 eoff = 51;
+    /* SNI extension (type 0x0000) */
+    if (dlen > 0)
+    {
+        cf[eoff] = 0x00;
+        cf[eoff + 1] = 0x00;
+        cf[eoff + 2] = (sni_ext_data >> 8);
+        cf[eoff + 3] = sni_ext_data & 0xFF;
+        __u32 list_len = dlen + 3;
+        cf[eoff + 4] = (list_len >> 8);
+        cf[eoff + 5] = list_len & 0xFF;
+        cf[eoff + 6] = 0x00; /* host_name type */
+        cf[eoff + 7] = (dlen >> 8);
+        cf[eoff + 8] = dlen & 0xFF;
+        for (__u32 i = 0; i < 32 && i < dlen; i++)
+            cf[eoff + 9 + i] = cfg->sni_domain[i];
+        eoff += sni_ext_total;
+    }
+    /* ALPN "h3" */
+    cf[eoff] = 0x00;
+    cf[eoff + 1] = 0x10;
+    cf[eoff + 2] = 0x00;
+    cf[eoff + 3] = 0x05;
+    cf[eoff + 4] = 0x00;
+    cf[eoff + 5] = 0x03;
+    cf[eoff + 6] = 0x02;
+    cf[eoff + 7] = 'h';
+    cf[eoff + 8] = '3';
+    eoff += 9;
+    /* supported_versions 0x0304 */
+    cf[eoff] = 0x00;
+    cf[eoff + 1] = 0x2b;
+    cf[eoff + 2] = 0x00;
+    cf[eoff + 3] = 0x03;
+    cf[eoff + 4] = 0x02;
+    cf[eoff + 5] = 0x03;
+    cf[eoff + 6] = 0x04;
+
+    /* ── Length field: PPN(4) + ciphertext(128) + GCM_tag(16) ── */
+    /* Always encrypt fixed 128-byte block (cf is zero-padded) so all packet
+     * writes use constant offsets — the BPF verifier can prove bounds. */
+    __u16 quic_payload_len = 4 + 128 + 16; /* = 148 */
+    quic[28] = 0x40 | ((quic_payload_len >> 8) & 0xFF);
+    quic[29] = quic_payload_len & 0xFF;
+
+    /* Write PPN in big-endian (will be HP-masked later) */
+    __u8 ppn_be[4];
+    ppn_be[0] = (ppn >> 24);
+    ppn_be[1] = (ppn >> 16);
+    ppn_be[2] = (ppn >> 8);
+    ppn_be[3] = ppn;
+    __builtin_memcpy(quic + 30, ppn_be, 4);
+
+    /* ── AES-128-GCM encrypt CRYPTO frame ── */
+    /* AEAD nonce = IV XOR left-padded PPN(BE) (RFC 9001 §5.3) */
+    /* All temp buffers in scratch to minimize gut_egress stack frame. */
+    __u8 *nonce = scratch + 624;
+    __builtin_memcpy(nonce, cfg->quic_iv, 12);
+    nonce[8] ^= ppn_be[0];
+    nonce[9] ^= ppn_be[1];
+    nonce[10] ^= ppn_be[2];
+    nonce[11] ^= ppn_be[3];
+
+    /* AAD = unprotected header bytes [0..33] */
+    __u8 *aad = scratch + 448;
+    __builtin_memcpy(aad, quic, 34);
+
+    /* ── Phase 1: Precompute all AES blocks (noinline calls, depth 1) ── */
+    /* H = AES(K, 0^128) */
+    __u8 *H = scratch + 512;
+    __builtin_memset(H, 0, 16);
+    aes128_encrypt_block(cfg->quic_key_rk, H, H);
+
+    /* CTR keystreams: AES(K, ctr_i) for i=2..9, XOR directly into cf */
+    __u8 *ks_tmp = scratch + 528;
+    __u8 *ctr_block = scratch + 640;
+    __builtin_memcpy(ctr_block, nonce, 12);
+    ctr_block[12] = 0;
+    ctr_block[13] = 0;
+    ctr_block[14] = 0;
+    for (__u32 i = 0; i < 8; i++)
+    {
+        ctr_block[15] = (__u8)(i + 2);
+        aes128_encrypt_block(cfg->quic_key_rk, ctr_block, ks_tmp);
+        __u32 off = i * 16;
+        for (int j = 0; j < 16; j++)
+            cf[off + j] ^= ks_tmp[j];
+    }
+
+    /* J0 keystream: AES(K, nonce || 0x00000001) for tag finalization */
+    __u8 *j0_ks = scratch + 544;
+    ctr_block[15] = 1;
+    aes128_encrypt_block(cfg->quic_key_rk, ctr_block, j0_ks);
+
+    /* ── Phase 2: GHASH + tag (noinline, depth 1 → callback depth 2) ── */
+    /* scratch_ghash at scratch+560: [0..15]=ghash_x, [16..31]=tmp, [32..47]=blk, [48..63]=tag_out */
+    __u8 *scratch_ghash = scratch + 560;
+    gcm_ghash_tag_128(H, aad, cf, j0_ks, scratch_ghash);
+
+    /* Tag is at scratch_ghash+48 (scratch+608) */
+    __u8 *tag = scratch_ghash + 48;
+
+    /* Copy ciphertext (128 bytes) + tag (16 bytes) at fixed offsets */
+    /* quic[34..162] = ciphertext, quic[162..178] = tag */
+    for (__u32 i = 0; i < 128; i++)
+        quic[34 + i] = cf[i];
+    for (__u32 i = 0; i < 16; i++)
+        quic[162 + i] = tag[i];
+
+    /* ── Header Protection (RFC 9001 §5.4) ── */
+    /* Sample starts at pn_offset+4 = 34 */
+    __u8 *hp_mask = scratch + 656;
+    aes128_encrypt_block(cfg->quic_hp_rk, quic + 34, hp_mask);
+    /* Mask first byte (Long Header: lower 4 bits) */
+    quic[0] ^= (hp_mask[0] & 0x0F);
+    /* Mask PPN bytes */
+    quic[30] ^= hp_mask[1];
+    quic[31] ^= hp_mask[2];
+    quic[32] ^= hp_mask[3];
+    quic[33] ^= hp_mask[4];
+
+    /* Fill rest of 1200-byte header with PRNG (after AEAD+tag region) */
+    for (__u32 i = 178; i < GUT_QUIC_LONG_HEADER_SIZE - 1 && i < 1199; i++)
+        quic[i] = pad_block[(i * 7) & 0x3F] ^ gost_bytes[i & 3];
+
+    /* Ballast encoding in last byte (outside AEAD region) */
+    quic[GUT_QUIC_LONG_HEADER_SIZE - 1] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
 }
+#endif /* GUT_MODE_QUIC — write_quic_long_header */
