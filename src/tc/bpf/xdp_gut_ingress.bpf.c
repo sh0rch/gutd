@@ -38,6 +38,11 @@ static __always_inline void xor16(__u8 *p, const __u8 *k)
         p[i] ^= k[i];
 }
 
+#if defined(GUT_MODE_SYSLOG)
+/* Not needed as separate subprog — b64_decode is called inline to avoid
+ * mark_precise explosion from noinline map-value invalidation. */
+#endif /* GUT_MODE_SYSLOG */
+
 static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *cfg)
 {
     void *data = (void *)(__u64)ctx->data;
@@ -111,6 +116,75 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
 
 #if defined(GUT_MODE_GOST)
     __u32 quic_hdr_len = GUT_GOST_HEADER_SIZE;
+#elif defined(GUT_MODE_SYSLOG)
+    /* Syslog base64 → GOST conversion: load, decode (noinline), store, trim */
+    if (wg[0] != 0x3C) /* '<' */
+        return -1;
+    {
+        __u32 b64_data_len = wg_len - GUT_SYSLOG_ASCII_LEN;
+        b64_data_len &= 0xFFF; /* unsigned bound for verifier */
+        if (b64_data_len < 16 || b64_data_len > GUT_B64_MAX_OUT)
+            return -1;
+
+        /* Load base64 from packet to scratch */
+        if (bpf_xdp_load_bytes(ctx, wg_off + GUT_SYSLOG_ASCII_LEN,
+                               scratch + B64_ENC_OFF, b64_data_len) < 0)
+            return -1;
+
+        /* Decode base64 inline */
+        __u32 b64_bounded = b64_data_len & 0xFFF;
+        if (b64_bounded < 16 || b64_bounded > GUT_B64_MAX_OUT || (b64_bounded & 3))
+            return -1;
+        __u32 decoded_len = b64_decode(scratch, B64_ENC_OFF, b64_bounded, B64_INNER_OFF);
+        if (decoded_len < GUT_GOST_HEADER_SIZE + WG_MIN_PACKET ||
+            decoded_len > GUT_B64_MAX_INNER)
+            return -1;
+
+        /* Strip ballast from decoded GOST inner so we only write net data
+         * to the packet and need a single bpf_xdp_adjust_tail. */
+        __u32 pad_off = (B64_INNER_OFF + 9) & (SCRATCH_SIZE - 1);
+        __u8 pad_byte_s = scratch[pad_off];
+        __u32 ballast_s = (pad_byte_s & 0x40) ? ((__u32)(pad_byte_s & 0x3F) + 1) : 0;
+        if (ballast_s >= decoded_len - GUT_GOST_HEADER_SIZE)
+            return -1;
+        decoded_len -= ballast_s;
+        decoded_len &= 0x3FF; /* unsigned bound for verifier: max 1023, fits scratch from off=384 */
+        if (decoded_len < GUT_GOST_HEADER_SIZE + WG_MIN_PACKET)
+            return -1;
+        scratch[pad_off] = 0x00; /* clear ballast flag for shared GOST code */
+
+        /* Write decoded GOST inner (without ballast) back to packet */
+        if (bpf_xdp_store_bytes(ctx, wg_off,
+                                scratch + B64_INNER_OFF, decoded_len) < 0)
+            return -1;
+
+        /* Trim excess tail bytes (base64 expansion + ballast in one op) */
+        __s32 syslog_trim = (__s32)wg_len - (__s32)decoded_len;
+        if (syslog_trim > 0)
+        {
+            if (bpf_xdp_adjust_tail(ctx, -syslog_trim) < 0)
+                return -1;
+        }
+
+        /* Re-derive all pointers after packet modifications */
+        data = (void *)(__u64)ctx->data;
+        data_end = (void *)(__u64)ctx->data_end;
+        eth = data;
+        if ((void *)(eth + 1) > data_end)
+            return -1;
+        udph = (void *)((__u8 *)data + udp_off);
+        if ((void *)(udph + 1) > data_end)
+            return -1;
+        wg = (__u8 *)data + wg_off;
+        wg_len = decoded_len;
+        if (wg + GUT_GOST_HEADER_SIZE + WG_MIN_PACKET > (__u8 *)data_end)
+            return -1;
+        if (wg + wg_len > (__u8 *)data_end)
+            return -1;
+        udp_len = 8 + (__u16)decoded_len;
+    }
+    /* Packet is now in GOST format — fall through to GOST processing */
+    __u32 quic_hdr_len = GUT_GOST_HEADER_SIZE;
 #else /* GUT_MODE_QUIC */
     __u32 quic_hdr_len = 0;
     if (wg[0] == 0x40)
@@ -139,9 +213,10 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         return -1;
 
     __u32 nonce = wg_nonce32(wg);
+#if !defined(GUT_MODE_SYSLOG)
     __u32 *ks0 = (__u32 *)(scratch + 0);
     chacha_block(ks0, cfg->chacha_init, 0, nonce);
-
+#endif
     __u32 *ks47 = (__u32 *)(scratch + 64);
     chacha_block(ks47, cfg->chacha_init, 47, nonce);
 
@@ -159,13 +234,13 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     }
 
     __u32 expected_ppn = ks47[10];
-#if !defined(GUT_MODE_GOST)
+#if defined(GUT_MODE_QUIC)
     __u32 expected_dcid = feistel32(wg_idx, cfg->feistel_rk);
 #endif
 
     __u8 *quic = wg - quic_hdr_len;
 
-#if defined(GUT_MODE_GOST)
+#if defined(GUT_MODE_GOST) || defined(GUT_MODE_SYSLOG)
     {
         __u32 pkt_ppn = 0;
         __builtin_memcpy(&pkt_ppn, quic + 0, 4);
@@ -217,6 +292,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
      *
      * Note: wg_idx reads bytes[8..12] for non-Type-1 (correct for DCID matching),
      * but receiver_index for Type 4 lives at bytes[4..8].  We extract separately. */
+#if !defined(GUT_MODE_SYSLOG) /* dynamic peer inline; syslog uses helper-based save/restore */
     if (cfg->dynamic_peer)
     {
         __u32 client_idx = 0;
@@ -265,6 +341,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             bpf_debug("XDP: client_map[%u] updated wg_type=%u port=%u", client_idx, wg_type, ep.port);
         }
     }
+#endif /* !GUT_MODE_SYSLOG */
 
     /* Read feistel-encrypted ports from the QUIC header (4 bytes, stored by TC egress).
      * Short header (GUT_QUIC_SHORT_HEADER_SIZE=16): enc_ports at bytes [10-13].
@@ -273,7 +350,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
      * On bpf_xdp_load_bytes failure enc_ports stays 0 and ports_ok=0 prevents restore. */
     __u32 enc_ports = 0;
     int ports_ok = 1;
-#if defined(GUT_MODE_GOST)
+#if defined(GUT_MODE_GOST) || defined(GUT_MODE_SYSLOG)
     __builtin_memcpy(&enc_ports, quic + 4, 4);
 #else /* GUT_MODE_QUIC */
     if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
@@ -289,6 +366,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     __be16 inner_sport_ne = ports_ok ? bpf_htons((__u16)(plain_ports >> 16)) : 0;
     __be16 inner_dport_ne = ports_ok ? bpf_htons((__u16)(plain_ports & 0xFFFF)) : 0;
 
+#if !defined(GUT_MODE_SYSLOG) /* mac2 XOR not needed: payload was base64-wrapped */
     if (wg_type == 1 && wg_len >= 148 && wg + 148 <= (__u8 *)data_end)
     {
         xor16(wg + 132, (const __u8 *)ks47 + 16);
@@ -297,6 +375,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     {
         xor16(wg + 76, (const __u8 *)ks47 + 16);
     }
+#endif /* !GUT_MODE_SYSLOG */
 
     if (ballast_len > 63 || ballast_len > wg_len)
         return -1;

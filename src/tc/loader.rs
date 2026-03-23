@@ -147,6 +147,24 @@ mod xdp_gut_ingress_gost {
     include!(concat!(env!("OUT_DIR"), "/xdp_gut_ingress_gost.skel.rs"));
 }
 
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+#[allow(clippy::all, clippy::pedantic)]
+mod tc_gut_egress_syslog {
+    include!(concat!(env!("OUT_DIR"), "/tc_gut_egress_syslog.skel.rs"));
+}
+
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+#[allow(clippy::all, clippy::pedantic)]
+mod tc_gut_egress_syslog_v6 {
+    include!(concat!(env!("OUT_DIR"), "/tc_gut_egress_syslog_v6.skel.rs"));
+}
+
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+#[allow(clippy::all, clippy::pedantic)]
+mod xdp_gut_ingress_syslog {
+    include!(concat!(env!("OUT_DIR"), "/xdp_gut_ingress_syslog.skel.rs"));
+}
+
 /// Egress skeleton: mode × outer-AF variant.
 /// Compiled from the same source with different -D flags.
 #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
@@ -155,6 +173,8 @@ enum EgressSkel {
     V6(tc_gut_egress_v6::TcGutEgressSkel<'static>),
     GostV4(tc_gut_egress_gost::TcGutEgressSkel<'static>),
     GostV6(tc_gut_egress_gost_v6::TcGutEgressSkel<'static>),
+    SyslogV4(tc_gut_egress_syslog::TcGutEgressSkel<'static>),
+    SyslogV6(tc_gut_egress_syslog_v6::TcGutEgressSkel<'static>),
 }
 
 #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
@@ -181,6 +201,16 @@ impl EgressSkel {
                     .update(&0u32.to_ne_bytes(), value, MapFlags::ANY)?
             }
             Self::GostV6(s) => {
+                s.maps
+                    .config_map
+                    .update(&0u32.to_ne_bytes(), value, MapFlags::ANY)?
+            }
+            Self::SyslogV4(s) => {
+                s.maps
+                    .config_map
+                    .update(&0u32.to_ne_bytes(), value, MapFlags::ANY)?
+            }
+            Self::SyslogV6(s) => {
                 s.maps
                     .config_map
                     .update(&0u32.to_ne_bytes(), value, MapFlags::ANY)?
@@ -212,6 +242,16 @@ impl EgressSkel {
                     .counters_map
                     .update(&0u32.to_ne_bytes(), &bytes, MapFlags::ANY)?
             }
+            Self::SyslogV4(s) => {
+                s.maps
+                    .counters_map
+                    .update(&0u32.to_ne_bytes(), &bytes, MapFlags::ANY)?
+            }
+            Self::SyslogV6(s) => {
+                s.maps
+                    .counters_map
+                    .update(&0u32.to_ne_bytes(), &bytes, MapFlags::ANY)?
+            }
         }
         Ok(())
     }
@@ -222,11 +262,13 @@ impl EgressSkel {
             Self::V6(s) => s.progs.gut_egress.as_fd(),
             Self::GostV4(s) => s.progs.gut_egress.as_fd(),
             Self::GostV6(s) => s.progs.gut_egress.as_fd(),
+            Self::SyslogV4(s) => s.progs.gut_egress.as_fd(),
+            Self::SyslogV6(s) => s.progs.gut_egress.as_fd(),
         }
     }
 
     fn is_v6(&self) -> bool {
-        matches!(self, Self::V6(_) | Self::GostV6(_))
+        matches!(self, Self::V6(_) | Self::GostV6(_) | Self::SyslogV6(_))
     }
 
     fn get_map_fd(&self, name: &str) -> Option<std::os::unix::io::BorrowedFd<'_>> {
@@ -249,6 +291,8 @@ impl EgressSkel {
             Self::V6(s) => map_fd!(s),
             Self::GostV4(s) => map_fd!(s),
             Self::GostV6(s) => map_fd!(s),
+            Self::SyslogV4(s) => map_fd!(s),
+            Self::SyslogV6(s) => map_fd!(s),
         }
     }
 
@@ -261,6 +305,8 @@ impl EgressSkel {
             Self::V6(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
             Self::GostV4(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
             Self::GostV6(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
+            Self::SyslogV4(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
+            Self::SyslogV6(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
         }
     }
 }
@@ -410,27 +456,39 @@ impl TcBpfManager {
         );
 
         // ── Load egress skeleton (mode × AF) ──────────────────────────
-        let is_gost = config.peer().obfs == crate::config::ObfsMode::Gost;
-        let egress_skel = match (is_gost, peer_is_v6) {
-            (true, true) => {
+        let obfs_mode = config.peer().obfs;
+        let egress_skel = match (obfs_mode, peer_is_v6) {
+            (crate::config::ObfsMode::Gost, true) => {
                 let b = tc_gut_egress_gost_v6::TcGutEgressSkelBuilder::default();
                 let o: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
                     Box::leak(Box::new(MaybeUninit::uninit()));
                 EgressSkel::GostV6(b.open(o)?.load()?)
             }
-            (true, false) => {
+            (crate::config::ObfsMode::Gost, false) => {
                 let b = tc_gut_egress_gost::TcGutEgressSkelBuilder::default();
                 let o: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
                     Box::leak(Box::new(MaybeUninit::uninit()));
                 EgressSkel::GostV4(b.open(o)?.load()?)
             }
-            (false, true) => {
+            (crate::config::ObfsMode::Syslog, true) => {
+                let b = tc_gut_egress_syslog_v6::TcGutEgressSkelBuilder::default();
+                let o: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
+                    Box::leak(Box::new(MaybeUninit::uninit()));
+                EgressSkel::SyslogV6(b.open(o)?.load()?)
+            }
+            (crate::config::ObfsMode::Syslog, false) => {
+                let b = tc_gut_egress_syslog::TcGutEgressSkelBuilder::default();
+                let o: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
+                    Box::leak(Box::new(MaybeUninit::uninit()));
+                EgressSkel::SyslogV4(b.open(o)?.load()?)
+            }
+            (_, true) => {
                 let b = tc_gut_egress_v6::TcGutEgressSkelBuilder::default();
                 let o: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
                     Box::leak(Box::new(MaybeUninit::uninit()));
                 EgressSkel::V6(b.open(o)?.load()?)
             }
-            (false, false) => {
+            (_, false) => {
                 let b = tc_gut_egress::TcGutEgressSkelBuilder::default();
                 let o: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
                     Box::leak(Box::new(MaybeUninit::uninit()));
@@ -494,14 +552,18 @@ impl TcBpfManager {
         }
         eprintln!("  devmap[0] = {veth_xdp_name} (ifindex={veth_xdp_ifindex})");
 
-        let (_ingress_skel, xdp_link, veth_pass_link) = if is_gost {
-            load_ingress!(xdp_gut_ingress_gost)
-        } else {
-            load_ingress!(xdp_gut_ingress)
+        let (_ingress_skel, xdp_link, veth_pass_link) = match obfs_mode {
+            crate::config::ObfsMode::Gost => load_ingress!(xdp_gut_ingress_gost),
+            crate::config::ObfsMode::Syslog => load_ingress!(xdp_gut_ingress_syslog),
+            _ => load_ingress!(xdp_gut_ingress),
         };
 
         let xdp_mode = Self::detect_xdp_mode(&ingress_ifname);
-        let mode_name = if is_gost { "gost" } else { "quic" };
+        let mode_name = match obfs_mode {
+            crate::config::ObfsMode::Gost => "gost",
+            crate::config::ObfsMode::Syslog => "syslog",
+            _ => "quic",
+        };
         eprintln!("  XDP ingress on {ingress_ifname} ({xdp_mode}, devmap → {veth_xdp_name})");
         eprintln!("GUT TC eBPF: Successfully attached (mode={mode_name})");
 
@@ -1349,6 +1411,9 @@ impl TcBpfManager {
             }
             crate::config::ObfsMode::Quic => {
                 eprintln!("  Obfuscation mode: quic (BPF per-mode)");
+            }
+            crate::config::ObfsMode::Syslog => {
+                eprintln!("  Obfuscation mode: syslog (BPF per-mode)");
             }
             other => {
                 eprintln!("  Obfuscation mode: {other:?} (BPF fallback to quic)");
