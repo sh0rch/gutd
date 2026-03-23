@@ -23,6 +23,7 @@ obfs = sip
 sni = example.com
 responder = true
 wg_host = 127.0.0.1:51820
+bind_port = 51821
 CONF
 
 echo "Starting gutd server..."

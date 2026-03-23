@@ -318,7 +318,7 @@ EOF
     # In userspace mode, GUTD_WG_HOST tells the proxy where to forward deobfuscated traffic.
     log "Starting gutd server on host..."
     if [ "$mode" = "userspace" ]; then
-        GUTD_WG_HOST=127.0.0.1:51821 "$GUTD_BINARY" --config /tmp/gutd-server.conf > /tmp/gutd-test-server.log 2>&1 &
+        GUTD_WG_HOST=127.0.0.1:51821 GUTD_BIND_PORT=51822 "$GUTD_BINARY" --config /tmp/gutd-server.conf > /tmp/gutd-test-server.log 2>&1 &
     else
         "$GUTD_BINARY" --config /tmp/gutd-server.conf > /tmp/gutd-test-server.log 2>&1 &
     fi
@@ -336,7 +336,7 @@ EOF
     # Start gutd relay in server_ns
     log "Starting gutd relay in server_ns..."
     if [ "$mode" = "userspace" ]; then
-        ip netns exec server_ns env GUTD_WG_HOST=0.0.0.0:51820 \
+        ip netns exec server_ns env GUTD_WG_HOST=0.0.0.0:51820 GUTD_BIND_PORT=51821 \
           "$GUTD_BINARY" --config /tmp/gutd-relay.conf > /tmp/gutd-test-relay.log 2>&1 &
     else
         ip netns exec server_ns "$GUTD_BINARY" --config /tmp/gutd-relay.conf > /tmp/gutd-test-relay.log 2>&1 &

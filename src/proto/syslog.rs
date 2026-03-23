@@ -1,12 +1,18 @@
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SYSLOG_HEADER_LEN: usize = 41;
+pub const SYSLOG_HDR_BASE: usize = 36;
+
+/// Returns header length for a given service name.
+#[inline]
+pub fn header_len(service_name: &str) -> usize {
+    SYSLOG_HDR_BASE + service_name.len()
+}
 
 /// Writes a dynamic syslog header into the buffer.
-/// Always writes exactly 41 bytes.
+/// Returns the number of bytes written = 36 + service_name.len().
 #[inline]
-pub fn write_header(buf: &mut [u8]) {
+pub fn write_header(buf: &mut [u8], service_name: &str) -> usize {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -29,27 +35,39 @@ pub fn write_header(buf: &mut [u8]) {
         y += 1;
     }
 
-    // Format: "<165>1 YYYY-MM-DDTHH:MM:SSZ nginx - - -  "
-    // Length: exactly 41 bytes
+    // Format: "<165>1 YYYY-MM-DDTHH:MM:SSZ <name> - - -  "
+    let hlen = SYSLOG_HDR_BASE + service_name.len();
     let _ = write!(
-        &mut buf[0..41],
-        "<165>1 {:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z nginx - - -  ",
+        &mut buf[0..hlen],
+        "<165>1 {:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z {} - - -  ",
         y,
         m,
         d,
         hour,
         min,
-        sec
+        sec,
+        service_name,
     );
+    hlen
 }
 
 /// Checks if the buffer starts with the syslog header footprint.
+/// Scans for " - - -  " marker to handle variable-length service names.
+/// Returns Some(header_len) on success, None on failure.
 #[inline]
-pub fn check_header(buf: &[u8]) -> bool {
-    if buf.len() < SYSLOG_HEADER_LEN {
-        return false;
+pub fn check_header(buf: &[u8]) -> Option<usize> {
+    if buf.len() < SYSLOG_HDR_BASE {
+        return None;
     }
-    // minimal check for performance, we know our header starts with this
-    // ends with "Z nginx - - -  "
-    &buf[0..7] == b"<165>1 " && &buf[26..41] == b"Z nginx - - -  "
+    if &buf[0..7] != b"<165>1 " {
+        return None;
+    }
+    // Scan for " - - -  " marker starting at position 28
+    let end = buf.len().min(68);
+    for i in 28..end.saturating_sub(7) {
+        if &buf[i..i + 8] == b" - - -  " {
+            return Some(i + 8);
+        }
+    }
+    None
 }

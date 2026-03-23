@@ -949,7 +949,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let local_bind: SocketAddr = if !is_server {
         wg_addr
     } else {
-        SocketAddr::new(peer.bind_ip, 0)
+        SocketAddr::new(peer.bind_ip, peer.bind_port)
     };
     let local_socket = Arc::new(UdpSocket::bind(local_bind)?);
     tune_udp_buffers(&local_socket);
@@ -1074,12 +1074,12 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         let mut sock_idx = 0;
 
                         let final_buf = if encap_obfs == crate::config::ObfsMode::Syslog {
-                            crate::proto::syslog::write_header(&mut out_buf);
+                            let hlen = crate::proto::syslog::write_header(&mut out_buf, sip_domain);
                             let b64_len = crate::proto::base64::encode(
                                 &buf[..new_size],
-                                &mut out_buf[crate::proto::syslog::SYSLOG_HEADER_LEN..],
+                                &mut out_buf[hlen..],
                             );
-                            &out_buf[..crate::proto::syslog::SYSLOG_HEADER_LEN + b64_len]
+                            &out_buf[..hlen + b64_len]
                         } else if encap_obfs == crate::config::ObfsMode::Sip {
                             if orig_wg_type == 4 && orig_wg_size > 32 {
                                 // RTP - use DCID from QUIC header as SSRC
@@ -1191,11 +1191,10 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     let mut was_rtp = false;
                     let mut sip_probe_kind = crate::proto::sip::SipKind::Response401;
 
-                    if crate::proto::syslog::check_header(&buf[..size]) {
-                        if let Some(decoded_len) = crate::proto::base64::decode(
-                            &buf[crate::proto::syslog::SYSLOG_HEADER_LEN..size],
-                            &mut out_buf,
-                        ) {
+                    if let Some(syslog_hdr_len) = crate::proto::syslog::check_header(&buf[..size]) {
+                        if let Some(decoded_len) =
+                            crate::proto::base64::decode(&buf[syslog_hdr_len..size], &mut out_buf)
+                        {
                             buf[..decoded_len].copy_from_slice(&out_buf[..decoded_len]);
                             size = decoded_len;
                             detected_prepend = Some(crate::config::ObfsMode::Syslog);

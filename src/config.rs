@@ -77,6 +77,7 @@ pub struct PeerConfig {
     pub wg_host: String,
     pub sip_domain: String,
     pub obfs: ObfsMode,
+    pub bind_port: u16,
 }
 
 /// Global runtime settings (from config file [global] section or CLI).
@@ -251,7 +252,10 @@ pub fn load_config_from_env() -> Result<Config> {
         "syslog" => ObfsMode::Syslog,
         "sip" => ObfsMode::Sip,
         other => {
-            return Err(format!("GUTD_OBFS: unknown value '{other}', expected quic|gost|noise|syslog|sip").into())
+            return Err(format!(
+                "GUTD_OBFS: unknown value '{other}', expected quic|gost|noise|syslog|sip"
+            )
+            .into())
         }
     };
     let stats_interval: u32 = std::env::var("GUTD_STATS_INTERVAL")
@@ -289,8 +293,13 @@ pub fn load_config_from_env() -> Result<Config> {
                 .unwrap_or_else(|_| "127.0.0.1:51820".to_string()),
             sip_domain: std::env::var("GUTD_SNI")
                 .or_else(|_| std::env::var("GUTD_SIP_DOMAIN"))
-                .unwrap_or_else(|_| "example.com".to_string()),
+                .or_else(|_| std::env::var("GUTD_SERVICE_NAME"))
+                .unwrap_or_else(|_| "nginx".to_string()),
             obfs,
+            bind_port: std::env::var("GUTD_BIND_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
         }],
     })
 }
@@ -315,6 +324,7 @@ struct PeerBuilder {
     wg_host: Option<String>,
     sip_domain: Option<String>,
     obfs: ObfsMode,
+    bind_port: Option<u16>,
 }
 
 impl Default for PeerBuilder {
@@ -337,6 +347,7 @@ impl Default for PeerBuilder {
             wg_host: None,
             obfs: ObfsMode::Quic,
             sip_domain: None,
+            bind_port: None,
         }
     }
 }
@@ -420,6 +431,7 @@ impl PeerBuilder {
                 .unwrap_or_else(|| "127.0.0.1:51820".to_string()),
             obfs: self.obfs,
             sip_domain: self.sip_domain.unwrap_or_else(|| "127.0.0.1".to_string()),
+            bind_port: self.bind_port.unwrap_or(0),
         })
     }
 }
@@ -504,6 +516,7 @@ fn parse_config(content: &str) -> Result<Config> {
                             };
                         }
                         "bind_ip" => b.bind_ip = Some(value.parse()?),
+                        "bind_port" => b.bind_port = Some(value.parse()?),
                         "peer_ip" => {
                             if value.eq_ignore_ascii_case("dynamic") {
                                 b.dynamic_peer = true;
@@ -557,10 +570,10 @@ fn parse_config(content: &str) -> Result<Config> {
                         "responder" => {
                             b.responder = Some(value == "true" || value == "1");
                         }
-                        "sip_domain" | "sni" => {
+                        "sip_domain" | "sni" | "service_name" => {
                             b.sip_domain = Some(value.trim_matches('"').to_string());
-                            }
-                            "obfs" => {
+                        }
+                        "obfs" => {
                             b.obfs = match value {
                                 "quic" => ObfsMode::Quic,
                                 "gost" | "noise" => ObfsMode::Gost,
