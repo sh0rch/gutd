@@ -18,6 +18,10 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+/* bpf_ktime_get_tai_ns: TAI nanoseconds since epoch (helper 161, kernel 6.1+).
+ * TAI ≈ UTC + 37s — close enough for syslog DPI evasion timestamps.
+ * Available for sched_cls (TC), unlike bpf_ktime_get_real_ns (#381). */
+
 /* ── Compile-time obfuscation mode ─────────────────────────────────────
  * Exactly one GUT_MODE_* must be defined via -D flag in build.rs.
  * Default: GUT_MODE_QUIC (backward-compatible QUIC encapsulation).   */
@@ -38,6 +42,9 @@
 #define GUT_QUIC_SHORT_HEADER_SIZE 16
 #define GUT_QUIC_LONG_HEADER_SIZE 1200
 #define GUT_GOST_HEADER_SIZE 10
+#define GUT_SYSLOG_ASCII_LEN 41 /* "<165>1 2026-03-16T12:00:00Z nginx - - -  " */
+#define GUT_B64_MAX_INNER 896   /* max inner before b64: GOST_HDR(10) + wg(800) + pad(64) */
+#define GUT_B64_MAX_OUT 1200    /* ceil(896/3)*4 = 1200 */
 #define GUT_KEY_SIZE 32
 #define MAX_PACKET_SIZE 1500
 #define SCRATCH_SIZE 4096                    /* scratch buffer: power-of-2.  Must be > MAX_PACKET_SIZE + 1 \
@@ -1594,6 +1601,526 @@ static __always_inline void write_gost_header(__u8 *quic, void *data_end, __u32 
     __builtin_memcpy((__u8 *)quic + 4, &enc_ports, 4);
     quic[8] = 0x00;
     quic[9] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
+}
+
+/* ── Base64 encode/decode for Syslog / SIP BPF modes ──────────────────
+ * Scratch buffer layout for base64 operations:
+ *   scratch[384..384+GUT_B64_MAX_INNER]  = inner buffer (encode input / decode output)
+ *   scratch[1280..1280+GUT_B64_MAX_OUT]  = base64 buffer (encode output / decode input)
+ * These offsets are chosen to avoid collision with ChaCha keystreams (0..255)
+ * and header shift temp (256..319).  */
+#define B64_INNER_OFF 384
+#define B64_ENC_OFF 1280
+
+/* Base64 decode LUT in .rodata — accessed by callback with variable index.
+ * No init needed; libbpf loads .rodata automatically. */
+static const __u8 b64_dec_lut[256] = {
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    62,
+    0,
+    0,
+    0,
+    63,
+    52,
+    53,
+    54,
+    55,
+    56,
+    57,
+    58,
+    59,
+    60,
+    61,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+    50,
+    51,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+};
+
+/* Base64 encode LUT: 6-bit value [0..63] → ASCII char.
+ * Placed in .rodata — verifier-friendly, no runtime init. */
+static const __u8 b64_enc_lut[64] = {
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
+    'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+    'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+', '/'};
+
+/* Lookup with forced mask — prevents the compiler from eliding the & 63
+ * which the verifier needs to bound the map_value pointer arithmetic. */
+static __always_inline __u8 b64e(__u32 val)
+{
+    __u32 idx;
+    asm volatile("%[out] = %[in]\n\t"
+                 "%[out] &= 63"
+                 : [out] "=r"(idx)
+                 : [in] "r"(val)
+                 :);
+    return b64_enc_lut[idx];
+}
+
+/* Encode scratch[in_off..in_off+in_len] → scratch[out_off..].
+ * Returns output length (always multiple of 4).
+ * Main loop processes only full 3-byte groups (branch-free body) to keep
+ * verifier state count linear.  Remainder 1–2 bytes handled after the loop. */
+static __always_inline __u32 b64_encode(__u8 *scratch, __u32 in_off, __u32 in_len, __u32 out_off)
+{
+    __u32 ip = 0, op = 0;
+    __u32 full_groups = in_len / 3;
+    if (full_groups > 250)
+        full_groups = 250;
+
+#pragma clang loop unroll(disable)
+    for (__u32 n = 0; n < 250; n++)
+    {
+        if (n >= full_groups)
+            break;
+
+        __u32 i0 = (in_off + ip) & (SCRATCH_SIZE - 1);
+        __u32 i1 = (in_off + ip + 1) & (SCRATCH_SIZE - 1);
+        __u32 i2 = (in_off + ip + 2) & (SCRATCH_SIZE - 1);
+
+        __u8 a = scratch[i0];
+        __u8 b = scratch[i1];
+        __u8 d = scratch[i2];
+
+        __u32 o0 = (out_off + op) & (SCRATCH_SIZE - 1);
+        __u32 o1 = (out_off + op + 1) & (SCRATCH_SIZE - 1);
+        __u32 o2 = (out_off + op + 2) & (SCRATCH_SIZE - 1);
+        __u32 o3 = (out_off + op + 3) & (SCRATCH_SIZE - 1);
+
+        scratch[o0] = b64e(a >> 2);
+        scratch[o1] = b64e(((a & 0x03) << 4) | (b >> 4));
+        scratch[o2] = b64e(((b & 0x0F) << 2) | (d >> 6));
+        scratch[o3] = b64e(d & 0x3F);
+
+        ip += 3;
+        op += 4;
+    }
+
+    /* Handle trailing 1 or 2 bytes outside the loop */
+    __u32 rem = in_len - ip;
+    if (rem >= 1)
+    {
+        __u32 i0 = (in_off + ip) & (SCRATCH_SIZE - 1);
+        __u8 a = scratch[i0];
+        __u32 o0 = (out_off + op) & (SCRATCH_SIZE - 1);
+        __u32 o1 = (out_off + op + 1) & (SCRATCH_SIZE - 1);
+        __u32 o2 = (out_off + op + 2) & (SCRATCH_SIZE - 1);
+        __u32 o3 = (out_off + op + 3) & (SCRATCH_SIZE - 1);
+
+        if (rem >= 2)
+        {
+            __u32 i1 = (in_off + ip + 1) & (SCRATCH_SIZE - 1);
+            __u8 b = scratch[i1];
+            scratch[o0] = b64e(a >> 2);
+            scratch[o1] = b64e(((a & 0x03) << 4) | (b >> 4));
+            scratch[o2] = b64e((b & 0x0F) << 2);
+            scratch[o3] = '=';
+        }
+        else
+        {
+            scratch[o0] = b64e(a >> 2);
+            scratch[o1] = b64e((a & 0x03) << 4);
+            scratch[o2] = '=';
+            scratch[o3] = '=';
+        }
+        op += 4;
+    }
+    return op;
+}
+
+static __always_inline __u8 b64_decode_char(__u8 c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return c - 'A';
+    if (c >= 'a' && c <= 'z')
+        return c - 'a' + 26;
+    if (c >= '0' && c <= '9')
+        return c - '0' + 52;
+    if (c == '+')
+        return 62;
+    if (c == '/')
+        return 63;
+    return 0; /* '=' or invalid → treated as 0 */
+}
+
+/* ── bpf_loop callback for base64 decode ──────────────────────────────
+ * Fully stateless: all offsets computed from idx (no mutable ctx fields).
+ * No conditional break: bpf_loop controls iteration count.
+ * This minimises verifier state: single straight-line path, converges
+ * in one abstract iteration. */
+struct b64_dec_ctx
+{
+    __u8 *scratch;
+    __u32 in_off;
+    __u32 out_off;
+};
+
+static long b64_decode_step(__u32 idx, void *_ctx)
+{
+    struct b64_dec_ctx *ctx = (struct b64_dec_ctx *)_ctx;
+    __u32 pos = idx * 4;
+    __u32 opos = idx * 3;
+
+    __u32 i0 = (ctx->in_off + pos) & (SCRATCH_SIZE - 1);
+    __u32 i1 = (ctx->in_off + pos + 1) & (SCRATCH_SIZE - 1);
+    __u32 i2 = (ctx->in_off + pos + 2) & (SCRATCH_SIZE - 1);
+    __u32 i3 = (ctx->in_off + pos + 3) & (SCRATCH_SIZE - 1);
+
+    __u8 v0 = b64_dec_lut[ctx->scratch[i0]];
+    __u8 v1 = b64_dec_lut[ctx->scratch[i1]];
+    __u8 v2 = b64_dec_lut[ctx->scratch[i2]];
+    __u8 v3 = b64_dec_lut[ctx->scratch[i3]];
+
+    __u32 o0 = (ctx->out_off + opos) & (SCRATCH_SIZE - 1);
+    __u32 o1 = (ctx->out_off + opos + 1) & (SCRATCH_SIZE - 1);
+    __u32 o2 = (ctx->out_off + opos + 2) & (SCRATCH_SIZE - 1);
+    ctx->scratch[o0] = (v0 << 2) | (v1 >> 4);
+    ctx->scratch[o1] = (v1 << 4) | (v2 >> 2);
+    ctx->scratch[o2] = (v2 << 6) | v3;
+
+    return 0;
+}
+
+/* Decode scratch[in_off..in_off+in_len] → scratch[out_off..].
+ * Uses bpf_loop with stateless callback — idx-based offsets, no mutable ctx.
+ * Returns decoded length (adjusted for '=' padding). */
+static __always_inline __u32 b64_decode(__u8 *scratch, __u32 in_off, __u32 in_len, __u32 out_off)
+{
+    struct b64_dec_ctx ctx = {
+        .scratch = scratch,
+        .in_off = in_off,
+        .out_off = out_off,
+    };
+
+    __u32 ngroups = in_len / 4;
+    bpf_loop(ngroups, b64_decode_step, &ctx, 0);
+
+    /* Output length = ngroups * 3, minus '=' padding chars. */
+    __u32 opos = ngroups * 3;
+    if (in_len >= 4)
+    {
+        __u8 p3 = scratch[(in_off + in_len - 1) & (SCRATCH_SIZE - 1)];
+        __u8 p2 = scratch[(in_off + in_len - 2) & (SCRATCH_SIZE - 1)];
+        if (p3 == '=')
+            opos--;
+        if (p2 == '=')
+            opos--;
+    }
+    return opos;
+}
+
+/* Write 41-byte ASCII syslog header with current timestamp.
+ * Format: "<165>1 YYYY-MM-DDTHH:MM:SSZ nginx - - -  "
+ * Uses bpf_ktime_get_tai_ns() for near-wall-clock time (TAI ≈ UTC+37s). */
+static __always_inline void write_syslog_ascii(__u8 *buf)
+{
+
+    /* Static prefix/suffix — only the 19-byte timestamp is dynamic */
+    buf[0] = '<';
+    buf[1] = '1';
+    buf[2] = '6';
+    buf[3] = '5';
+    buf[4] = '>';
+    buf[5] = '1';
+    buf[6] = ' ';
+
+    __u64 ns = bpf_ktime_get_tai_ns();
+    /* TAI is ahead of UTC by 37 leap seconds (since 2017-01-01).
+     * Subtract the offset so the formatted timestamp is UTC. */
+    __u64 secs = ns / 1000000000ULL - 37;
+    __u32 tod = (__u32)(secs % 86400);
+    __u32 hour = tod / 3600;
+    __u32 min = (tod % 3600) / 60;
+    __u32 sec = tod % 60;
+
+    /* Civil date from days since 1970-01-01 (Howard Hinnant algorithm) */
+    __u32 z = (__u32)(secs / 86400) + 719468;
+    __u32 era = z / 146097;
+    __u32 doe = z - era * 146097;
+    __u32 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    __u32 y = yoe + era * 400;
+    __u32 doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    __u32 mp = (5 * doy + 2) / 153;
+    __u32 d = doy - (153 * mp + 2) / 5 + 1;
+    __u32 m = mp < 10 ? mp + 3 : mp - 9;
+    if (m <= 2)
+        y++;
+
+    /* "YYYY-MM-DDTHH:MM:SS" at buf[7..25] */
+    buf[7] = '0' + (y / 1000) % 10;
+    buf[8] = '0' + (y / 100) % 10;
+    buf[9] = '0' + (y / 10) % 10;
+    buf[10] = '0' + y % 10;
+    buf[11] = '-';
+    buf[12] = '0' + m / 10;
+    buf[13] = '0' + m % 10;
+    buf[14] = '-';
+    buf[15] = '0' + d / 10;
+    buf[16] = '0' + d % 10;
+    buf[17] = 'T';
+    buf[18] = '0' + hour / 10;
+    buf[19] = '0' + hour % 10;
+    buf[20] = ':';
+    buf[21] = '0' + min / 10;
+    buf[22] = '0' + min % 10;
+    buf[23] = ':';
+    buf[24] = '0' + sec / 10;
+    buf[25] = '0' + sec % 10;
+
+    /* "Z nginx - - -  " */
+    buf[26] = 'Z';
+    buf[27] = ' ';
+    buf[28] = 'n';
+    buf[29] = 'g';
+    buf[30] = 'i';
+    buf[31] = 'n';
+    buf[32] = 'x';
+    buf[33] = ' ';
+    buf[34] = '-';
+    buf[35] = ' ';
+    buf[36] = '-';
+    buf[37] = ' ';
+    buf[38] = '-';
+    buf[39] = ' ';
+    buf[40] = ' ';
 }
 
 static __always_inline void write_quic_short_header(__u8 *quic, void *data_end, __u32 dcid, __u32 ppn, __u32 enc_ports, __u32 pad_len)
