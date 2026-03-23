@@ -1439,10 +1439,14 @@ impl TcBpfManager {
             gut_config.quic_hp_rk = crate::crypto::aes128_expand_key(&q_hp);
             gut_config.quic_iv = q_iv;
 
-            // SNI domain (= sip_domain from config)
+            // SNI domain (= sip_domain from config), space-padded to 32 for fixed-size BPF syslog header
             let sni = config.peer().sip_domain.as_bytes();
             let sni_len = sni.len().min(31);
             gut_config.sni_domain[..sni_len].copy_from_slice(&sni[..sni_len]);
+            // Pad remaining bytes with spaces so syslog header has no null bytes
+            for b in &mut gut_config.sni_domain[sni_len..] {
+                *b = b' ';
+            }
             gut_config.sni_domain_len = sni_len as u8;
 
             eprintln!(

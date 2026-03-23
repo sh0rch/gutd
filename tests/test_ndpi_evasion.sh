@@ -7,6 +7,10 @@ PCAP_FILE="/tmp/gutd_ndpi.pcap"
 NDPI_DIR="/tmp/nDPI"
 OBFS_MODE="${GUTD_OBFS:-sip}" # 'quic', 'gost', 'sip', 'syslog'
 SNI_DOMAIN="${GUTD_SNI:-example.com}"
+# For syslog mode, use a different default service name
+if [[ "${OBFS_MODE}" == "syslog" ]]; then
+    SNI_DOMAIN="${GUTD_SERVICE_NAME:-${GUTD_SNI:-asterisk}}"
+fi
 GUTD_US="${GUTD_US:-true}"
 # SIP and syslog expand payload heavily — reduce WG MTU to avoid fragmentation
 if [[ "${OBFS_MODE}" == "sip" || "${OBFS_MODE}" == "syslog" ]]; then
@@ -130,6 +134,7 @@ obfs = $OBFS_MODE
 sni = $SNI_DOMAIN
 responder = true
 wg_host = 127.0.0.1:51820
+bind_port = 51821
 EOF
     cat <<EOF > /tmp/gutd_c.conf
 [global]

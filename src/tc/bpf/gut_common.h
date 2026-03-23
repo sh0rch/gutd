@@ -42,9 +42,10 @@
 #define GUT_QUIC_SHORT_HEADER_SIZE 16
 #define GUT_QUIC_LONG_HEADER_SIZE 1200
 #define GUT_GOST_HEADER_SIZE 10
-#define GUT_SYSLOG_ASCII_LEN 41 /* "<165>1 2026-03-16T12:00:00Z nginx - - -  " */
-#define GUT_B64_MAX_INNER 896   /* max inner before b64: GOST_HDR(10) + wg(800) + pad(64) */
-#define GUT_B64_MAX_OUT 1200    /* ceil(896/3)*4 = 1200 */
+#define GUT_SYSLOG_HDR_BASE 36 /* "<165>1 YYYY-MM-DDTHH:MM:SSZ " + " - - -  " = 28 + 8 */
+#define GUT_SYSLOG_HDR_MAX 68  /* 36 + max sni_domain_len(32) */
+#define GUT_B64_MAX_INNER 896  /* max inner before b64: GOST_HDR(10) + wg(800) + pad(64) */
+#define GUT_B64_MAX_OUT 1200   /* ceil(896/3)*4 = 1200 */
 #define GUT_KEY_SIZE 32
 #define MAX_PACKET_SIZE 1500
 #define SCRATCH_SIZE 4096                    /* scratch buffer: power-of-2.  Must be > MAX_PACKET_SIZE + 1 \
@@ -2047,10 +2048,11 @@ static __always_inline __u32 b64_decode(__u8 *scratch, __u32 in_off, __u32 in_le
     return opos;
 }
 
-/* Write 41-byte ASCII syslog header with current timestamp.
- * Format: "<165>1 YYYY-MM-DDTHH:MM:SSZ nginx - - -  "
+/* Write dynamic-length ASCII syslog header with current timestamp.
+ * Format: "<165>1 YYYY-MM-DDTHH:MM:SSZ <name(32 space-padded)> - - -  "
+ * Always writes exactly GUT_SYSLOG_HDR_MAX (68) bytes.
  * Uses bpf_ktime_get_tai_ns() for near-wall-clock time (TAI ≈ UTC+37s). */
-static __always_inline void write_syslog_ascii(__u8 *buf)
+static __always_inline void write_syslog_ascii(__u8 *buf, struct gut_config *cfg)
 {
 
     /* Static prefix/suffix — only the 19-byte timestamp is dynamic */
@@ -2105,22 +2107,22 @@ static __always_inline void write_syslog_ascii(__u8 *buf)
     buf[24] = '0' + sec / 10;
     buf[25] = '0' + sec % 10;
 
-    /* "Z nginx - - -  " */
+    /* "Z <service_name(32 space-padded)> - - -  " — always 42 bytes, fixed for verifier */
     buf[26] = 'Z';
     buf[27] = ' ';
-    buf[28] = 'n';
-    buf[29] = 'g';
-    buf[30] = 'i';
-    buf[31] = 'n';
-    buf[32] = 'x';
-    buf[33] = ' ';
-    buf[34] = '-';
-    buf[35] = ' ';
-    buf[36] = '-';
-    buf[37] = ' ';
-    buf[38] = '-';
-    buf[39] = ' ';
-    buf[40] = ' ';
+
+    /* Copy 32-byte name field (loader pads with spaces). */
+    __builtin_memcpy(buf + 28, cfg->sni_domain, 32);
+
+    /* Suffix always at fixed position 60 */
+    buf[60] = ' ';
+    buf[61] = '-';
+    buf[62] = ' ';
+    buf[63] = '-';
+    buf[64] = ' ';
+    buf[65] = '-';
+    buf[66] = ' ';
+    buf[67] = ' ';
 }
 
 static __always_inline void write_quic_short_header(__u8 *quic, void *data_end, __u32 dcid, __u32 ppn, __u32 enc_ports, __u32 pad_len)

@@ -117,17 +117,38 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
 #if defined(GUT_MODE_GOST)
     __u32 quic_hdr_len = GUT_GOST_HEADER_SIZE;
 #elif defined(GUT_MODE_SYSLOG)
-    /* Syslog base64 → GOST conversion: load, decode (noinline), store, trim */
+    /* Syslog base64 → GOST conversion: load, decode (noinline), store, trim.
+     * Scan for " - - -  " marker to find where b64 data starts — the service
+     * name length varies per peer, so we cannot use a fixed header size. */
     if (wg[0] != 0x3C) /* '<' */
         return -1;
     {
-        __u32 b64_data_len = wg_len - GUT_SYSLOG_ASCII_LEN;
+        /* Scan for " - - -  " (8 bytes) starting from position 28 (after timestamp).
+         * Service name is at most 32 bytes, so marker is in [28..60). */
+        __u32 syslog_hdr_len = 0;
+        if (wg + 68 > (__u8 *)data_end)
+            return -1;
+#pragma unroll
+        for (__u32 i = 28; i < 60; i++)
+        {
+            if (wg[i] == ' ' && wg[i + 1] == '-' && wg[i + 2] == ' ' &&
+                wg[i + 3] == '-' && wg[i + 4] == ' ' && wg[i + 5] == '-' &&
+                wg[i + 6] == ' ' && wg[i + 7] == ' ')
+            {
+                syslog_hdr_len = i + 8;
+                break;
+            }
+        }
+        if (syslog_hdr_len < GUT_SYSLOG_HDR_BASE || syslog_hdr_len > GUT_SYSLOG_HDR_MAX)
+            return -1;
+
+        __u32 b64_data_len = wg_len - syslog_hdr_len;
         b64_data_len &= 0xFFF; /* unsigned bound for verifier */
         if (b64_data_len < 16 || b64_data_len > GUT_B64_MAX_OUT)
             return -1;
 
         /* Load base64 from packet to scratch */
-        if (bpf_xdp_load_bytes(ctx, wg_off + GUT_SYSLOG_ASCII_LEN,
+        if (bpf_xdp_load_bytes(ctx, wg_off + syslog_hdr_len,
                                scratch + B64_ENC_OFF, b64_data_len) < 0)
             return -1;
 

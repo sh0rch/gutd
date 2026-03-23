@@ -296,7 +296,7 @@ int gut_egress(struct __sk_buff *skb)
     if (b64_len == 0 || b64_len > GUT_B64_MAX_OUT)
         return TC_ACT_OK;
 
-    __u32 syslog_total = GUT_SYSLOG_ASCII_LEN + b64_len;
+    __u32 syslog_total = GUT_SYSLOG_HDR_MAX + b64_len;
     __u32 room;
     /* Force bounded room: verifier loses wg_total range across ChaCha spills.
      * Inline asm prevents the compiler from eliminating the mask. */
@@ -309,7 +309,7 @@ int gut_egress(struct __sk_buff *skb)
                      : [in] "r"(raw_room)
                      :);
     }
-    if (room < 1 || room > GUT_SYSLOG_ASCII_LEN + GUT_B64_MAX_OUT)
+    if (room < 1 || room > GUT_SYSLOG_HDR_MAX + GUT_B64_MAX_OUT)
         return TC_ACT_OK;
 #else
     __u32 room = quic_hdr_len;
@@ -372,13 +372,13 @@ int gut_egress(struct __sk_buff *skb)
 #if defined(GUT_MODE_SYSLOG)
     /* Write syslog ASCII header into scratch (avoids packet-pointer spill
      * issues after b64_encode), then bpf_skb_store_bytes both parts. */
-    write_syslog_ascii(scratch + 256);
+    write_syslog_ascii(scratch + 256, cfg);
     if (bpf_skb_store_bytes(skb, new_quic_off, scratch + 256,
-                            GUT_SYSLOG_ASCII_LEN, 0) < 0)
+                            GUT_SYSLOG_HDR_MAX, 0) < 0)
         return TC_ACT_OK;
     if (b64_len <= GUT_B64_MAX_OUT)
     {
-        if (bpf_skb_store_bytes(skb, new_quic_off + GUT_SYSLOG_ASCII_LEN,
+        if (bpf_skb_store_bytes(skb, new_quic_off + GUT_SYSLOG_HDR_MAX,
                                 scratch + B64_ENC_OFF, b64_len, 0) < 0)
             return TC_ACT_OK;
     }
