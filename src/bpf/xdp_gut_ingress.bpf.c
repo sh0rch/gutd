@@ -212,7 +212,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         return -1;
 
 #if defined(GUT_MODE_GOST)
-    __u32 quic_hdr_len = GUT_GOST_HEADER_SIZE;
+    __u32 outer_hdr_len = GUT_GOST_HEADER_SIZE;
 #elif defined(GUT_MODE_SYSLOG)
     /* Syslog base64 → GOST conversion: load, decode (noinline), store, trim.
      * Scan for " - - -  " marker to find where b64 data starts — the service
@@ -306,7 +306,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         udp_len = 8 + (__u16)decoded_len;
     }
     /* Packet is now in GOST format — fall through to GOST processing */
-    __u32 quic_hdr_len = GUT_GOST_HEADER_SIZE;
+    __u32 outer_hdr_len = GUT_GOST_HEADER_SIZE;
 #elif defined(GUT_MODE_SIP)
     /* ── SIP mode: detect RTP (data) vs SIP signaling (b64) ── */
     if (wg_len < 22) /* min: RTP(12) + GOST(10) */
@@ -511,16 +511,16 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         return -1; /* not RTP and not SIP — reject */
     }
     /* Packet is now in GOST format — fall through to GOST processing */
-    __u32 quic_hdr_len = GUT_GOST_HEADER_SIZE;
+    __u32 outer_hdr_len = GUT_GOST_HEADER_SIZE;
 #else /* GUT_MODE_QUIC */
-    __u32 quic_hdr_len = 0;
+    __u32 outer_hdr_len = 0;
     if (wg[0] == 0x40)
     {
-        quic_hdr_len = GUT_QUIC_SHORT_HEADER_SIZE;
+        outer_hdr_len = GUT_QUIC_SHORT_HEADER_SIZE;
     }
     else if ((wg[0] & 0x80) == 0x80)
     {
-        quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
+        outer_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
     }
     else
     {
@@ -528,13 +528,13 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     }
 #endif
 
-    __u8 pad_byte = wg[quic_hdr_len - 1];
+    __u8 pad_byte = wg[outer_hdr_len - 1];
     /* bit6 (0x40) = has-ballast flag; bits[0:5]+1 = actual ballast len [1..64].
      * 0x00 = no ballast (large packet — skip tail trimming). */
     __u32 ballast_len = (pad_byte & 0x40) ? ((__u32)(pad_byte & 0x3F) + 1) : 0;
 
-    wg += quic_hdr_len;
-    wg_len -= quic_hdr_len;
+    wg += outer_hdr_len;
+    wg_len -= outer_hdr_len;
 
     if (wg + WG_MIN_PACKET > (__u8 *)data_end)
         return -1;
@@ -561,7 +561,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     __u32 expected_dcid = ks47[9];
 #endif
 
-    __u8 *quic = wg - quic_hdr_len;
+    __u8 *quic = wg - outer_hdr_len;
 
 #if defined(GUT_MODE_GOST) || defined(GUT_MODE_B64)
     {
@@ -571,7 +571,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             return -1;
     }
 #else /* GUT_MODE_QUIC */
-    if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
+    if (outer_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
     {
         __u32 pkt_dcid = 0;
         __builtin_memcpy(&pkt_dcid, quic + 1, 4);
@@ -676,7 +676,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
 #if defined(GUT_MODE_GOST) || defined(GUT_MODE_B64)
     __builtin_memcpy(&enc_ports, quic + 4, 4);
 #else /* GUT_MODE_QUIC */
-    if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
+    if (outer_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
     {
         __builtin_memcpy(&enc_ports, quic + 10, 4);
     }
@@ -698,7 +698,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
      * Use bpf_xdp_load_bytes → XOR in scratch → bpf_xdp_store_bytes. */
     if (wg_type == 1 && wg_len >= 148)
     {
-        __u32 m2_off = wg_off + quic_hdr_len + 132;
+        __u32 m2_off = wg_off + outer_hdr_len + 132;
         __u8 *m2 = scratch + 192;
         if (bpf_xdp_load_bytes(ctx, m2_off, m2, 16) == 0)
         {
@@ -711,7 +711,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     }
     else if (wg_type == 2 && wg_len >= 92)
     {
-        __u32 m2_off = wg_off + quic_hdr_len + 76;
+        __u32 m2_off = wg_off + outer_hdr_len + 76;
         __u8 *m2 = scratch + 192;
         if (bpf_xdp_load_bytes(ctx, m2_off, m2, 16) == 0)
         {
@@ -742,7 +742,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
 
     // "нам ничего не надо считать от конца пакета!!" -> we removed meta extraction.
 
-    __u16 new_udp_len = (__u16)(udp_len - tail_total - quic_hdr_len);
+    __u16 new_udp_len = (__u16)(udp_len - tail_total - outer_hdr_len);
     udph->len = bpf_htons(new_udp_len);
     udph->check = 0;
 
@@ -782,7 +782,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
                     break;
                 scratch[256 + i] = ((__u8 *)data)[i];
             }
-            if (bpf_xdp_adjust_head(ctx, quic_hdr_len) == 0)
+            if (bpf_xdp_adjust_head(ctx, outer_hdr_len) == 0)
             {
                 data = (void *)(__u64)ctx->data;
                 data_end = (void *)(__u64)ctx->data_end;
@@ -875,6 +875,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
 
     stats->mask_count++;
     stats->packets_processed++;
+    stats->packets_ingress++;
     stats->bytes_processed += (__u64)((__u8 *)data_end - (__u8 *)data);
 
     return 0;

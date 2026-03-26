@@ -120,10 +120,19 @@ impl GutConfig {
             IpAddr::V4(ip) => (u32::from_ne_bytes(ip.octets()), [0u8; 16]),
             IpAddr::V6(ip) => (0u32, ip.octets()),
         };
+        let stored_count = ports.len().min(MAX_PORTS);
+        if ports.len() > MAX_PORTS {
+            eprintln!(
+                "WARNING: {} ports configured but MAX_PORTS={} — truncating to first {}",
+                ports.len(),
+                MAX_PORTS,
+                MAX_PORTS
+            );
+        }
         let mut cfg = Self {
             key: *key,
             ports: [0u16; MAX_PORTS],
-            num_ports: u32::try_from(ports.len()).expect("ports.len() exceeds u32::MAX"),
+            num_ports: u32::try_from(stored_count).expect("stored_count exceeds u32::MAX"),
             outer_mtu,
             inner_mtu_v4: DEFAULT_INNER_MTU,
             inner_mtu_v6: DEFAULT_INNER_MTU,
@@ -207,6 +216,8 @@ pub struct GutStats {
     pub mask_count: u64, // was mask_balanced_count; all masking is ChaCha now
     pub packets_fragmented: u64,
     pub inner_tcp_seen: u64,
+    pub packets_egress: u64,  // TC egress: WG→outer packets sent
+    pub packets_ingress: u64, // XDP ingress: outer→WG packets received
 }
 
 /// Offload capability flags — mirrors GUT_FLAG_* in gut_common.h
@@ -227,7 +238,7 @@ fn compute_chacha_init(key: &[u8; 32]) -> [u32; 12] {
 }
 
 const _: [(); 628] = [(); std::mem::size_of::<GutConfig>()];
-const _: [(); 56] = [(); std::mem::size_of::<GutStats>()];
+const _: [(); 72] = [(); std::mem::size_of::<GutStats>()];
 
 impl GutStats {
     #[must_use]
@@ -241,6 +252,8 @@ impl GutStats {
             total.mask_count += stat.mask_count;
             total.packets_fragmented += stat.packets_fragmented;
             total.inner_tcp_seen += stat.inner_tcp_seen;
+            total.packets_egress += stat.packets_egress;
+            total.packets_ingress += stat.packets_ingress;
         }
         total
     }

@@ -11,9 +11,10 @@ RESULTS_FILE="${RESULTS_FILE:-/tmp/gutd-test-results.txt}"
 GUTD_OBFS="${GUTD_OBFS:-quic}"
 GUT_PORTS_CSV="${GUT_PORTS_CSV:-41000,41001}"
 
-# Base MTU: syslog/sip base64 path has a hard limit of 800 bytes for WG payload.
+# Base MTU: syslog base64 path has a hard limit of 800 bytes for WG payload.
+# SIP uses RTP for data (no base64), so it can use the full 1420 MTU.
 # For QUIC/Gost it can be higher (default 1420).
-if [[ "$GUTD_OBFS" == "sip" || "$GUTD_OBFS" == "syslog" ]]; then
+if [[ "$GUTD_OBFS" == "syslog" ]]; then
     WG_MTU="${WG_MTU:-800}"
 else
     WG_MTU="${WG_MTU:-1420}"
@@ -635,7 +636,8 @@ test_wireguard_via_gutd() {
     log "Capturing wire packets with full details..."
     local wire_filter
     wire_filter="$(build_udp_port_filter "$GUT_PORTS_CSV")"
-    timeout 6 tcpdump -i veth_host -n -vv -c 10 "$wire_filter" > /tmp/gutd-test-wire-details.txt 2>&1 &
+    #timeout 6 tcpdump -i veth_host -n -vv -c 10 "$wire_filter" > /tmp/gutd-test-wire-details.txt 2>&1 &
+    timeout 6 tcpdump -i veth_host -n -vv -c 10  > /tmp/gutd-test-wire-details.txt 2>&1 &
     TCPDUMP_DETAIL_PID=$!
     
     capture_packets veth_host /tmp/gutd-test-gutd-wire.pcap 5 &
