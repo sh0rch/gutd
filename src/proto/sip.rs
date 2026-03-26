@@ -163,7 +163,7 @@ fn generate_auth_token(timestamp_us: u64, feistel_key: &[u32; 4]) -> u32 {
     // Round to 100ms granularity (100,000 microseconds)
     // This gives 10 unique tokens per second, tight enough for security
     let ts_100ms = (timestamp_us / 100_000) as u32;
-    crate::proto::feistel::feistel32(ts_100ms, feistel_key)
+    crate::proto::feistel::sip_hash32(ts_100ms, feistel_key)
 }
 
 /// Fast hex encoding into buffer (8 chars for u32)
@@ -200,7 +200,7 @@ pub fn verify_auth_token_from_timestamp(
     // Calculate expected token from packet's timestamp value (concatenated digits)
     // Use 100ms granularity by dividing concatenated value by 10000
     let ts_100ms = (packet_timestamp_value / 10000) as u32;
-    let expected_token = crate::proto::feistel::feistel32(ts_100ms, feistel_key);
+    let expected_token = crate::proto::feistel::sip_hash32(ts_100ms, feistel_key);
     
     token == expected_token
 }
@@ -221,7 +221,7 @@ fn write_options_keepalive(
         .unwrap()
         .as_micros() as u64;
     let auth_token = generate_auth_token(timestamp_us, feistel_key);
-    let from_tag_val = crate::proto::feistel::feistel32(((timestamp_us / 1000) ^ sport as u64) as u32, feistel_key);
+    let from_tag_val = crate::proto::feistel::sip_hash32(((timestamp_us / 1000) ^ sport as u64) as u32, feistel_key);
     
     let time_of_day_us = timestamp_us % 86_400_000_000;
     let hour = (time_of_day_us / 3_600_000_000) as u8;
@@ -280,8 +280,8 @@ pub fn write_header(
     
     // Generate dynamic identifiers
     let session_id = timestamp_us / 1000; // milliseconds for session ID
-    let from_tag_val = crate::proto::feistel::feistel32(((timestamp_us / 1000) ^ sport as u64) as u32, feistel_key);
-    let to_tag_val = crate::proto::feistel::feistel32(((timestamp_us / 1000) ^ dport as u64) as u32, feistel_key);
+    let from_tag_val = crate::proto::feistel::sip_hash32(((timestamp_us / 1000) ^ sport as u64) as u32, feistel_key);
+    let to_tag_val = crate::proto::feistel::sip_hash32(((timestamp_us / 1000) ^ dport as u64) as u32, feistel_key);
 
     match kind {
         SipKind::Register => {
@@ -298,7 +298,7 @@ pub fn write_header(
         },
         SipKind::Response401 => {
             write!(cursor, "SIP/2.0 401 Unauthorized\r\n").unwrap();
-            let nonce_val = crate::proto::feistel::feistel32((timestamp_us / 1000) as u32, feistel_key);
+            let nonce_val = crate::proto::feistel::sip_hash32((timestamp_us / 1000) as u32, feistel_key);
             write!(cursor, "WWW-Authenticate: Digest realm=\"{}\", nonce=\"", domain).unwrap();
             let pos = cursor.position() as usize;
             write_hex8(&mut cursor.get_mut()[pos..pos+8], nonce_val);

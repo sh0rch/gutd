@@ -208,8 +208,8 @@ pub struct GutStats {
     pub packets_processed: u64,
     pub packets_dropped: u64,
     pub bytes_processed: u64,
-    pub _reserved_stat: u64, // was mask_fast_count
-    pub mask_count: u64,     // was mask_balanced_count; all masking is ChaCha now
+    pub packets_oversized: u64,
+    pub mask_count: u64, // was mask_balanced_count; all masking is ChaCha now
     pub packets_fragmented: u64,
     pub inner_tcp_seen: u64,
 }
@@ -219,7 +219,7 @@ pub const GUT_FLAG_NEED_L4_CSUM: u16 = 1 << 0;
 
 /// Derive 4 Feistel32 round keys from ChaCha block(counter=0xFFFFFFFE, nonce=0).
 /// Domain-separated from data masking (nonce>=1) and ballast (block 99).
-fn compute_feistel_rk(key: &[u8; 32], rounds: u8) -> [u32; 4] {
+pub(crate) fn compute_feistel_rk(key: &[u8; 32], rounds: u8) -> [u32; 4] {
     let ks = crate::proto::mask_balanced::chacha_block(key, 0xFFFFFFFE, 0, rounds);
     [ks[0], ks[1], ks[2], ks[3]]
 }
@@ -249,7 +249,7 @@ impl GutStats {
             total.packets_processed += stat.packets_processed;
             total.packets_dropped += stat.packets_dropped;
             total.bytes_processed += stat.bytes_processed;
-            total._reserved_stat += stat._reserved_stat;
+            total.packets_oversized += stat.packets_oversized;
             total.mask_count += stat.mask_count;
             total.packets_fragmented += stat.packets_fragmented;
             total.inner_tcp_seen += stat.inner_tcp_seen;

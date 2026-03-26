@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+#set -ex
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUTD_BINARY="${GUTD_BINARY:-$SCRIPT_DIR/../target/release/gutd}"
@@ -89,6 +89,10 @@ ip netns add ndpi_server
 ip link add veth_c type veth peer name veth_s
 ip link set veth_c netns ndpi_client
 ip link set veth_s netns ndpi_server
+
+# Disable offloads to ensure BPF sees individual segments at the set MTU
+ip netns exec ndpi_client ethtool -K veth_c gso off gro off tso off
+ip netns exec ndpi_server ethtool -K veth_s gso off gro off tso off
 
 ip netns exec ndpi_client ip addr add 10.0.0.1/24 dev veth_c
 ip netns exec ndpi_client ip link set veth_c up
@@ -257,7 +261,17 @@ RESULTS_FILE="/tmp/ndpi_results.txt"
 ndpiReader -v2 -i $PCAP_FILE > $RESULTS_FILE
 
 echo ""
-echo "=== FULL nDPI REPORT ==="
+echo "=== nDPI classification (mode: ${OBFS_MODE}) ==="
 cat $RESULTS_FILE
 
-exit 0
+# Verify nDPI classified traffic as the expected protocol
+case "$OBFS_MODE" in
+    quic)   EXPECT="QUIC" ;;
+    sip)    EXPECT="SIP" ;;
+    syslog) EXPECT="Syslog" ;;
+    gost)   EXPECT="" ;;  # random UDP, no specific protocol expected
+esac
+
+if [ -n "$EXPECT" ]; then
+    grep -qi "$EXPECT" "$RESULTS_FILE" || err "nDPI did not classify traffic as $EXPECT"
+fi

@@ -42,7 +42,7 @@ fn qr(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
 }
 
 /// Generate a single ChaCha keystream block with arbitrary counter.
-/// Used for nonce-chain (block 111), ballast (block 99), and bulk masking.
+/// Used for nonce-chain (block 211), ballast (block 199), and bulk masking.
 ///
 /// Returns 16 × u32 words of keystream.
 pub fn chacha_block(key: &[u8; 32], counter: u32, nonce: u32, rounds: u8) -> [u32; 16] {
@@ -78,19 +78,19 @@ pub fn chacha_block(key: &[u8; 32], counter: u32, nonce: u32, rounds: u8) -> [u3
     s
 }
 
-/// Derive (next_nonce, next_pkt_id) from ChaCha block 111.
+/// Derive (next_nonce, next_pkt_id) from ChaCha block 211.
 /// Both values are guaranteed non-zero.
 pub fn chacha_next_ids(key: &[u8; 32], nonce: u32, rounds: u8) -> (u32, u32) {
-    let ks = chacha_block(key, 111, nonce, rounds);
+    let ks = chacha_block(key, 211, nonce, rounds);
     let nn = if ks[0] == 0 { 1 } else { ks[0] };
     let np = if ks[1] == 0 { 1 } else { ks[1] };
     (nn, np)
 }
 
-/// Compute ballast data + length from ChaCha block 99.
+/// Compute ballast data + length from ChaCha block 199.
 /// Returns (ballast_bytes, ballast_len) where ballast_len ∈ [0, 63].
 pub fn chacha_ballast(key: &[u8; 32], nonce: u32, rounds: u8) -> ([u8; 63], usize) {
-    let ks = chacha_block(key, 99, nonce, rounds);
+    let ks = chacha_block(key, 199, nonce, rounds);
     let bytes: [u8; 64] = unsafe { std::mem::transmute(ks) };
     let blen = (bytes[63] & 0x3F) as usize; // 0..63
     let mut out = [0u8; 63];

@@ -25,6 +25,7 @@ const IFLA_INFO_KIND: u16 = 1;
 const IFLA_INFO_DATA: u16 = 2;
 const IFLA_GSO_MAX_SEGS: u16 = 40;
 const IFLA_GSO_MAX_SIZE: u16 = 41;
+const IFLA_GRO_MAX_SIZE: u16 = 58;
 // veth peer info (linux/if_link.h — VETH_INFO_PEER)
 const VETH_INFO_PEER: u16 = 1;
 // IFA attributes (linux/if_addr.h)
@@ -494,6 +495,13 @@ pub fn link_set_gso_max_size(name: &str, size: u32) {
     if nl_set_gso(name, IFLA_GSO_MAX_SIZE, size).is_err() {
         let _ = std::fs::write(
             format!("/sys/class/net/{name}/gso_max_size"),
+            size.to_string(),
+        );
+    }
+    // Also try setting gro_max_size (kernel ≥ 5.2)
+    if nl_set_gso(name, IFLA_GRO_MAX_SIZE, size).is_err() {
+        let _ = std::fs::write(
+            format!("/sys/class/net/{name}/gro_max_size"),
             size.to_string(),
         );
     }

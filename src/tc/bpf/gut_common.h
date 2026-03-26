@@ -44,14 +44,24 @@
 #define GUT_GOST_HEADER_SIZE 10
 #define GUT_SYSLOG_HDR_BASE 36 /* "<165>1 YYYY-MM-DDTHH:MM:SSZ " + " - - -  " = 28 + 8 */
 #define GUT_SYSLOG_HDR_MAX 68  /* 36 + max sni_domain_len(32) */
+#define GUT_SIP_HDR_MAX 1024   /* Full SIP header template (2 × 512 map chunks, loader fills) */
+#define GUT_SIP_TPL_CHUNK 512  /* Each sip_tpl_map chunk size */
+#define GUT_RTP_HEADER_SIZE 12 /* RTP header: V(1)+PT(1)+seq(2)+ts(4)+SSRC(4) */
 #define GUT_B64_MAX_INNER 896  /* max inner before b64: GOST_HDR(10) + wg(800) + pad(64) */
 #define GUT_B64_MAX_OUT 1200   /* ceil(896/3)*4 = 1200 */
+#define GUT_B64_WG_MTU_MAX 800 /* max WG packet size for b64 modes (syslog/sip) */
+#define SIP_SCAN_OFF 2560      /* scratch offset for SIP marker scan on ingress */
+
+/* Combined base64 mode flag for shared syslog/SIP code paths */
+#if defined(GUT_MODE_SYSLOG) || defined(GUT_MODE_SIP)
+#define GUT_MODE_B64 1
+#endif
 #define GUT_KEY_SIZE 32
-#define MAX_PACKET_SIZE 1500
-#define SCRATCH_SIZE 4096                    /* scratch buffer: power-of-2.  Must be > MAX_PACKET_SIZE + 1 \
+#define MAX_PACKET_SIZE 9000
+#define SCRATCH_SIZE 16384                   /* scratch buffer: power-of-2.  Must be > MAX_PACKET_SIZE + 1 \
                                               * so BPF_BOUND_LEN ([1,2048]) with scratch+1 stays within    \
                                               * map value bounds (off=1 + 2048 ≤ 4096).                  \
-                                              * mask_data_fast uses (i &= 0x7FF) → max 2047+7 < 4096.       */
+                                              * mask_data_fast uses (i &= 0x3FFF) → max 16383.              */
 #define MAX_INNER_TECH_LIMIT MAX_PACKET_SIZE /* technical verifier/scratch cap, runtime MTU comes from config_map */
 
 /* Masking: always ChaCha (rounds configured at compile time) */
@@ -153,7 +163,7 @@ struct gut_stats
     __u64 packets_processed;
     __u64 packets_dropped;
     __u64 bytes_processed;
-    __u64 _reserved_stat;
+    __u64 packets_oversized;
     __u64 mask_count;
     __u64 packets_fragmented;
     __u64 inner_tcp_seen;
@@ -229,6 +239,28 @@ struct
     __type(key, __u32);
     __type(value, __u32);
 } session_map SEC(".maps");
+
+#if defined(GUT_MODE_SIP)
+/* Pre-built SIP header template split across 2 maps (loader fills with
+ * realistic SIP+SDP, total GUT_SIP_HDR_MAX bytes, ends with "a=fmtp:0 " marker).
+ * Two maps of GUT_SIP_TPL_CHUNK bytes each — allows bpf_skb_store_bytes with
+ * compile-time constant lengths. */
+struct
+{
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u8[GUT_SIP_TPL_CHUNK]);
+} sip_tpl_map_0 SEC(".maps");
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u8[GUT_SIP_TPL_CHUNK]);
+} sip_tpl_map_1 SEC(".maps");
+#endif
 
 /* Compile-time ChaCha round count.  Override at build via -DCHACHA_ROUNDS=N.
  * Must match between sender and receiver BPF programs.
@@ -406,7 +438,7 @@ static __attribute__((noinline)) void chacha_block(__u32 ks[16],
 static __always_inline void xor_ks(__u8 *data, __u32 off, __u32 n,
                                    const __u32 ks[16])
 {
-    __u32 o = off & 0x7FF;
+    __u32 o = off & 0x3FFF;
     if (n == 64 && o + 64 <= SCRATCH_SIZE)
     {
         __u32 *p = (__u32 *)(data + o);
@@ -422,7 +454,7 @@ static __always_inline void xor_ks(__u8 *data, __u32 off, __u32 n,
         {
             if (j < n)
             {
-                __u32 oj = (off + j) & 0x7FF;
+                __u32 oj = (off + j) & 0x3FFF;
                 data[oj] ^= kbytes[j];
             }
         }
@@ -455,7 +487,7 @@ static long chacha_loop_cb(__u32 idx, void *_ctx)
     __u32 n = remain < 64 ? remain : 64;
 
     asm volatile("" : "+r"(i));
-    i &= 0x7FF;
+    i &= 0x3FFF;
     if (i > SCRATCH_SIZE - 64)
         return 1;
 
@@ -496,7 +528,7 @@ static __always_inline void mask_data_chacha(__u8 *data, __u32 len,
  *   byte  63 bits[0:5] = ballast_len (0..63)
  *   Only computed for small packets (inner_len < BALLAST_THRESHOLD).
  *
- * Block 111 (counter=111, same nonce):
+ * Block 211 (counter=211, same nonce):
  *   words[0] = next_nonce (u32 LE), guaranteed non-zero
  *   words[1] = next_pkt_id (u32 LE), guaranteed non-zero
  *   Always computed — eliminates all separate PRNGs from datapath.
@@ -504,8 +536,8 @@ static __always_inline void mask_data_chacha(__u8 *data, __u32 len,
  * Loader seeds initial (nonce, pkt_id) into counters_map.
  * Receiver never predicts nonce — reads it from wire header.
  */
-#define CHACHA_BLOCK_BALLAST 99
-#define CHACHA_BLOCK_NEXT_IDS 111
+#define CHACHA_BLOCK_BALLAST 199
+#define CHACHA_BLOCK_NEXT_IDS 211
 
 /* Generate ballast data + length from ChaCha block 99.
  * Writes up to 63 bytes into ballast_out, returns ballast_len.
@@ -584,6 +616,24 @@ static __always_inline __u16 select_port(__u32 pkt_id, const struct gut_config *
 #define FEISTEL_SALT_PKT_ID 0x9E3779B9u  /* golden ratio × 2^32 */
 #define FEISTEL_SALT_BALLAST 0x517CC1B7u /* sqrt(3) × 2^32 */
 #define FEISTEL_SALT_PORTS 0xB7E15163u   /* 2π × 2^31 — domain for port encryption */
+
+static __always_inline __u32 sip_hash32(__u32 x, const __u32 rk[4])
+{
+    __u32 h = x;
+    h = h * 0xcc9e2d51 + rk[0];
+    h = (h << 15) | (h >> 17);
+    h = h * 0x1b873593 + rk[1];
+    h = (h << 13) | (h >> 19);
+    h = h * 0xe6546b64 + rk[2];
+    h = (h << 10) | (h >> 22);
+    h = h * 0x85ebca6b + rk[3];
+    h ^= h >> 16;
+    h *= 0x85ebca6b;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35;
+    h ^= h >> 16;
+    return h;
+}
 
 static __always_inline __u32 feistel32(__u32 x, const __u32 rk[4])
 {
@@ -1898,42 +1948,63 @@ static __always_inline __u8 b64e(__u32 val)
 
 /* Encode scratch[in_off..in_off+in_len] → scratch[out_off..].
  * Returns output length (always multiple of 4).
- * Main loop processes only full 3-byte groups (branch-free body) to keep
- * verifier state count linear.  Remainder 1–2 bytes handled after the loop. */
+ * Uses bpf_loop to handle up to GUT_B64_MAX_INNER bytes without hitting
+ * verifier instruction limits. Remainder 1–2 bytes handled after the loop. */
+struct b64_enc_ctx
+{
+    __u8 *scratch;
+    __u32 in_off;
+    __u32 out_off;
+};
+
+static long b64_encode_step(__u32 idx, void *_ctx)
+{
+    struct b64_enc_ctx *ctx = (struct b64_enc_ctx *)_ctx;
+    __u32 pos = idx * 3;
+    __u32 opos = idx * 4;
+
+    __u32 i0 = (ctx->in_off + pos) & (SCRATCH_SIZE - 1);
+    __u32 i1 = (ctx->in_off + pos + 1) & (SCRATCH_SIZE - 1);
+    __u32 i2 = (ctx->in_off + pos + 2) & (SCRATCH_SIZE - 1);
+
+    __u8 a = ctx->scratch[i0];
+    __u8 b = ctx->scratch[i1];
+    __u8 d = ctx->scratch[i2];
+
+    __u32 o0 = (ctx->out_off + opos) & (SCRATCH_SIZE - 1);
+    __u32 o1 = (ctx->out_off + opos + 1) & (SCRATCH_SIZE - 1);
+    __u32 o2 = (ctx->out_off + opos + 2) & (SCRATCH_SIZE - 1);
+    __u32 o3 = (ctx->out_off + opos + 3) & (SCRATCH_SIZE - 1);
+
+    ctx->scratch[o0] = b64e(a >> 2);
+    ctx->scratch[o1] = b64e(((a & 0x03) << 4) | (b >> 4));
+    ctx->scratch[o2] = b64e(((b & 0x0F) << 2) | (d >> 6));
+    ctx->scratch[o3] = b64e(d & 0x3F);
+
+    return 0;
+}
+
 static __always_inline __u32 b64_encode(__u8 *scratch, __u32 in_off, __u32 in_len, __u32 out_off)
 {
-    __u32 ip = 0, op = 0;
     __u32 full_groups = in_len / 3;
-    if (full_groups > 250)
-        full_groups = 250;
+    if (full_groups > 300)
+        full_groups = 300;
 
-#pragma clang loop unroll(disable)
-    for (__u32 n = 0; n < 250; n++)
-    {
-        if (n >= full_groups)
-            break;
+    struct b64_enc_ctx ctx = {
+        .scratch = scratch,
+        .in_off = in_off,
+        .out_off = out_off,
+    };
 
-        __u32 i0 = (in_off + ip) & (SCRATCH_SIZE - 1);
-        __u32 i1 = (in_off + ip + 1) & (SCRATCH_SIZE - 1);
-        __u32 i2 = (in_off + ip + 2) & (SCRATCH_SIZE - 1);
+    bpf_loop(full_groups, b64_encode_step, &ctx, 0);
 
-        __u8 a = scratch[i0];
-        __u8 b = scratch[i1];
-        __u8 d = scratch[i2];
+    __u32 ip = full_groups * 3;
+    __u32 op = full_groups * 4;
 
-        __u32 o0 = (out_off + op) & (SCRATCH_SIZE - 1);
-        __u32 o1 = (out_off + op + 1) & (SCRATCH_SIZE - 1);
-        __u32 o2 = (out_off + op + 2) & (SCRATCH_SIZE - 1);
-        __u32 o3 = (out_off + op + 3) & (SCRATCH_SIZE - 1);
-
-        scratch[o0] = b64e(a >> 2);
-        scratch[o1] = b64e(((a & 0x03) << 4) | (b >> 4));
-        scratch[o2] = b64e(((b & 0x0F) << 2) | (d >> 6));
-        scratch[o3] = b64e(d & 0x3F);
-
-        ip += 3;
-        op += 4;
-    }
+    /* Re-bound ip/op for verifier: multiplication result spilled to stack
+     * loses scalar range tracking.  Force asm masks the compiler cannot elide. */
+    asm volatile("%[v] &= 0xFFF" : [v] "+r"(ip) : :);
+    asm volatile("%[v] &= 0xFFF" : [v] "+r"(op) : :);
 
     /* Handle trailing 1 or 2 bytes outside the loop */
     __u32 rem = in_len - ip;
@@ -2052,7 +2123,7 @@ static __always_inline __u32 b64_decode(__u8 *scratch, __u32 in_off, __u32 in_le
  * Format: "<165>1 YYYY-MM-DDTHH:MM:SSZ <name(32 space-padded)> - - -  "
  * Always writes exactly GUT_SYSLOG_HDR_MAX (68) bytes.
  * Uses bpf_ktime_get_tai_ns() for near-wall-clock time (TAI ≈ UTC+37s). */
-static __always_inline void write_syslog_ascii(__u8 *buf, struct gut_config *cfg)
+static __always_inline __u32 write_syslog_ascii(__u8 *buf, struct gut_config *cfg)
 {
 
     /* Static prefix/suffix — only the 19-byte timestamp is dynamic */
@@ -2111,18 +2182,29 @@ static __always_inline void write_syslog_ascii(__u8 *buf, struct gut_config *cfg
     buf[26] = 'Z';
     buf[27] = ' ';
 
-    /* Copy 32-byte name field (loader pads with spaces). */
-    __builtin_memcpy(buf + 28, cfg->sni_domain, 32);
+    __u32 slen = cfg->sni_domain_len;
+    if (slen > 32)
+        slen = 32;
 
-    /* Suffix always at fixed position 60 */
-    buf[60] = ' ';
-    buf[61] = '-';
-    buf[62] = ' ';
-    buf[63] = '-';
-    buf[64] = ' ';
-    buf[65] = '-';
-    buf[66] = ' ';
-    buf[67] = ' ';
+    for (int i = 0; i < 32; i++)
+    {
+        if (i >= slen)
+            break;
+        buf[28 + i] = cfg->sni_domain[i];
+    }
+
+    __u32 j = 28 + slen;
+    j &= 63; /* bound for verifier max 28+32 = 60 */
+    buf[j] = ' ';
+    buf[j + 1] = '-';
+    buf[j + 2] = ' ';
+    buf[j + 3] = '-';
+    buf[j + 4] = ' ';
+    buf[j + 5] = '-';
+    buf[j + 6] = ' ';
+    buf[j + 7] = ' ';
+
+    return j + 8;
 }
 
 static __always_inline void write_quic_short_header(__u8 *quic, void *data_end, __u32 dcid, __u32 ppn, __u32 enc_ports, __u32 pad_len)

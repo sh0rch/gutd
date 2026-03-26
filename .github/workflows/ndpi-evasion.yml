@@ -1,0 +1,175 @@
+name: nDPI Evasion Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      modes:
+        description: 'Modes to test (space-separated, or "all")'
+        required: false
+        default: 'all'
+  workflow_call:
+    inputs:
+      skip_build:
+        description: 'Skip gutd build (artifact already available from caller)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: ${{ !inputs.skip_build }}
+    uses: ./.github/workflows/build.yml
+    with:
+      build_all: false
+
+  ndpi-build:
+    name: Build nDPI
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Cache nDPI build
+      id: cache-ndpi
+      uses: actions/cache@v4
+      with:
+        path: /tmp/nDPI
+        key: ndpi-${{ runner.os }}-v1
+
+    - name: Build nDPI from source
+      if: steps.cache-ndpi.outputs.cache-hit != 'true'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libnuma-dev librrd-dev libpcap-dev libtool-bin autoconf automake make gcc pkg-config git
+        git clone --depth 1 https://github.com/ntop/nDPI.git /tmp/nDPI
+        cd /tmp/nDPI
+        ./autogen.sh
+        ./configure
+        make -j$(nproc)
+
+    - name: Verify ndpiReader
+      run: /tmp/nDPI/example/ndpiReader -V
+
+    - name: Upload ndpiReader
+      uses: actions/upload-artifact@v4
+      with:
+        name: ndpiReader
+        path: /tmp/nDPI/example/ndpiReader
+        retention-days: 1
+
+  evasion-test:
+    name: "${{ matrix.mode }} (userspace)"
+    needs: [build, ndpi-build]
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [quic, gost, sip, syslog]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download gutd binary
+      uses: actions/download-artifact@v4
+      with:
+        name: gutd-x86_64
+        path: /tmp/bin
+
+    - name: Download ndpiReader
+      uses: actions/download-artifact@v4
+      with:
+        name: ndpiReader
+        path: /tmp/ndpi-bin
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y tcpdump iptables iperf3 wireguard-tools iproute2 libpcap-dev
+        chmod +x /tmp/bin/gutd-x86_64
+        chmod +x /tmp/ndpi-bin/ndpiReader
+        sudo cp /tmp/ndpi-bin/ndpiReader /usr/local/bin/ndpiReader
+        /tmp/bin/gutd-x86_64 --version
+        ndpiReader -V
+
+    - name: Run nDPI evasion test (${{ matrix.mode }})
+      env:
+        GUTD_BINARY: /tmp/bin/gutd-x86_64
+        GUTD_OBFS: ${{ matrix.mode }}
+        GUTD_US: "true"
+      run: sudo -E bash tests/test_ndpi_evasion.sh
+
+    - name: Publish nDPI report
+      if: always()
+      run: |
+        if [ -f /tmp/ndpi_results.txt ]; then
+          echo "## nDPI — \`${{ matrix.mode }}\` mode" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/ndpi_results.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+        fi
+
+    - name: Upload pcap artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: pcap-${{ matrix.mode }}
+        path: /tmp/gutd_ndpi.pcap
+        retention-days: 3
+
+    - name: Rename nDPI report with mode
+      if: always()
+      run: cp /tmp/ndpi_results.txt /tmp/ndpi_results_${{ matrix.mode }}.txt 2>/dev/null || true
+
+    - name: Upload nDPI report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ndpi-report-${{ matrix.mode }}
+        path: /tmp/ndpi_results_${{ matrix.mode }}.txt
+        retention-days: 3
+
+    - name: Upload gutd logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: gutd-logs-${{ matrix.mode }}
+        path: |
+          /tmp/gutd_s.log
+          /tmp/gutd_c.log
+        retention-days: 3
+
+  summary:
+    name: Results Summary
+    needs: evasion-test
+    if: always()
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Download all nDPI reports
+      uses: actions/download-artifact@v4
+      with:
+        pattern: ndpi-report-*
+        path: /tmp/reports
+        merge-multiple: true
+
+    - name: Generate summary
+      run: |
+        echo "## nDPI Evasion Test — All Modes" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Mode | nDPI Classification | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+
+        for mode in quic gost sip syslog; do
+          REPORT="/tmp/reports/ndpi_results_${mode}.txt"
+          if [ -f "$REPORT" ]; then
+            # Extract detected protocol names (top line of protocol stats)
+            PROTOS=$(grep -oP '\b[A-Z][A-Za-z0-9_.]+(?=\s+\d)' "$REPORT" | sort -u | head -5 | tr '\n' ', ' | sed 's/,$//')
+            [ -z "$PROTOS" ] && PROTOS="(see full report)"
+            echo "| $mode | $PROTOS | :white_check_mark: |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| $mode | — | :warning: No report |" >> $GITHUB_STEP_SUMMARY
+          fi
+        done
+
+

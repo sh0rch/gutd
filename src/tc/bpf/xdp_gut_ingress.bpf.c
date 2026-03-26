@@ -14,6 +14,103 @@ char LICENSE[] SEC("license") = "GPL";
 
 #define WG_MIN_PACKET 32
 
+#if defined(GUT_MODE_SIP)
+/* ── SIP marker scan via bpf_loop ── scan scratch[SIP_SCAN_OFF..] for "a=fmtp:0 " */
+struct sip_scan_ctx
+{
+    __u8 *scratch;
+    __u32 max_len;
+    __u32 result;
+    __u64 date_numeric;
+    __u32 auth_token;
+};
+
+static __attribute__((unused)) long sip_date_extract_cb(__u32 idx, void *_ctx)
+{
+    struct sip_scan_ctx *ctx = (struct sip_scan_ctx *)_ctx;
+    if (idx + 7 > ctx->max_len)
+        return 1;
+    __u32 base = SIP_SCAN_OFF + idx;
+    __u8 *s = ctx->scratch;
+
+    // Quick find "Date: "
+    if (s[base & (SCRATCH_SIZE - 1)] == 'D' && s[(base + 1) & (SCRATCH_SIZE - 1)] == 'a' &&
+        s[(base + 2) & (SCRATCH_SIZE - 1)] == 't' && s[(base + 3) & (SCRATCH_SIZE - 1)] == 'e' &&
+        s[(base + 4) & (SCRATCH_SIZE - 1)] == ':' && s[(base + 5) & (SCRATCH_SIZE - 1)] == ' ')
+    {
+        // Extract digits until CRLF
+        for (int i = 6; i < 48; i++)
+        {
+            if (idx + i >= ctx->max_len)
+                break;
+            __u16 b_off = (base + i) & (SCRATCH_SIZE - 1);
+            __u8 b = s[b_off];
+            if (b == '\r' || b == '\n' || b == ' ')
+                break;
+            if (b >= '0' && b <= '9')
+            {
+                ctx->date_numeric = ctx->date_numeric * 10 + (b - '0');
+            }
+        }
+        return 1; // found Date, stop
+    }
+    return 0;
+}
+
+static __attribute__((unused)) long sip_marker_scan_cb(__u32 idx, void *_ctx)
+{
+    struct sip_scan_ctx *ctx = (struct sip_scan_ctx *)_ctx;
+    if (ctx->result != 0)
+        return 1; /* already found — stop */
+    if (idx + 9 > ctx->max_len)
+        return 1; /* past end — stop */
+    __u32 base = SIP_SCAN_OFF + idx;
+    __u8 *s = ctx->scratch;
+    if (s[base & (SCRATCH_SIZE - 1)] == 'a' &&
+        s[(base + 1) & (SCRATCH_SIZE - 1)] == '=' &&
+        s[(base + 2) & (SCRATCH_SIZE - 1)] == 'f' &&
+        s[(base + 3) & (SCRATCH_SIZE - 1)] == 'm' &&
+        s[(base + 4) & (SCRATCH_SIZE - 1)] == 't' &&
+        s[(base + 5) & (SCRATCH_SIZE - 1)] == 'p' &&
+        s[(base + 6) & (SCRATCH_SIZE - 1)] == ':' &&
+        s[(base + 7) & (SCRATCH_SIZE - 1)] == '0' &&
+        s[(base + 8) & (SCRATCH_SIZE - 1)] == ' ')
+    {
+        ctx->result = idx + 9;
+        return 1; /* found — stop */
+    }
+    return 0; /* continue */
+}
+
+static __attribute__((unused)) long sip_auth_scan_cb(__u32 idx, void *_ctx)
+{
+    struct sip_scan_ctx *ctx = (struct sip_scan_ctx *)_ctx;
+    if (ctx->auth_token != 0)
+        return 1; /* already found */
+    if (idx >= ctx->max_len)
+        return 1;
+    __u32 base = (SIP_SCAN_OFF + idx) & (SCRATCH_SIZE - 1);
+    __u8 *s = ctx->scratch;
+    if (s[base] == 'z' && s[(base + 7) & (SCRATCH_SIZE - 1)] == '-')
+    {
+        __u32 tok = 0;
+        for (int j = 0; j < 8; j++)
+        {
+            __u8 b = s[(base + 8 + j) & (SCRATCH_SIZE - 1)];
+            if (b >= '0' && b <= '9')
+                tok = (tok << 4) | (b - '0');
+            else if (b >= 'a' && b <= 'f')
+                tok = (tok << 4) | (b - 'a' + 10);
+            else if (b >= 'A' && b <= 'F')
+                tok = (tok << 4) | (b - 'A' + 10);
+        }
+        ctx->auth_token = tok;
+        return 1;
+    }
+    return 0;
+}
+#endif /* GUT_MODE_SIP */
+
 struct
 {
     __uint(type, BPF_MAP_TYPE_DEVMAP);
@@ -38,10 +135,10 @@ static __always_inline void xor16(__u8 *p, const __u8 *k)
         p[i] ^= k[i];
 }
 
-#if defined(GUT_MODE_SYSLOG)
+#if defined(GUT_MODE_B64)
 /* Not needed as separate subprog — b64_decode is called inline to avoid
  * mark_precise explosion from noinline map-value invalidation. */
-#endif /* GUT_MODE_SYSLOG */
+#endif /* GUT_MODE_B64 */
 
 static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *cfg)
 {
@@ -128,8 +225,8 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         __u32 syslog_hdr_len = 0;
         if (wg + 68 > (__u8 *)data_end)
             return -1;
-#pragma unroll
-        for (__u32 i = 28; i < 60; i++)
+
+        _Pragma("unroll") for (__u32 i = 28; i < 60; i++)
         {
             if (wg[i] == ' ' && wg[i + 1] == '-' && wg[i + 2] == ' ' &&
                 wg[i + 3] == '-' && wg[i + 4] == ' ' && wg[i + 5] == '-' &&
@@ -146,8 +243,6 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         b64_data_len &= 0xFFF; /* unsigned bound for verifier */
         if (b64_data_len < 16 || b64_data_len > GUT_B64_MAX_OUT)
             return -1;
-
-        /* Load base64 from packet to scratch */
         if (bpf_xdp_load_bytes(ctx, wg_off + syslog_hdr_len,
                                scratch + B64_ENC_OFF, b64_data_len) < 0)
             return -1;
@@ -169,14 +264,20 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         if (ballast_s >= decoded_len - GUT_GOST_HEADER_SIZE)
             return -1;
         decoded_len -= ballast_s;
-        decoded_len &= 0x3FF; /* unsigned bound for verifier: max 1023, fits scratch from off=384 */
-        if (decoded_len < GUT_GOST_HEADER_SIZE + WG_MIN_PACKET)
+
+        decoded_len &= 0x3FF;
+        if (decoded_len < GUT_GOST_HEADER_SIZE + WG_MIN_PACKET || decoded_len > 1023)
             return -1;
         scratch[pad_off] = 0x00; /* clear ballast flag for shared GOST code */
 
+        /* Force compiler to resolve bounds strictly before call */
+        __u32 slen = decoded_len & 0x3FF;
+        if (slen == 0)
+            return -1;
+
         /* Write decoded GOST inner (without ballast) back to packet */
         if (bpf_xdp_store_bytes(ctx, wg_off,
-                                scratch + B64_INNER_OFF, decoded_len) < 0)
+                                scratch + B64_INNER_OFF, slen) < 0)
             return -1;
 
         /* Trim excess tail bytes (base64 expansion + ballast in one op) */
@@ -203,6 +304,211 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         if (wg + wg_len > (__u8 *)data_end)
             return -1;
         udp_len = 8 + (__u16)decoded_len;
+    }
+    /* Packet is now in GOST format — fall through to GOST processing */
+    __u32 quic_hdr_len = GUT_GOST_HEADER_SIZE;
+#elif defined(GUT_MODE_SIP)
+    /* ── SIP mode: detect RTP (data) vs SIP signaling (b64) ── */
+    if (wg_len < 22) /* min: RTP(12) + GOST(10) */
+        return -1;
+
+    if ((wg[0] & 0xC0) == 0x80 && (wg[1] & 0x7F) == 0x60)
+    {
+        /* ── RTP data path: strip 12-byte RTP header → GOST ── */
+        __u32 gost_data_len = wg_len - GUT_RTP_HEADER_SIZE;
+        gost_data_len &= 0xFFF;
+        if (gost_data_len < GUT_GOST_HEADER_SIZE + WG_MIN_PACKET ||
+            gost_data_len > 1500)
+            return -1;
+
+        /* Re-bound for verifier: spill across branches loses umin tracking */
+        asm volatile("%[v] &= 2047\n\t"
+                     "if %[v] < 42 goto +0"
+                     : [v] "+r"(gost_data_len)
+                     :
+                     :);
+        if (gost_data_len < 42 || gost_data_len > 1500)
+            return -1;
+
+        /* Strip RTP header directly from packet.
+         * The RTP header is 12 bytes at wg_off.
+         * Shift Ethernet+IP+UDP(8) headers forward to cover the hole. */
+        __u32 shift_len_head = udp_off + 8;
+        if (shift_len_head > 62)
+            return -1;
+
+        /* 1. Load original headers into scratch */
+
+        for (int i = 0; i < 62; i++)
+        {
+            if (i >= shift_len_head)
+                break;
+            scratch[256 + i] = ((__u8 *)data)[i];
+        }
+
+        /* 2. Remove the 12-byte RTP header from the start of the packet data */
+        if (bpf_xdp_adjust_head(ctx, (int)GUT_RTP_HEADER_SIZE) < 0)
+            return -1;
+
+        /* 3. Restore headers at the new start position */
+        data = (void *)(__u64)ctx->data;
+        data_end = (void *)(__u64)ctx->data_end;
+        if ((__u8 *)data + shift_len_head > (__u8 *)data_end)
+            return -1;
+
+        for (int i = 0; i < 62; i++)
+        {
+            if (i >= shift_len_head)
+                break;
+            ((__u8 *)data)[i] = scratch[256 + i];
+        }
+
+        /* Re-derive all pointers for subsequent processing */
+        eth = data;
+        udph = (void *)((__u8 *)data + udp_off);
+        wg = (__u8 *)data + wg_off;
+        wg_len = gost_data_len;
+        if (wg + GUT_GOST_HEADER_SIZE + WG_MIN_PACKET > (__u8 *)data_end)
+            return -1;
+        udp_len = 8 + (__u16)gost_data_len;
+    }
+    else if (wg[0] == 'M' || wg[0] == 'R' || wg[0] == 'O' ||
+             wg[0] == 'S' || wg[0] == 'I' || wg[0] == 'B' ||
+             wg[0] == 'A' || wg[0] == 'V' || wg[0] == 'N' || wg[0] == 'P' ||
+             (wg[0] == 'G' && wg[1] == 'E' && wg[2] == 'T'))
+    {
+        /* ── SIP signaling: scan for "a=fmtp:0 " marker, b64 decode → GOST ── */
+        __u32 scan_len = wg_len;
+        if (scan_len > 1024)
+            scan_len = 1024;
+        if (scan_len < 64)
+            return -1;
+
+        /* Load first up to 1024 bytes for marker scanning */
+        if (bpf_xdp_load_bytes(ctx, wg_off,
+                               scratch + SIP_SCAN_OFF, scan_len) < 0)
+            return -1;
+
+        struct sip_scan_ctx sctx = {};
+        sctx.scratch = scratch;
+        sctx.max_len = scan_len;
+        sctx.result = 0;
+        sctx.date_numeric = 0;
+        sctx.auth_token = 0;
+
+        /* 1. Extract Date: digits for anti-probing salt */
+        bpf_loop(512, sip_date_extract_cb, &sctx, 0);
+
+        /* 2. Extract auth_token from Call-ID/branch in scratch */
+        bpf_loop(480, sip_auth_scan_cb, &sctx, 0);
+        __u32 auth_token = sctx.auth_token;
+
+        /* 3. Anti-probing check: Feistel(date_numeric / 10000) == auth_token */
+        __u32 ts_100ms = (__u32)(sctx.date_numeric / 10000);
+        if (auth_token == 0 || sip_hash32(ts_100ms, cfg->feistel_rk) != auth_token)
+        {
+            bpf_debug("SIP: drop probe dn=%llu tok=%x vs ts=%d", sctx.date_numeric, auth_token, ts_100ms);
+            return -1;
+        }
+
+        /* 4. Find marker for b64 payload */
+        bpf_loop(1024, sip_marker_scan_cb, &sctx, 0);
+        __u32 sip_hdr_len = sctx.result;
+        if (sip_hdr_len == 0 || sip_hdr_len >= 1024 || sip_hdr_len >= wg_len)
+            return -1;
+
+        __u32 b64_data_len = wg_len - (sip_hdr_len & 0x3FF);
+        b64_data_len &= 0x7FF;
+        if (b64_data_len < 16 || b64_data_len > GUT_B64_MAX_OUT)
+            return -1;
+
+        /* Re-bound b64_data_len for verifier */
+        {
+            __u32 blen_bounded;
+            asm volatile("%[out] = %[in]\n\t"
+                         "%[out] &= 2047\n\t"
+                         "if %[out] < 16 goto +0"
+                         : [out] "=r"(blen_bounded)
+                         : [in] "r"(b64_data_len)
+                         :);
+            if (blen_bounded < 16 || blen_bounded > GUT_B64_MAX_OUT)
+                return -1;
+            b64_data_len = blen_bounded;
+        }
+
+        /* Load base64 payload from packet */
+        if (bpf_xdp_load_bytes(ctx, (wg_off + (sip_hdr_len & 0x3FF)) & 0xFFFF,
+                               scratch + B64_ENC_OFF, b64_data_len) < 0)
+            return -1;
+
+        /* Decode base64 */
+        __u32 b64_bounded = b64_data_len & 0xFFF;
+        if (b64_bounded < 16 || b64_bounded > GUT_B64_MAX_OUT || (b64_bounded & 3))
+            return -1;
+        __u32 decoded_len = b64_decode(scratch, B64_ENC_OFF, b64_bounded, B64_INNER_OFF);
+        if (decoded_len < GUT_GOST_HEADER_SIZE + WG_MIN_PACKET ||
+            decoded_len > GUT_B64_MAX_INNER)
+            return -1;
+
+        /* Strip ballast from decoded GOST inner */
+        __u32 pad_off = (B64_INNER_OFF + 9) & (SCRATCH_SIZE - 1);
+        __u8 pad_byte_s = scratch[pad_off];
+        __u32 ballast_s = (pad_byte_s & 0x40) ? ((__u32)(pad_byte_s & 0x3F) + 1) : 0;
+        if (ballast_s >= decoded_len - GUT_GOST_HEADER_SIZE)
+            return -1;
+        decoded_len -= ballast_s;
+        decoded_len &= 0x3FF;
+        if (decoded_len < GUT_GOST_HEADER_SIZE + WG_MIN_PACKET || decoded_len > 1023)
+            return -1;
+        scratch[pad_off] = 0x00;
+
+        /* Re-bound decoded_len: verifier loses range through bpf_loop spills */
+        {
+            __u32 dl_bounded;
+            asm volatile("%[out] = %[in]\n\t"
+                         "%[out] &= 1023\n\t"
+                         "if %[out] < 42 goto +0"
+                         : [out] "=r"(dl_bounded)
+                         : [in] "r"(decoded_len)
+                         :);
+            if (dl_bounded < GUT_GOST_HEADER_SIZE + WG_MIN_PACKET)
+                return -1;
+            decoded_len = dl_bounded;
+        }
+
+        /* Write decoded GOST inner back to packet */
+        if (bpf_xdp_store_bytes(ctx, wg_off,
+                                scratch + B64_INNER_OFF, decoded_len) < 0)
+            return -1;
+
+        /* Trim excess tail bytes */
+        __s32 sip_trim = (__s32)wg_len - (__s32)decoded_len;
+        if (sip_trim > 0)
+        {
+            if (bpf_xdp_adjust_tail(ctx, -sip_trim) < 0)
+                return -1;
+        }
+
+        /* Re-derive all pointers */
+        data = (void *)(__u64)ctx->data;
+        data_end = (void *)(__u64)ctx->data_end;
+        eth = data;
+        if ((void *)(eth + 1) > data_end)
+            return -1;
+        udph = (void *)((__u8 *)data + udp_off);
+        if ((void *)(udph + 1) > data_end)
+            return -1;
+        wg = (__u8 *)data + wg_off;
+        wg_len = decoded_len;
+        if (wg + GUT_GOST_HEADER_SIZE + WG_MIN_PACKET > (__u8 *)data_end)
+            return -1;
+        if (wg + wg_len > (__u8 *)data_end)
+            return -1;
+        udp_len = 8 + (__u16)decoded_len;
+    }
+    else
+    {
+        return -1; /* not RTP and not SIP — reject */
     }
     /* Packet is now in GOST format — fall through to GOST processing */
     __u32 quic_hdr_len = GUT_GOST_HEADER_SIZE;
@@ -234,7 +540,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         return -1;
 
     __u32 nonce = wg_nonce32(wg);
-#if !defined(GUT_MODE_SYSLOG)
+#if !defined(GUT_MODE_B64)
     __u32 *ks0 = (__u32 *)(scratch + 0);
     chacha_block(ks0, cfg->chacha_init, 0, nonce);
 #endif
@@ -261,7 +567,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
 
     __u8 *quic = wg - quic_hdr_len;
 
-#if defined(GUT_MODE_GOST) || defined(GUT_MODE_SYSLOG)
+#if defined(GUT_MODE_GOST) || defined(GUT_MODE_B64)
     {
         __u32 pkt_ppn = 0;
         __builtin_memcpy(&pkt_ppn, quic + 0, 4);
@@ -313,7 +619,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
      *
      * Note: wg_idx reads bytes[8..12] for non-Type-1 (correct for DCID matching),
      * but receiver_index for Type 4 lives at bytes[4..8].  We extract separately. */
-#if !defined(GUT_MODE_SYSLOG) /* dynamic peer inline; syslog uses helper-based save/restore */
+#if !defined(GUT_MODE_B64) /* dynamic peer inline; b64 modes use helper-based save/restore */
     if (cfg->dynamic_peer)
     {
         __u32 client_idx = 0;
@@ -362,7 +668,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             bpf_debug("XDP: client_map[%u] updated wg_type=%u port=%u", client_idx, wg_type, ep.port);
         }
     }
-#endif /* !GUT_MODE_SYSLOG */
+#endif /* !GUT_MODE_B64 */
 
     /* Read feistel-encrypted ports from the QUIC header (4 bytes, stored by TC egress).
      * Short header (GUT_QUIC_SHORT_HEADER_SIZE=16): enc_ports at bytes [10-13].
@@ -371,7 +677,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
      * On bpf_xdp_load_bytes failure enc_ports stays 0 and ports_ok=0 prevents restore. */
     __u32 enc_ports = 0;
     int ports_ok = 1;
-#if defined(GUT_MODE_GOST) || defined(GUT_MODE_SYSLOG)
+#if defined(GUT_MODE_GOST) || defined(GUT_MODE_B64)
     __builtin_memcpy(&enc_ports, quic + 4, 4);
 #else /* GUT_MODE_QUIC */
     if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
@@ -387,7 +693,40 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     __be16 inner_sport_ne = ports_ok ? bpf_htons((__u16)(plain_ports >> 16)) : 0;
     __be16 inner_dport_ne = ports_ok ? bpf_htons((__u16)(plain_ports & 0xFFFF)) : 0;
 
-#if !defined(GUT_MODE_SYSLOG) /* mac2 XOR not needed: payload was base64-wrapped */
+    /* mac2 XOR — symmetric with userspace obfs_decap.
+     * B64 modes: mac2 was XOR'd on egress (in GOST inner before b64 encode).
+     * Non-B64 modes: mac2 was XOR'd directly on packet by TC egress.
+     * Both need the reverse XOR here. */
+#if defined(GUT_MODE_B64)
+    /* B64: avoid xor16 function call to save stack (SIP mode has bpf_loop callback).
+     * Use bpf_xdp_load_bytes → XOR in scratch → bpf_xdp_store_bytes. */
+    if (wg_type == 1 && wg_len >= 148)
+    {
+        __u32 m2_off = wg_off + quic_hdr_len + 132;
+        __u8 *m2 = scratch + 192;
+        if (bpf_xdp_load_bytes(ctx, m2_off, m2, 16) == 0)
+        {
+            __u8 *ks47_b = (__u8 *)ks47;
+
+            for (int i = 0; i < 16; i++)
+                m2[i] ^= ks47_b[16 + i];
+            bpf_xdp_store_bytes(ctx, m2_off, m2, 16);
+        }
+    }
+    else if (wg_type == 2 && wg_len >= 92)
+    {
+        __u32 m2_off = wg_off + quic_hdr_len + 76;
+        __u8 *m2 = scratch + 192;
+        if (bpf_xdp_load_bytes(ctx, m2_off, m2, 16) == 0)
+        {
+            __u8 *ks47_b = (__u8 *)ks47;
+
+            for (int i = 0; i < 16; i++)
+                m2[i] ^= ks47_b[16 + i];
+            bpf_xdp_store_bytes(ctx, m2_off, m2, 16);
+        }
+    }
+#else
     if (wg_type == 1 && wg_len >= 148 && wg + 148 <= (__u8 *)data_end)
     {
         xor16(wg + 132, (const __u8 *)ks47 + 16);
@@ -396,7 +735,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     {
         xor16(wg + 76, (const __u8 *)ks47 + 16);
     }
-#endif /* !GUT_MODE_SYSLOG */
+#endif
 
     if (ballast_len > 63 || ballast_len > wg_len)
         return -1;
@@ -629,7 +968,6 @@ static __always_inline int handle_quic_probe(struct xdp_md *ctx)
     __u8 orig_dcid[20];
     __u8 orig_scid[20] = {};
 
-#pragma unroll
     for (int i = 0; i < 20; i++)
         orig_dcid[i] = quic[6 + i]; /* constant offsets 6..25, within r=32 */
 
@@ -657,7 +995,7 @@ static __always_inline int handle_quic_probe(struct xdp_md *ctx)
     response[5] = scid_len;
 
     int roff = 6;
-#pragma unroll
+
     for (int i = 0; i < 20; i++)
     {
         if (i < scid_len)
@@ -668,7 +1006,7 @@ static __always_inline int handle_quic_probe(struct xdp_md *ctx)
     }
     response[roff & 0x3F] = dcid_len;
     roff++;
-#pragma unroll
+
     for (int i = 0; i < 20; i++)
     {
         if (i < dcid_len)
@@ -695,9 +1033,9 @@ static __always_inline int handle_quic_probe(struct xdp_md *ctx)
      * offset (quic_off) safely inside the helper.
      * new_quic_len = 1+4+1+scid_len+1+dcid_len+4+4, range [15, 59].
      * Explicit range pair (not bitmask) preserves umin for the verifier. */
-    if (new_quic_len < 15 || new_quic_len > 63)
+    new_quic_len &= 0x3F;
+    if (new_quic_len < 15 || new_quic_len > 60)
         return XDP_PASS;
-    new_quic_len &= 0x3F; /* dead branch: enforces [15,63] for verifier */
     if (bpf_xdp_store_bytes(ctx, quic_off, response, new_quic_len))
         return XDP_PASS;
 
@@ -768,22 +1106,188 @@ static __always_inline int handle_quic_probe(struct xdp_md *ctx)
 }
 #endif /* GUT_MODE_QUIC */
 
+#if defined(GUT_MODE_SIP)
+/* ── SIP anti-probing: respond with 401/403 to DPI probes ─────────────
+ * When own_http3 (anti-probe flag) is enabled, reply to inbound SIP
+ * requests that failed GUT validation with:
+ *   OPTIONS  → 200 OK
+ *   REGISTER → 401 Unauthorized
+ *   other    → 403 Forbidden
+ * Minimal response (no Via copy) — enough to convince DPI this is a
+ * real SIP server and not a tunnel endpoint. */
+static __always_inline int handle_sip_probe(struct xdp_md *ctx)
+{
+    void *data = (void *)(__u64)ctx->data;
+    void *data_end = (void *)(__u64)ctx->data_end;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return XDP_PASS;
+
+    __u32 ip_off = 14;
+    __u32 udp_off;
+    __u8 ipver = 0;
+
+    if (eth->h_proto == bpf_htons(ETH_P_IP))
+    {
+        struct iphdr *iph = (void *)((__u8 *)data + ip_off);
+        if ((void *)(iph + 1) > data_end)
+            return XDP_PASS;
+        if (iph->protocol != IPPROTO_UDP || iph->ihl != 5)
+            return XDP_PASS;
+        udp_off = ip_off + 20;
+        ipver = 4;
+    }
+    else if (eth->h_proto == bpf_htons(ETH_P_IPV6))
+    {
+        struct ipv6hdr *ip6h = (void *)((__u8 *)data + ip_off);
+        if ((void *)(ip6h + 1) > data_end)
+            return XDP_PASS;
+        if (ip6h->nexthdr != IPPROTO_UDP)
+            return XDP_PASS;
+        udp_off = ip_off + 40;
+        ipver = 6;
+    }
+    else
+    {
+        return XDP_PASS;
+    }
+
+    struct udphdr *udph = (void *)((__u8 *)data + udp_off);
+    if ((void *)(udph + 1) > data_end)
+        return XDP_PASS;
+
+    __u32 sip_off = udp_off + 8;
+    __u8 *sip = (__u8 *)data + sip_off;
+    if (sip + 10 > (__u8 *)data_end)
+        return XDP_PASS;
+
+    /* Identify SIP method from first byte(s) */
+    /* Response lines: "SIP/2.0 " — not a probe, ignore */
+    if (sip[0] == 'S' && sip[1] == 'I' && sip[2] == 'P')
+        return XDP_PASS;
+
+    /* Select response status line based on method:
+     * O=OPTIONS → 200 OK, R=REGISTER → 401, else → 403 */
+    __u32 status_len;
+    /* Copy response into stack buffer (bpf_xdp_store_bytes can't read from .rodata) */
+    __u8 resp_buf[64];
+    if (sip[0] == 'O') /* OPTIONS */
+    {
+        __builtin_memcpy(resp_buf, "SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n", 37);
+        status_len = 37;
+    }
+    else if (sip[0] == 'R') /* REGISTER */
+    {
+        __builtin_memcpy(resp_buf, "SIP/2.0 401 Unauthorized\r\nContent-Length: 0\r\n\r\n", 47);
+        status_len = 47;
+    }
+    else
+    {
+        __builtin_memcpy(resp_buf, "SIP/2.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n", 44);
+        status_len = 44;
+    }
+
+    /* Trim packet to fit response */
+    __u32 current_payload = bpf_ntohs(udph->len) - 8;
+    if (status_len < current_payload)
+    {
+        __s32 trim = (__s32)current_payload - (__s32)status_len;
+        if (bpf_xdp_adjust_tail(ctx, -trim) < 0)
+            return XDP_PASS;
+    }
+    else if (status_len > current_payload)
+    {
+        __s32 grow = (__s32)status_len - (__s32)current_payload;
+        if (bpf_xdp_adjust_tail(ctx, grow) < 0)
+            return XDP_PASS;
+    }
+
+    data = (void *)(__u64)ctx->data;
+    data_end = (void *)(__u64)ctx->data_end;
+    eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return XDP_PASS;
+
+    /* Write response body */
+    if (bpf_xdp_store_bytes(ctx, sip_off, resp_buf, status_len) < 0)
+        return XDP_PASS;
+
+    /* Swap MACs */
+    __u8 tmp_mac[6];
+    __builtin_memcpy(tmp_mac, eth->h_dest, 6);
+    __builtin_memcpy(eth->h_dest, eth->h_source, 6);
+    __builtin_memcpy(eth->h_source, tmp_mac, 6);
+
+    /* Swap UDP ports */
+    udph = (void *)((__u8 *)data + udp_off);
+    if ((void *)(udph + 1) > data_end)
+        return XDP_PASS;
+    __be16 tmp_port = udph->source;
+    udph->source = udph->dest;
+    udph->dest = tmp_port;
+
+    __u16 new_udp_len = 8 + (__u16)status_len;
+    udph->len = bpf_htons(new_udp_len);
+    udph->check = 0;
+
+    if (ipver == 4)
+    {
+        struct iphdr *iph = (void *)((__u8 *)data + ip_off);
+        if ((void *)(iph + 1) > data_end)
+            return XDP_PASS;
+        /* Swap IPs */
+        __u32 tmp_ip = iph->saddr;
+        iph->saddr = iph->daddr;
+        iph->daddr = tmp_ip;
+        iph->tot_len = bpf_htons(20 + new_udp_len);
+        iph->ttl = 64;
+        iph->check = 0;
+        __u64 ip_csum = bpf_csum_diff(0, 0, (__be32 *)iph, sizeof(*iph), 0);
+        iph->check = csum_fold(ip_csum);
+    }
+    else
+    {
+        struct ipv6hdr *ip6h = (void *)((__u8 *)data + ip_off);
+        if ((void *)(ip6h + 1) > data_end)
+            return XDP_PASS;
+        struct in6_addr tmp_ip6;
+        __builtin_memcpy(&tmp_ip6, &ip6h->saddr, 16);
+        __builtin_memcpy(&ip6h->saddr, &ip6h->daddr, 16);
+        __builtin_memcpy(&ip6h->daddr, &tmp_ip6, 16);
+        ip6h->payload_len = bpf_htons(new_udp_len);
+        ip6h->hop_limit = 64;
+    }
+
+    bpf_debug("XDP_TX SIP anti-probe response, status_len=%d", status_len);
+    return XDP_TX;
+}
+#endif /* GUT_MODE_SIP */
+
 SEC("xdp")
 int xdp_gut_ingress(struct xdp_md *ctx)
 {
-    bpf_debug("XDP ingress: pkt size=%d", ctx->data_end - ctx->data);
     __u32 zero = 0;
+
     struct gut_config *cfg = bpf_map_lookup_elem(&config_map, &zero);
     if (!cfg)
         return XDP_PASS;
 
-    if (gut_xdp_core(ctx, cfg) != 0)
+    int rc = gut_xdp_core(ctx, cfg);
+    if (rc != 0)
     {
 #if defined(GUT_MODE_QUIC)
         /* QUIC mode: respond to DPI probes with Version Negotiation */
         if (cfg->own_http3 == 1)
         {
             if (handle_quic_probe(ctx) == XDP_TX)
+                return XDP_TX;
+        }
+#elif defined(GUT_MODE_SIP)
+        /* SIP mode: respond to DPI probes with 401/403 */
+        if (cfg->own_http3 == 1)
+        {
+            if (handle_sip_probe(ctx) == XDP_TX)
                 return XDP_TX;
         }
 #endif
