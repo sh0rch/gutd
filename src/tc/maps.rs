@@ -73,7 +73,6 @@ pub struct GutConfig {
     pub partial_ip_csum: u32,   // Precomputed partial IP header checksum (fixed fields)
     pub default_xdp_action: u8, // XDP action for non-GUT packets: 0=XDP_PASS, 1=XDP_DROP
     pub keepalive_drop_percent: u8, // Keepalive (WG type=4, payload=0) drop probability in %
-    pub feistel_rk: [u32; 4],   // Feistel32 round keys (derived from key via ChaCha)
     pub peer_ip6: [u8; 16],     // Peer IPv6 address (network byte order, zero if v4)
     pub bind_ip6: [u8; 16],     // Local bind IPv6 (network byte order, zero if v4)
     pub tun_local_ip4: u32,     // Local veth (gut0) IP — XDP ingress rewrites dst to this
@@ -116,9 +115,6 @@ impl GutConfig {
         // Precompute ChaCha init state: constants(4) + key_words(8)
         let chacha_init = compute_chacha_init(key);
 
-        // Derive Feistel32 round keys from ChaCha block
-        let feistel_rk = compute_feistel_rk(key, CHACHA_ROUNDS);
-
         // Extract IPv4/IPv6 addresses
         let (peer_ip4, peer_ip6) = match peer_ip {
             IpAddr::V4(ip) => (u32::from_ne_bytes(ip.octets()), [0u8; 16]),
@@ -144,7 +140,6 @@ impl GutConfig {
             partial_ip_csum: 0, // computed later in build_gut_config when bind_ip is known
             default_xdp_action: 0, // XDP_PASS by default; overridden by loader from config
             keepalive_drop_percent: 30,
-            feistel_rk,
             peer_ip6,
             bind_ip6: [0u8; 16],
             tun_local_ip4: 0,
@@ -217,13 +212,6 @@ pub struct GutStats {
 /// Offload capability flags — mirrors GUT_FLAG_* in gut_common.h
 pub const GUT_FLAG_NEED_L4_CSUM: u16 = 1 << 0;
 
-/// Derive 4 Feistel32 round keys from ChaCha block(counter=0xFFFFFFFE, nonce=0).
-/// Domain-separated from data masking (nonce>=1) and ballast (block 99).
-pub(crate) fn compute_feistel_rk(key: &[u8; 32], rounds: u8) -> [u32; 4] {
-    let ks = crate::proto::mask_balanced::chacha_block(key, 0xFFFFFFFE, 0, rounds);
-    [ks[0], ks[1], ks[2], ks[3]]
-}
-
 fn compute_chacha_init(key: &[u8; 32]) -> [u32; 12] {
     let mut init = [0u32; 12];
     // "expand 32-byte k" constants
@@ -238,7 +226,7 @@ fn compute_chacha_init(key: &[u8; 32]) -> [u32; 12] {
     init
 }
 
-const _: [(); 644] = [(); std::mem::size_of::<GutConfig>()];
+const _: [(); 628] = [(); std::mem::size_of::<GutConfig>()];
 const _: [(); 56] = [(); std::mem::size_of::<GutStats>()];
 
 impl GutStats {

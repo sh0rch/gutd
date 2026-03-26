@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::proto::feistel::{feistel32, feistel32_inv, FEISTEL_SALT_PORTS};
-use crate::proto::mask_balanced::{chacha_block, chacha_block_fast, chacha_init};
+use crate::proto::feistel::sip_hash32;
+use crate::proto::mask_balanced::{chacha_block_fast, chacha_init};
 
 const GUT_QUIC_SHORT_HEADER_SIZE: usize = 16;
 const GUT_GOST_HEADER_SIZE: usize = 10;
@@ -257,11 +257,6 @@ fn wg_nonce32(wg: &[u8]) -> u32 {
     n0 ^ n1 ^ n2 ^ n3
 }
 
-pub fn compute_feistel_rk(key: &[u8; 32], rounds: u8) -> [u32; 4] {
-    let ks = chacha_block(key, 0xFFFFFFFE, 0, rounds);
-    [ks[0], ks[1], ks[2], ks[3]]
-}
-
 fn xor16(p: &mut [u8], k: &[u8]) {
     for i in 0..16 {
         p[i] ^= k[i];
@@ -273,7 +268,6 @@ pub fn obfs_encap(
     buf: &mut [u8],
     orig_len: usize,
     key: &[u32; 12],
-    feistel_rk: &[u32; 4],
     rounds: u8,
     is_server: bool,
     wg_sport: u16,
@@ -330,7 +324,7 @@ pub fn obfs_encap(
 
     // Encrypt ports
     let plain_ports = ((wg_sport as u32) << 16) | (wg_dport as u32);
-    let enc_ports = feistel32(plain_ports ^ FEISTEL_SALT_PORTS, feistel_rk);
+    let enc_ports = plain_ports ^ ks47[11];
 
     // PPn
     let ppn = ks47[10];
@@ -341,26 +335,31 @@ pub fn obfs_encap(
 
     let mut pad_len = 0;
     if obfs == crate::config::ObfsMode::Gost {
-        // GOST-like 16-byte alignment emulation
-        let base_udp_size = 8 + quic_hdr_len + orig_len;
-        let remainder = base_udp_size % 16;
-        if remainder != 0 {
-            pad_len = 16 - remainder;
+        // GOST: 16-byte alignment for small packets (< 256 bytes) only
+        if orig_len < 256 {
+            let base_udp_size = 8 + quic_hdr_len + orig_len;
+            let remainder = base_udp_size % 16;
+            if remainder != 0 {
+                pad_len = 16 - remainder;
+            }
         }
+    } else if obfs == crate::config::ObfsMode::Quic && orig_len >= 220 {
+        // QUIC large packets: no padding — real QUIC has uniform MTU-sized data
+        pad_len = 0;
+    } else if (obfs == crate::config::ObfsMode::Syslog || obfs == crate::config::ObfsMode::Sip)
+        && orig_len >= 220
+    {
+        // B64 large packets: small random padding [1..15]
+        let raw = std::cmp::min((pad_block[63] & 0x0F) as usize, 14);
+        pad_len = raw + 1;
+    } else if obfs == crate::config::ObfsMode::Quic {
+        // QUIC small packets: [1..64]
+        let raw = (pad_block[63] & 0x3F) as usize;
+        pad_len = raw + 1;
     } else {
-        // For QUIC / SIP / Syslog we use random length padding to mask packet sizes and handshakes
-        let max_pad = if obfs == crate::config::ObfsMode::Quic && orig_len >= 220 {
-            0
-        } else if obfs == crate::config::ObfsMode::Quic {
-            0x3F // 1..64
-        } else {
-            0x1F // 1..32
-        };
-
-        if max_pad > 0 {
-            let raw = pad_block[63] & max_pad;
-            pad_len = (raw as usize) + 1;
-        }
+        // B64 (syslog/sip) small packets: [1..32]
+        let raw = (pad_block[63] & 0x1F) as usize;
+        pad_len = raw + 1;
     }
 
     if pad_len > 0 {
@@ -374,7 +373,7 @@ pub fn obfs_encap(
         buf[quic_hdr_len - 1] = 0x00;
     }
 
-    let dcid = feistel32(wg_idx, feistel_rk);
+    let dcid = ks47[9];
 
     if quic_hdr_len == GUT_GOST_HEADER_SIZE {
         write_gost_header(buf, ppn, enc_ports, pad_len);
@@ -383,7 +382,7 @@ pub fn obfs_encap(
     } else {
         write_quic_long_header(
             buf, wg_type, wg_idx, dcid, ppn, enc_ports, pad_len, orig_len, wg_off, &pad_block,
-            feistel_rk, sip_domain,
+            sip_domain,
         );
     }
 
@@ -433,7 +432,6 @@ fn write_quic_long_header(
     orig_len: usize,
     wg_off: usize,
     pad_block: &[u8; 64],
-    feistel_rk: &[u32; 4],
     sip_domain: &str,
 ) {
     // 0xC3 = QUIC Initial (client Type 1) with 4-byte PN, 0xF0 = QUIC Retry (Cookie Reply Type 3)
@@ -456,7 +454,7 @@ fn write_quic_long_header(
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos() as u32;
-    let time_gost = feistel32(t_ns, feistel_rk);
+    let time_gost = t_ns.wrapping_mul(0x9E3779B9u32).rotate_left(13);
     let gost_b = time_gost.to_le_bytes();
 
     let head = (GUT_QUIC_LONG_HEADER_SIZE / 2).min(200);
@@ -473,9 +471,12 @@ fn write_quic_long_header(
     buf[3] = 0x00;
     buf[4] = 0x01; // QUIC v1
 
-    let dcid2 = feistel32(wg_idx ^ 0xDEADBEEF, feistel_rk);
-    let scid = feistel32(wg_idx ^ 0xCAFEBABE, feistel_rk);
-    let scid2 = feistel32(wg_idx ^ 0x12345678, feistel_rk);
+    let dcid2 = (wg_idx ^ 0xDEADBEEF).wrapping_mul(0x9E3779B9u32);
+    let scid = (wg_idx ^ 0xCAFEBABE).wrapping_mul(0x6C62272Eu32);
+    let scid2 = sip_hash32(
+        wg_idx ^ 0x12345678,
+        &[0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5],
+    );
 
     let mut actual_dcid = [0u8; 8];
     actual_dcid[0..4].copy_from_slice(&dcid.to_le_bytes());
@@ -644,7 +645,6 @@ pub fn obfs_verify(
     buf: &[u8],
     orig_len: usize,
     key: &[u32; 12],
-    feistel_rk: &[u32; 4],
     rounds: u8,
     obfs: crate::config::ObfsMode,
 ) -> bool {
@@ -704,13 +704,13 @@ pub fn obfs_verify(
     xor16(&mut hdr, &ks47_b[0..16]);
 
     let wg_type = hdr[0] & 0x1F;
-    let wg_idx = if wg_type == 2 {
+    let _wg_idx = if wg_type == 2 {
         u32::from_le_bytes(hdr[8..12].try_into().unwrap())
     } else {
         u32::from_le_bytes(hdr[4..8].try_into().unwrap())
     };
 
-    let expected_dcid = feistel32(wg_idx, feistel_rk);
+    let expected_dcid = ks47[9];
 
     if hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
         let pkt_dcid = u32::from_le_bytes(buf[1..5].try_into().unwrap());
@@ -751,7 +751,6 @@ pub fn obfs_decap(
     buf: &mut [u8],
     orig_len: usize,
     key: &[u32; 12],
-    feistel_rk: &[u32; 4],
     rounds: u8,
     obfs: crate::config::ObfsMode,
 ) -> Option<(usize, u16, u16)> {
@@ -797,13 +796,13 @@ pub fn obfs_decap(
         u32::from_le_bytes(buf[24..28].try_into().unwrap()) // Ports hidden in Token in Long Header
     };
 
-    let plain_ports = feistel32_inv(enc_ports, feistel_rk) ^ FEISTEL_SALT_PORTS;
-    let wg_sport = (plain_ports >> 16) as u16;
-    let wg_dport = (plain_ports & 0xFFFF) as u16;
-
     let nonce = wg_nonce32(&buf[wg_off..wg_off + actual_wg_len]);
     let ks47 = chacha_block_fast(key, 47, nonce, rounds);
     let ks47_b: [u8; 64] = unsafe { std::mem::transmute(ks47) };
+
+    let plain_ports = enc_ports ^ ks47[11];
+    let wg_sport = (plain_ports >> 16) as u16;
+    let wg_dport = (plain_ports & 0xFFFF) as u16;
 
     xor16(&mut buf[wg_off..wg_off + 16], &ks47_b[0..16]);
     let wg_type = buf[wg_off] & 0x1F;
@@ -900,7 +899,8 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let key = peer.key;
     let key_init = chacha_init(&key);
     let rounds: u8 = 4;
-    let feistel_rk = compute_feistel_rk(&key, rounds);
+    // auth_key: first 4 key words (key[0..16] as u32 LE) — same as BPF chacha_init[4..8]
+    let auth_key: [u32; 4] = key_init[4..8].try_into().unwrap();
 
     let is_server = peer.responder;
     let obfs = match std::env::var("GUTD_OBFS").as_deref() {
@@ -1062,7 +1062,6 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         &mut buf,
                         size,
                         &key_init,
-                        &feistel_rk,
                         rounds,
                         is_server,
                         src.port(),
@@ -1134,7 +1133,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                     dest.port(),
                                     rtp_port,
                                     b64_len,
-                                    &feistel_rk,
+                                    &auth_key,
                                     &date_str,
                                 );
                                 out_buf.copy_within(
@@ -1251,7 +1250,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 src.port(),
                                 10000,
                                 0,
-                                &feistel_rk,
+                                &auth_key,
                                 &date_str,
                             );
                             let _ = ingress_ext.send_to(&sip_resp[..hlen], src);
@@ -1271,7 +1270,6 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 &buf,
                                 size,
                                 &key_init,
-                                &feistel_rk,
                                 rounds,
                                 crate::config::ObfsMode::Quic,
                             )
@@ -1284,7 +1282,6 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 &buf,
                                 size,
                                 &key_init,
-                                &feistel_rk,
                                 rounds,
                                 crate::config::ObfsMode::Gost,
                             ) {
@@ -1302,7 +1299,6 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 &buf,
                                 size,
                                 &key_init,
-                                &feistel_rk,
                                 rounds,
                                 crate::config::ObfsMode::Gost,
                             );
@@ -1314,7 +1310,6 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 &buf,
                                 size,
                                 &key_init,
-                                &feistel_rk,
                                 rounds,
                                 crate::config::ObfsMode::Quic,
                             );
@@ -1343,7 +1338,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                     src.port(),
                                     10000,
                                     0,
-                                    &feistel_rk,
+                                    &auth_key,
                                     &date_str,
                                 );
                                 let _ = ingress_ext.send_to(&sip_resp[..hlen], src);
@@ -1367,14 +1362,9 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                             .insert(src, detected_obfs);
                     }
 
-                    if let Some((new_size, _wg_sport, _wg_dport)) = obfs_decap(
-                        &mut buf,
-                        size,
-                        &key_init,
-                        &feistel_rk,
-                        rounds,
-                        detected_obfs,
-                    ) {
+                    if let Some((new_size, _wg_sport, _wg_dport)) =
+                        obfs_decap(&mut buf, size, &key_init, rounds, detected_obfs)
+                    {
                         if dynamic_peer && new_size >= 8 {
                             let wg_type = buf[0] & 0x1F;
                             if wg_type == 1 {

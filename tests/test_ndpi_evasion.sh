@@ -12,8 +12,9 @@ if [[ "${OBFS_MODE}" == "syslog" ]]; then
     SNI_DOMAIN="${GUTD_SERVICE_NAME:-${GUTD_SNI:-asterisk}}"
 fi
 GUTD_US="${GUTD_US:-true}"
-# SIP and syslog expand payload heavily — reduce WG MTU to avoid fragmentation
-if [[ "${OBFS_MODE}" == "sip" || "${OBFS_MODE}" == "syslog" ]]; then
+# Syslog expands entire payload via base64 — reduce WG MTU to avoid fragmentation.
+# SIP uses RTP (raw GOST, no base64) for data — can use normal MTU.
+if [[ "${OBFS_MODE}" == "syslog" ]]; then
     WG_MTU="${WG_MTU:-500}"
 else
     WG_MTU="${WG_MTU:-1420}"

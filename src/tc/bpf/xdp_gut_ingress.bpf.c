@@ -45,7 +45,7 @@ static __attribute__((unused)) long sip_date_extract_cb(__u32 idx, void *_ctx)
                 break;
             __u16 b_off = (base + i) & (SCRATCH_SIZE - 1);
             __u8 b = s[b_off];
-            if (b == '\r' || b == '\n' || b == ' ')
+            if (b == '\r' || b == '\n')
                 break;
             if (b >= '0' && b <= '9')
             {
@@ -403,9 +403,9 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         bpf_loop(480, sip_auth_scan_cb, &sctx, 0);
         __u32 auth_token = sctx.auth_token;
 
-        /* 3. Anti-probing check: Feistel(date_numeric / 10000) == auth_token */
+        /* 3. Anti-probing check: sip_hash32(date_numeric / 10000, key) == auth_token */
         __u32 ts_100ms = (__u32)(sctx.date_numeric / 10000);
-        if (auth_token == 0 || sip_hash32(ts_100ms, cfg->feistel_rk) != auth_token)
+        if (auth_token == 0 || sip_hash32(ts_100ms, cfg->chacha_init + 4) != auth_token)
         {
             bpf_debug("SIP: drop probe dn=%llu tok=%x vs ts=%d", sctx.date_numeric, auth_token, ts_100ms);
             return -1;
@@ -414,10 +414,10 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         /* 4. Find marker for b64 payload */
         bpf_loop(1024, sip_marker_scan_cb, &sctx, 0);
         __u32 sip_hdr_len = sctx.result;
-        if (sip_hdr_len == 0 || sip_hdr_len >= 1024 || sip_hdr_len >= wg_len)
+        if (sip_hdr_len == 0 || sip_hdr_len > GUT_SIP_HDR_MAX || sip_hdr_len >= wg_len)
             return -1;
 
-        __u32 b64_data_len = wg_len - (sip_hdr_len & 0x3FF);
+        __u32 b64_data_len = wg_len - (sip_hdr_len & 0x7FF);
         b64_data_len &= 0x7FF;
         if (b64_data_len < 16 || b64_data_len > GUT_B64_MAX_OUT)
             return -1;
@@ -437,7 +437,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         }
 
         /* Load base64 payload from packet */
-        if (bpf_xdp_load_bytes(ctx, (wg_off + (sip_hdr_len & 0x3FF)) & 0xFFFF,
+        if (bpf_xdp_load_bytes(ctx, (wg_off + (sip_hdr_len & 0x7FF)) & 0xFFFF,
                                scratch + B64_ENC_OFF, b64_data_len) < 0)
             return -1;
 
@@ -540,10 +540,6 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         return -1;
 
     __u32 nonce = wg_nonce32(wg);
-#if !defined(GUT_MODE_B64)
-    __u32 *ks0 = (__u32 *)(scratch + 0);
-    chacha_block(ks0, cfg->chacha_init, 0, nonce);
-#endif
     __u32 *ks47 = (__u32 *)(scratch + 64);
     chacha_block(ks47, cfg->chacha_init, 47, nonce);
 
@@ -562,7 +558,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
 
     __u32 expected_ppn = ks47[10];
 #if defined(GUT_MODE_QUIC)
-    __u32 expected_dcid = feistel32(wg_idx, cfg->feistel_rk);
+    __u32 expected_dcid = ks47[9];
 #endif
 
     __u8 *quic = wg - quic_hdr_len;
@@ -670,10 +666,10 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     }
 #endif /* !GUT_MODE_B64 */
 
-    /* Read feistel-encrypted ports from the QUIC header (4 bytes, stored by TC egress).
+    /* Read XOR-encrypted ports from the QUIC header (4 bytes, stored by TC egress).
      * Short header (GUT_QUIC_SHORT_HEADER_SIZE=16): enc_ports at bytes [10-13].
      * Long header  (GUT_QUIC_LONG_HEADER_SIZE=1200): enc_ports at bytes [24-27] (token field).
-     * Decrypt: feistel32_inv(enc, rk) ^ FEISTEL_SALT_PORTS -> (sport<<16)|dport host-order.
+     * Decrypt: enc_ports ^ ks47[11] -> (sport<<16)|dport host-order.
      * On bpf_xdp_load_bytes failure enc_ports stays 0 and ports_ok=0 prevents restore. */
     __u32 enc_ports = 0;
     int ports_ok = 1;
@@ -689,7 +685,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         __builtin_memcpy(&enc_ports, quic + 24, 4);
     }
 #endif
-    __u32 plain_ports = feistel32_inv(enc_ports, cfg->feistel_rk) ^ FEISTEL_SALT_PORTS;
+    __u32 plain_ports = enc_ports ^ ks47[11];
     __be16 inner_sport_ne = ports_ok ? bpf_htons((__u16)(plain_ports >> 16)) : 0;
     __be16 inner_dport_ne = ports_ok ? bpf_htons((__u16)(plain_ports & 0xFFFF)) : 0;
 
@@ -850,7 +846,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
 
         udp->check = 0;
         /* Restore WG UDP ports decrypted from the QUIC header.
-         * feistel32_inv(enc_ports, rk) ^ FEISTEL_SALT_PORTS -> original sport:dport.
+         * enc_ports ^ ks47[11] -> original sport:dport.
          * ports_ok=0 when load failed — leave tunnel ports as-is rather than corrupt. */
         if (ports_ok)
         {

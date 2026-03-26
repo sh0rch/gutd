@@ -112,6 +112,7 @@ int gut_egress(struct __sk_buff *skb)
 #if defined(GUT_MODE_SIP)
     /* SIP mode: data pkts (type 4, size > 32) → RTP path; rest → SIP+b64 signaling */
     __u8 sip_is_rtp = (wg_type == 4 && wg_len > 32) ? 1 : 0;
+    __u32 sip_hdr_len = 0;
 #endif
 
 #if defined(GUT_MODE_B64)
@@ -136,12 +137,11 @@ int gut_egress(struct __sk_buff *skb)
 #endif
 
     /* Save inner UDP ports BEFORE bpf_skb_adjust_room invalidates SKB pointers.
-     * Pack sport:dport into a u32, XOR with FEISTEL_SALT_PORTS for domain separation,
-     * then encrypt with feistel32 using the shared round keys.  XDP ingress decrypts
-     * with feistel32_inv to recover the original WireGuard port numbers. */
+     * enc_ports is computed after ks47 is ready (plain_ports ^ ks47[11]).
+     * XDP ingress recovers them symmetrically: enc_ports ^ ks47[11]. */
     __u32 plain_ports = (((__u32)bpf_ntohs(udph->source)) << 16) |
                         ((__u32)bpf_ntohs(udph->dest));
-    __u32 enc_ports = feistel32(plain_ports ^ FEISTEL_SALT_PORTS, cfg->feistel_rk);
+    __u32 enc_ports = 0; /* computed after chacha_block(ks47) below */
 
     __u32 nonce = wg_nonce32(wg_head);
 
@@ -173,75 +173,72 @@ int gut_egress(struct __sk_buff *skb)
     chacha_block(ks69, cfg->chacha_init, 69, nonce);
     __u8 *pad_block = (__u8 *)ks69;
 
-    /* Ballast for small packets.
-     * Wire encoding: last header byte = 0x40 | (raw & 0x3F)
+    /* Ballast: random padding for all packets to break fixed-size fingerprints.
+     * Wire encoding: last GOST header byte = 0x40 | (raw & 0x3F)
      *   bit6 (0x40) = "has ballast" flag
      *   bits[0:5]   = raw ∈ [0..63], actual ballast = raw+1 → [1..64]
-     * Large packets (no ballast): the byte stays 0x00 — bit6 clear = no trim.
-     * Gost mode: 16-byte aligned → {16,32,48,64} for cleaner block structure.
-     * QUIC mode: uniform [1..64] bytes.
+     * GOST mode: 16-byte alignment for all packets (pad 0..15).
+     * Other modes: small packets (< 220) get larger padding, large packets get [1..15].
      * Verifier note: after bpf_skb_change_tail spills pad_len to stack the
      * tnum loses umin; explicit re-check restores [1,64] before the store. */
     __u32 pad_len = 0;
+#if defined(GUT_MODE_GOST)
+    /* GOST: 16-byte alignment for small packets (< 256 bytes) only */
+    {
+        __u32 base_udp = 8 + quic_hdr_len + wg_len;
+        if (wg_len < 256)
+        {
+            __u32 remainder = base_udp & 0x0F;
+            if (remainder != 0)
+                pad_len = 16 - remainder;
+        }
+    }
+#else
     if (wg_len < BALLAST_THRESHOLD)
     {
-#if defined(GUT_MODE_GOST)
-        __u32 raw = (pad_block[63] >> 4) & 0x03; /* [0..3] uniform */
-        pad_len = (raw + 1) << 4;                /* {16, 32, 48, 64} */
-#elif defined(GUT_MODE_B64)
-        __u32 raw = pad_block[63] & 0x1F; /* [0..31] uniform — matches userspace syslog/sip */
+#if defined(GUT_MODE_B64)
+        __u32 raw = pad_block[63] & 0x1F; /* [0..31] uniform */
         pad_len = raw + 1;                /* [1..32] */
 #else
         __u32 raw = pad_block[63] & 0x3F; /* [0..63] uniform */
         pad_len = raw + 1;                /* [1..64] */
 #endif
+    }
+#if defined(GUT_MODE_B64)
+    else
+    {
+        /* Large packets (B64 only): small random padding for traffic shaping.
+         * QUIC: real QUIC has uniform MTU-sized data packets — no padding. */
+        __u32 raw = pad_block[63] & 0x0F;
+        if (raw > 14)
+            raw = 14;
+        pad_len = raw + 1; /* [1..15] */
+    }
+#endif
+#endif
+    if (pad_len > 0)
+    {
         if (bpf_skb_change_tail(skb, skb->len + pad_len, 0) < 0)
             return TC_ACT_OK;
-        /* Re-establish [1,64] for verifier after potential stack reload. */
-        if (pad_len == 0 || pad_len > 64)
+        /* Re-establish [1,64] for verifier after bpf_skb_change_tail stack spill.
+         * Compiler optimizes out a plain check; asm volatile forces the bound. */
+        asm volatile("%[v] &= 127\n\t"
+                     "if %[v] < 1 goto +0"
+                     : [v] "+r"(pad_len)
+                     :
+                     :);
+        if (pad_len < 1 || pad_len > 64)
             return TC_ACT_OK;
         if (bpf_skb_store_bytes(skb, skb->len - pad_len, pad_block, pad_len, 0) < 0)
             return TC_ACT_OK;
     }
 
-#if defined(GUT_MODE_B64)
-    /* Pre-load the full WG+ballast payload into scratch BEFORE the second ChaCha
-     * call. The verifier loses scalar range info on values spilled across noinline
-     * subprogram calls (chacha_block), so wg_len/pad_len must be consumed while
-     * their bounds are still tracked.
-     * Use inline asm to force a register AND-mask that the compiler cannot
-     * eliminate and the verifier will track as bounded [0..1023].
-     * SIP RTP data path skips this — no b64 needed for data packets. */
-#if defined(GUT_MODE_SIP)
-    if (!sip_is_rtp)
-    {
-#endif
-        {
-            __u8 *inner_pre = scratch + B64_INNER_OFF;
-            __u32 quic_hdr_pre = GUT_GOST_HEADER_SIZE;
-            __u32 wg_total_pre = wg_len + pad_len;
-            if (wg_total_pre < WG_MIN_PACKET || wg_total_pre > GUT_B64_MAX_INNER - quic_hdr_pre)
-                return TC_ACT_OK;
-            __u32 load_len;
-            asm volatile("%[out] = %[in]\n\t"
-                         "%[out] &= 1023\n\t"
-                         "if %[out] < 1 goto +0"
-                         : [out] "=r"(load_len)
-                         : [in] "r"(wg_total_pre)
-                         :);
-            if (load_len < 1 || load_len > 886)
-                return TC_ACT_OK;
-            if (bpf_skb_load_bytes(skb, wg_off, inner_pre + quic_hdr_pre, load_len) < 0)
-                return TC_ACT_OK;
-        }
-#if defined(GUT_MODE_SIP)
-    }
-#endif
-#endif
-
     __u32 *ks47 = (__u32 *)(scratch + 128);
     chacha_block(ks47, cfg->chacha_init, 47, nonce);
     __u8 *ks47_b = (__u8 *)ks47;
+
+    /* enc_ports: XOR inner WG ports with ks47[11] (domain-separated from XOR keys and PPN).*/
+    enc_ports = plain_ports ^ ks47[11];
 
     // Extract index before masking for stable connection IDs
     __u32 wg_idx = 0;
@@ -294,7 +291,6 @@ int gut_egress(struct __sk_buff *skb)
     if (bpf_skb_store_bytes(skb, wg_off, wg_head, 16, 0) < 0)
         return TC_ACT_OK;
 
-#if !defined(GUT_MODE_B64) /* mac2 XOR not needed: payload is base64-wrapped */
     if (wg_type == 1 && wg_len >= 148)
     {
         __u8 *mac2 = scratch + 192;
@@ -315,7 +311,6 @@ int gut_egress(struct __sk_buff *skb)
             bpf_skb_store_bytes(skb, wg_off + 76, mac2, 16, 0);
         }
     }
-#endif /* !GUT_MODE_B64 */
 
 #if defined(GUT_MODE_B64)
     /* ── Base64 / RTP mode: build GOST inner and encapsulate ── */
@@ -340,26 +335,21 @@ int gut_egress(struct __sk_buff *skb)
             inner[8] = 0x00;
             inner[9] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
 
-            /* WG+ballast payload was pre-loaded into inner+quic_hdr_len before chacha_block(ks47)
-             * to avoid verifier scalar range loss across noinline subprogram spills.
-             * Apply the same ks47 XOR masks to the scratch copy (must match userspace obfs_encap):
-             *   - first 16 bytes of WG header
-             *   - mac2 field for Type 1 (offset 132) and Type 2 (offset 76) */
+            /* Load already-XOR'd WG+ballast from packet into scratch.
+             * Packet has fully masked payload (first-16 + mac2 XOR done above).
+             * Use asm volatile to re-bound wg_total for verifier. */
             {
-                __u8 *wg_pre = inner + quic_hdr_len;
-                for (int i = 0; i < 16; i++)
-                    wg_pre[i] ^= ks47_b[i];
-                /* mac2 XOR — symmetric with userspace obfs_encap / obfs_decap */
-                if (wg_type == 1 && wg_len >= 148)
-                {
-                    for (int i = 0; i < 16; i++)
-                        wg_pre[132 + i] ^= ks47_b[16 + i];
-                }
-                else if (wg_type == 2 && wg_len >= 92)
-                {
-                    for (int i = 0; i < 16; i++)
-                        wg_pre[76 + i] ^= ks47_b[16 + i];
-                }
+                __u32 load_len;
+                asm volatile("%[out] = %[in]\n\t"
+                             "%[out] &= 1023\n\t"
+                             "if %[out] < 1 goto +0"
+                             : [out] "=r"(load_len)
+                             : [in] "r"(wg_total)
+                             :);
+                if (load_len < 1 || load_len > 886)
+                    return TC_ACT_OK;
+                if (bpf_skb_load_bytes(skb, wg_off, inner + quic_hdr_len, load_len) < 0)
+                    return TC_ACT_OK;
             }
 
             __u32 inner_len = quic_hdr_len + wg_total;
@@ -373,7 +363,11 @@ int gut_egress(struct __sk_buff *skb)
                 slen = 32;
             __u32 b64_hdr_max = GUT_SYSLOG_HDR_BASE + slen;
 #else /* GUT_MODE_SIP */
-        __u32 b64_hdr_max = GUT_SIP_HDR_MAX;
+        sip_hdr_len = write_sip_header(scratch + 256, cfg, wg_type, wg_len);
+        sip_hdr_len &= 0x1FF;
+        if (sip_hdr_len < 40 || sip_hdr_len > GUT_SIP_HDR_MAX)
+            return TC_ACT_OK;
+        __u32 b64_hdr_max = sip_hdr_len;
 #endif
             b64_total = b64_hdr_max + b64_len;
             /* Force bounded room: verifier loses wg_total range across ChaCha spills. */
@@ -445,9 +439,11 @@ int gut_egress(struct __sk_buff *skb)
                      :);
         if (bounded_shift < 1 || bounded_shift > 60)
             return TC_ACT_OK;
-        if (bpf_skb_load_bytes(skb, 14 + room, scratch + 256, bounded_shift) < 0)
+        /* Use scratch+192 (free in b64 mode) to avoid clobbering the
+         * SIP header already pre-built at scratch+256. */
+        if (bpf_skb_load_bytes(skb, 14 + room, scratch + 192, bounded_shift) < 0)
             return TC_ACT_OK;
-        if (bpf_skb_store_bytes(skb, 14, scratch + 256, bounded_shift, 0) < 0)
+        if (bpf_skb_store_bytes(skb, 14, scratch + 192, bounded_shift, 0) < 0)
             return TC_ACT_OK;
     }
 #else
@@ -503,16 +499,21 @@ int gut_egress(struct __sk_buff *skb)
 #elif defined(GUT_MODE_SIP)
     if (!sip_is_rtp)
     {
-        /* ── Signaling: write SIP template (2 × 512-byte chunks) + b64 payload ── */
-        __u8 *tpl0 = bpf_map_lookup_elem(&sip_tpl_map_0, &zero);
-        __u8 *tpl1 = bpf_map_lookup_elem(&sip_tpl_map_1, &zero);
-        if (!tpl0 || !tpl1)
-            return TC_ACT_OK;
-        if (bpf_skb_store_bytes(skb, new_quic_off, tpl0,
-                                GUT_SIP_TPL_CHUNK, 0) < 0)
-            return TC_ACT_OK;
-        if (bpf_skb_store_bytes(skb, new_quic_off + GUT_SIP_TPL_CHUNK, tpl1,
-                                GUT_SIP_TPL_CHUNK, 0) < 0)
+        /* ── Signaling: store pre-built SIP header + b64 payload ── */
+        {
+            __u32 hlen;
+            asm volatile("%[out] = %[in]\n\t"
+                         "%[out] &= 511\n\t"
+                         "if %[out] < 40 goto +0"
+                         : [out] "=r"(hlen)
+                         : [in] "r"(sip_hdr_len)
+                         :);
+            if (hlen < 40 || hlen > GUT_SIP_HDR_MAX)
+                return TC_ACT_OK;
+            sip_hdr_len = hlen;
+        }
+        if (bpf_skb_store_bytes(skb, new_quic_off, scratch + 256,
+                                sip_hdr_len, 0) < 0)
             return TC_ACT_OK;
         {
             __u32 slen;
@@ -524,7 +525,7 @@ int gut_egress(struct __sk_buff *skb)
                          :);
             if (slen >= 4 && slen <= GUT_B64_MAX_OUT)
             {
-                if (bpf_skb_store_bytes(skb, new_quic_off + GUT_SIP_HDR_MAX,
+                if (bpf_skb_store_bytes(skb, new_quic_off + sip_hdr_len,
                                         scratch + B64_ENC_OFF, slen, 0) < 0)
                     return TC_ACT_OK;
             }
@@ -546,7 +547,7 @@ int gut_egress(struct __sk_buff *skb)
         rtp_gost[5] = (ts >> 16) & 0xFF;
         rtp_gost[6] = (ts >> 8) & 0xFF;
         rtp_gost[7] = ts & 0xFF;
-        __u32 dcid = feistel32(wg_idx, cfg->feistel_rk);
+        __u32 dcid = ks47[9]; /* ks47[9]: unused word, keyed by nonce+shared key */
         __builtin_memcpy(rtp_gost + 8, &dcid, 4);
         /* GOST header: PPN(4) + enc_ports(4) + 0x00 + pad_byte */
         __builtin_memcpy(rtp_gost + 12, &ppn, 4);
@@ -560,38 +561,9 @@ int gut_egress(struct __sk_buff *skb)
          * WG data starts at new_quic_off + 22. */
         if (bpf_skb_store_bytes(skb, new_quic_off, rtp_gost, 22, 0) < 0)
             return TC_ACT_OK;
-
-        /* XOR and store the first 16 bytes of WG header in the new position */
-        {
-            __u8 wg16[16];
-            __builtin_memcpy(wg16, wg_head, 16);
-            for (int i = 0; i < 16; i++)
-                wg16[i] ^= ks47_b[i];
-            if (bpf_skb_store_bytes(skb, new_quic_off + 22, wg16, 16, 0) < 0)
-                return TC_ACT_OK;
-        }
-
-        /* XOR mac2 if present */
-        if (wg_type == 1 && wg_len >= 148)
-        {
-            __u8 mac2[16];
-            if (bpf_skb_load_bytes(skb, new_quic_off + 22 + 132, mac2, 16) == 0)
-            {
-                for (int i = 0; i < 16; i++)
-                    mac2[i] ^= ks47_b[16 + i];
-                bpf_skb_store_bytes(skb, new_quic_off + 22 + 132, mac2, 16, 0);
-            }
-        }
-        else if (wg_type == 2 && wg_len >= 92)
-        {
-            __u8 mac2[16];
-            if (bpf_skb_load_bytes(skb, new_quic_off + 22 + 76, mac2, 16) == 0)
-            {
-                for (int i = 0; i < 16; i++)
-                    mac2[i] ^= ks47_b[16 + i];
-                bpf_skb_store_bytes(skb, new_quic_off + 22 + 76, mac2, 16, 0);
-            }
-        }
+        /* WG payload (including first-16 XOR and mac2 XOR) is already
+         * in-place at new_quic_off+22 after adjust_room + header shift.
+         * No additional masking needed — unified GOST prep above. */
     }
 #elif defined(GUT_MODE_GOST)
     __u8 *quic = (__u8 *)data + new_quic_off;
@@ -600,7 +572,7 @@ int gut_egress(struct __sk_buff *skb)
     __u8 *quic = (__u8 *)data + new_quic_off;
     if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
     {
-        __u32 dcid = feistel32(wg_idx, cfg->feistel_rk);
+        __u32 dcid = ks47[9]; /* per-packet keyed value, no need for Feistel PRP */
         write_quic_short_header(quic, data_end, dcid, ppn, enc_ports, pad_len);
     }
     else
