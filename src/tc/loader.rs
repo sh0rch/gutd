@@ -249,24 +249,6 @@ impl EgressSkel {
         Ok(())
     }
 
-    fn update_sip_tpl_map_0(&self, key: &[u8], value: &[u8]) -> crate::Result<()> {
-        match self {
-            Self::SipV4(s) => s.maps.sip_tpl_map_0.update(key, value, MapFlags::ANY)?,
-            Self::SipV6(s) => s.maps.sip_tpl_map_0.update(key, value, MapFlags::ANY)?,
-            _ => return Err("Not in SIP mode".into()),
-        }
-        Ok(())
-    }
-
-    fn update_sip_tpl_map_1(&self, key: &[u8], value: &[u8]) -> crate::Result<()> {
-        match self {
-            Self::SipV4(s) => s.maps.sip_tpl_map_1.update(key, value, MapFlags::ANY)?,
-            Self::SipV6(s) => s.maps.sip_tpl_map_1.update(key, value, MapFlags::ANY)?,
-            _ => return Err("Not in SIP mode".into()),
-        }
-        Ok(())
-    }
-
     fn update_counters_map(&self, initial_seq: u32) -> crate::Result<()> {
         let bytes = initial_seq.to_ne_bytes();
         match self {
@@ -374,24 +356,6 @@ impl EgressSkel {
             Self::SyslogV6(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
             Self::SipV4(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
             Self::SipV6(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
-        }
-    }
-
-    fn get_sip_tpl_map_0_fd(&self) -> Option<std::os::unix::io::BorrowedFd<'_>> {
-        use std::os::unix::io::AsFd;
-        match self {
-            Self::SipV4(s) => Some(s.maps.sip_tpl_map_0.as_fd()),
-            Self::SipV6(s) => Some(s.maps.sip_tpl_map_0.as_fd()),
-            _ => None,
-        }
-    }
-
-    fn get_sip_tpl_map_1_fd(&self) -> Option<std::os::unix::io::BorrowedFd<'_>> {
-        use std::os::unix::io::AsFd;
-        match self {
-            Self::SipV4(s) => Some(s.maps.sip_tpl_map_1.as_fd()),
-            Self::SipV6(s) => Some(s.maps.sip_tpl_map_1.as_fd()),
-            _ => None,
         }
     }
 }
@@ -662,52 +626,6 @@ impl TcBpfManager {
             crate::config::ObfsMode::Sip => load_ingress!(xdp_gut_ingress_sip),
             _ => load_ingress!(xdp_gut_ingress),
         };
-
-        // ── Populate SIP template map (if SIP mode) ──────────────────────
-        if obfs_mode == crate::config::ObfsMode::Sip {
-            let tpl = Self::build_sip_template(config);
-            assert!(tpl.len() == 1024, "SIP template must be exactly 1024 bytes");
-            let (chunk0, chunk1) = tpl.split_at(512);
-
-            if let Some(fd) = egress_skel.get_sip_tpl_map_0_fd() {
-                use std::os::unix::io::AsRawFd;
-                let map_fd: i32 = fd.as_raw_fd();
-                let key = 0u32.to_ne_bytes();
-                let attr = libbpf_rs::MapFlags::ANY;
-                unsafe {
-                    let r = libbpf_rs::libbpf_sys::bpf_map_update_elem(
-                        map_fd,
-                        key.as_ptr().cast(),
-                        chunk0.as_ptr().cast(),
-                        attr.bits(),
-                    );
-                    if r != 0 {
-                        return Err(format!("Failed to update egress sip_tpl_map_0: {r}").into());
-                    }
-                }
-            }
-            if let Some(fd) = egress_skel.get_sip_tpl_map_1_fd() {
-                use std::os::unix::io::AsRawFd;
-                let map_fd: i32 = fd.as_raw_fd();
-                let key = 0u32.to_ne_bytes();
-                let attr = libbpf_rs::MapFlags::ANY;
-                unsafe {
-                    let r = libbpf_rs::libbpf_sys::bpf_map_update_elem(
-                        map_fd,
-                        key.as_ptr().cast(),
-                        chunk1.as_ptr().cast(),
-                        attr.bits(),
-                    );
-                    if r != 0 {
-                        return Err(format!("Failed to update egress sip_tpl_map_1: {r}").into());
-                    }
-                }
-            }
-            eprintln!(
-                "  SIP template: {} bytes written to sip_tpl_map_0/1 (2x512)",
-                tpl.len()
-            );
-        }
 
         let xdp_mode = Self::detect_xdp_mode(&ingress_ifname);
         let mode_name = match obfs_mode {
@@ -1618,145 +1536,6 @@ impl TcBpfManager {
         Ok(gut_config)
     }
 
-    /// Build a full 1024-byte SIP MESSAGE + SDP template for BPF sip_tpl_map_0/1.
-    ///
-    /// The template ends with `a=fmtp:0 ` marker; BPF appends base64 payload after it.
-    /// Feistel-derived hashes in branch/tag/Call-ID allow friend-or-foe verification:
-    /// the Date header is the salt — receiver extracts its digits, recomputes feistel,
-    /// and compares with Call-ID/branch values.  Matches verify_auth_token_from_timestamp().
-    #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
-    fn build_sip_template(config: &Config) -> Vec<u8> {
-        use std::io::Write;
-        const GUT_SIP_HDR_MAX: usize = 1024;
-
-        let domain = &config.peer().sip_domain;
-        let bind_ip = config.peer().bind_ip;
-        let p2p_info = crate::tun::compute_p2p_peer(&config.peer().address).ok();
-        let (src_ip_str, dst_ip_str) = match p2p_info {
-            Some((s, d, _)) => (s, d),
-            None => (bind_ip.to_string(), "10.0.0.1".to_string()),
-        };
-
-        let sport = config.peer().bind_port;
-        let dport = config.peer().ports.first().copied().unwrap_or(5060);
-        let rtp_port = config.peer().ports.get(1).copied().unwrap_or(10000);
-
-        // ── Feistel round keys (same derivation as BPF config and userspace) ──
-        let feistel_rk =
-            crate::tc::maps::compute_feistel_rk(&config.peer().key, crate::tc::maps::CHACHA_ROUNDS);
-
-        // ── Current time → Date header (acts as salt for feistel hashes) ──
-        let timestamp_us = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as u64;
-        let now_secs = timestamp_us / 1_000_000;
-
-        // Calendar date (same algorithm as format_sip_date_only / update_cached_date)
-        let date_str = crate::tc::maps::format_sip_date_only(now_secs);
-
-        // Time of day with microseconds (same format as sip::write_header)
-        let time_of_day_us = timestamp_us % 86_400_000_000;
-        let hour = (time_of_day_us / 3_600_000_000) as u8;
-        let minute = ((time_of_day_us % 3_600_000_000) / 60_000_000) as u8;
-        let second = ((time_of_day_us % 60_000_000) / 1_000_000) as u8;
-        let microsecond = (time_of_day_us % 1_000_000) as u32;
-
-        // Full Date header value: "Dow, DD Mon YYYY HH:MM:SS.UUUUUU GMT"
-        let date_value = format!(
-            "{}, {:02}:{:02}:{:02}.{:06} GMT",
-            date_str, hour, minute, second, microsecond
-        );
-
-        // Extract all digits from date_value → numeric salt
-        let date_numeric: u64 = date_value
-            .bytes()
-            .filter(|b| b.is_ascii_digit())
-            .fold(0u64, |acc, b| {
-                acc.saturating_mul(10).saturating_add((b - b'0') as u64)
-            });
-
-        // Use 100ms granularity (last 4 digits / 10000) to match verify_auth_token_from_timestamp
-        let ts_100ms = (date_numeric / 10000) as u32;
-        let auth_token = crate::proto::feistel::feistel32(ts_100ms, &feistel_rk);
-        let from_tag_val = crate::proto::feistel::feistel32(
-            ((timestamp_us / 1000) ^ sport as u64) as u32,
-            &feistel_rk,
-        );
-        let session_id = timestamp_us / 1000;
-        let cseq_num = ((timestamp_us / 1000) % 1000) + 1;
-
-        // ── Build SIP MESSAGE template ──
-        let mut buf = vec![0u8; GUT_SIP_HDR_MAX];
-        let mut cursor = std::io::Cursor::new(&mut buf[..]);
-
-        write!(cursor, "MESSAGE sip:{dport}@{domain}:{dport} SIP/2.0\r\n").unwrap();
-        write!(
-            cursor,
-            "Via: SIP/2.0/UDP {src_ip_str}:{sport};branch=z9hG4bK-{auth_token:08x}\r\n"
-        )
-        .unwrap();
-        write!(cursor, "Max-Forwards: 70\r\n").unwrap();
-        write!(
-            cursor,
-            "From: <sip:{sport}@{domain}>;tag={from_tag_val:08x}\r\n"
-        )
-        .unwrap();
-        write!(cursor, "To: <sip:{dport}@{domain}>\r\n").unwrap();
-        write!(cursor, "Call-ID: {auth_token:08x}@{domain}\r\n").unwrap();
-        write!(cursor, "CSeq: {cseq_num} MESSAGE\r\n").unwrap();
-        write!(cursor, "Contact: <sip:{sport}@{src_ip_str}:{sport}>\r\n").unwrap();
-        write!(cursor, "User-Agent: Asterisk PBX 16.2.0\r\n").unwrap();
-        write!(cursor, "Date: {date_value}\r\n").unwrap();
-        write!(cursor, "Allow: INVITE, ACK, CANCEL, OPTIONS, BYE, REFER, SUBSCRIBE, NOTIFY, INFO, PUBLISH, MESSAGE\r\n").unwrap();
-        write!(cursor, "Content-Type: application/sdp\r\n").unwrap();
-
-        let cl_pos = cursor.position() as usize + "Content-Length: ".len();
-        write!(cursor, "Content-Length: 0000\r\n\r\n").unwrap();
-        let header_end_pos = cursor.position() as usize;
-
-        // Full SDP body matching userspace sdp_preamble format
-        write!(cursor, "v=0\r\n").unwrap();
-        write!(
-            cursor,
-            "o=- {session_id} {session_id} IN IP4 {src_ip_str}\r\n"
-        )
-        .unwrap();
-        write!(cursor, "s=SIP Call\r\n").unwrap();
-        write!(cursor, "c=IN IP4 {dst_ip_str}\r\n").unwrap();
-        write!(cursor, "t=0 0\r\n").unwrap();
-        write!(cursor, "m=audio {rtp_port} RTP/AVP 0 8\r\n").unwrap();
-        write!(cursor, "a=rtpmap:0 PCMU/8000\r\n").unwrap();
-        write!(cursor, "a=rtpmap:8 PCMA/8000\r\n").unwrap();
-        write!(cursor, "a=ptime:20\r\n").unwrap();
-        write!(cursor, "a=sendrecv\r\n").unwrap();
-        write!(cursor, "a=fmtp:0 ").unwrap();
-
-        let sdp_prefix_len = cursor.position() as usize;
-        let padding = GUT_SIP_HDR_MAX.saturating_sub(sdp_prefix_len);
-
-        // Fill remaining bytes to exactly 1024 to make the marker position stable
-        for _ in 0..padding {
-            write!(cursor, " ").unwrap();
-        }
-
-        let total = cursor.position() as usize;
-
-        // Ensure Content-Length covers the full payload (SDP + max Base64)
-        let final_sdp_len = total - header_end_pos + 1200;
-        let cl_str = format!("{:4}", final_sdp_len);
-        buf[cl_pos..cl_pos + 4].copy_from_slice(cl_str.as_bytes());
-
-        eprintln!(
-            "  SIP template built: {} bytes (padding={}, auth={:08x}, tag={:08x})",
-            buf.len(),
-            padding,
-            auth_token,
-            from_tag_val
-        );
-        buf
-    }
-
     #[cfg(target_os = "linux")]
     fn probe_offload_flags(ifname: &str) -> u16 {
         let disable_l4_csum = std::env::var("GUTD_FORCE_L4_CSUM")
@@ -1783,15 +1562,6 @@ impl TcBpfManager {
         let gut_config = Self::build_gut_config(config, &self.interface, &self.ingress_interface)?;
 
         self.egress_skel.update_config_map(&gut_config)?;
-
-        #[cfg(feature = "tc_ebpf")]
-        if config.peer().obfs == crate::config::ObfsMode::Sip {
-            let tpl_data = Self::build_sip_template(config);
-            let (chunk0, chunk1) = tpl_data.split_at(512);
-            let key = 0u32.to_ne_bytes();
-            self.egress_skel.update_sip_tpl_map_0(&key, chunk0)?;
-            self.egress_skel.update_sip_tpl_map_1(&key, chunk1)?;
-        }
 
         let outer_af = if self.egress_skel.is_v6() {
             "IPv6"

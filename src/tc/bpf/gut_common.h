@@ -44,8 +44,8 @@
 #define GUT_GOST_HEADER_SIZE 10
 #define GUT_SYSLOG_HDR_BASE 36 /* "<165>1 YYYY-MM-DDTHH:MM:SSZ " + " - - -  " = 28 + 8 */
 #define GUT_SYSLOG_HDR_MAX 68  /* 36 + max sni_domain_len(32) */
-#define GUT_SIP_HDR_MAX 1024   /* Full SIP header template (2 × 512 map chunks, loader fills) */
-#define GUT_SIP_TPL_CHUNK 512  /* Each sip_tpl_map chunk size */
+#define GUT_SIP_HDR_BASE 182   /* Fixed bytes in write_sip_header() (excl. 2 × sni_domain) */
+#define GUT_SIP_HDR_MAX 256    /* Max SIP header: GUT_SIP_HDR_BASE + 2*32 + margin */
 #define GUT_RTP_HEADER_SIZE 12 /* RTP header: V(1)+PT(1)+seq(2)+ts(4)+SSRC(4) */
 #define GUT_B64_MAX_INNER 896  /* max inner before b64: GOST_HDR(10) + wg(800) + pad(64) */
 #define GUT_B64_MAX_OUT 1200   /* ceil(896/3)*4 = 1200 */
@@ -119,7 +119,6 @@ struct gut_config
     __u32 partial_ip_csum;       /* Precomputed partial IP header checksum (fixed fields) */
     __u8 default_xdp_action;     /* XDP action for non-GUT packets: 0=XDP_PASS, 1=XDP_DROP */
     __u8 keepalive_drop_percent; /* Keepalive drop probability in % (0..100) */
-    __u32 feistel_rk[4];         /* Feistel32 round keys (derived from key via ChaCha) */
     __u8 peer_ip6[16];           /* Peer IPv6 address (network byte order, zero if v4) */
     __u8 bind_ip6[16];           /* Local bind IPv6 (network byte order, zero if v4) */
     __u32 tun_local_ip4;         /* Local veth (gut0) IP — XDP ingress rewrites dst to this */
@@ -239,28 +238,6 @@ struct
     __type(key, __u32);
     __type(value, __u32);
 } session_map SEC(".maps");
-
-#if defined(GUT_MODE_SIP)
-/* Pre-built SIP header template split across 2 maps (loader fills with
- * realistic SIP+SDP, total GUT_SIP_HDR_MAX bytes, ends with "a=fmtp:0 " marker).
- * Two maps of GUT_SIP_TPL_CHUNK bytes each — allows bpf_skb_store_bytes with
- * compile-time constant lengths. */
-struct
-{
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, __u8[GUT_SIP_TPL_CHUNK]);
-} sip_tpl_map_0 SEC(".maps");
-
-struct
-{
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, __u8[GUT_SIP_TPL_CHUNK]);
-} sip_tpl_map_1 SEC(".maps");
-#endif
 
 /* Compile-time ChaCha round count.  Override at build via -DCHACHA_ROUNDS=N.
  * Must match between sender and receiver BPF programs.
@@ -605,18 +582,6 @@ static __always_inline __u16 select_port(__u32 pkt_id, const struct gut_config *
     return cfg->ports[idx];
 }
 
-/* ── Feistel32: 4-round balanced Feistel network (u32 → u32 PRP) ─────
- *
- * Bijection on [0, 2^32): every input maps to a unique output.
- * Used to generate pseudorandom wire nonce and pkt_id from a monotonic
- * sequence counter — unpredictable without key knowledge, yet unique.
- *
- * Salt constants for domain separation: different salts produce
- * independent permutations from the same round keys. */
-#define FEISTEL_SALT_PKT_ID 0x9E3779B9u  /* golden ratio × 2^32 */
-#define FEISTEL_SALT_BALLAST 0x517CC1B7u /* sqrt(3) × 2^32 */
-#define FEISTEL_SALT_PORTS 0xB7E15163u   /* 2π × 2^31 — domain for port encryption */
-
 static __always_inline __u32 sip_hash32(__u32 x, const __u32 rk[4])
 {
     __u32 h = x;
@@ -633,47 +598,6 @@ static __always_inline __u32 sip_hash32(__u32 x, const __u32 rk[4])
     h *= 0xc2b2ae35;
     h ^= h >> 16;
     return h;
-}
-
-static __always_inline __u32 feistel32(__u32 x, const __u32 rk[4])
-{
-    __u16 lo = (__u16)(x & 0xFFFF);
-    __u16 hi = (__u16)(x >> 16);
-
-#pragma unroll
-    for (int i = 0; i < 4; i++)
-    {
-        __u32 f = ((__u32)lo * 0x9E37 + rk[i]) ^ ((__u32)lo << 3) ^ ((__u32)lo >> 5);
-        __u16 new_lo = hi ^ (__u16)(f & 0xFFFF);
-        hi = lo;
-        lo = new_lo;
-    }
-
-    return ((__u32)hi << 16) | (__u32)lo;
-}
-
-/* ── feistel32_inv: exact inverse of feistel32 ────────────────────────
- *
- * Forward round: {lo, hi} → {hi ^ F(lo), lo}
- * Inverse round: given {lo', hi'} = {hi^F(lo_old), lo_old}
- *   lo_old = hi'   →   hi_old = lo' ^ F(hi')
- * Decrypt: run rounds in reverse order with same round-function. */
-static __always_inline __u32 feistel32_inv(__u32 x, const __u32 rk[4])
-{
-    __u16 lo = (__u16)(x & 0xFFFF);
-    __u16 hi = (__u16)(x >> 16);
-
-#pragma unroll
-    for (int i = 3; i >= 0; i--)
-    {
-        __u16 lo_old = hi;
-        __u32 f = ((__u32)hi * 0x9E37 + rk[i]) ^ ((__u32)hi << 3) ^ ((__u32)hi >> 5);
-        __u16 hi_old = lo ^ (__u16)(f & 0xFFFF);
-        lo = lo_old;
-        hi = hi_old;
-    }
-
-    return ((__u32)hi << 16) | (__u32)lo;
 }
 
 /* Compiler barriers for BPF verifier (technique from libbpf_wgobfs) */
@@ -2207,6 +2131,288 @@ static __always_inline __u32 write_syslog_ascii(__u8 *buf, struct gut_config *cf
     return j + 8;
 }
 
+/* Write dynamic SIP header for obfuscation.
+ * wg_type mapping (matches userspace):
+ *   1 → REGISTER, 2 → SIP/2.0 200 OK, 3 → SIP/2.0 401 Unauthorized,
+ *   4 (keepalive, len==32) → OPTIONS, else → MESSAGE.
+ * Returns total bytes written, ending right after "a=fmtp:0 " marker.
+ * Auth token in Via branch = sip_hash32(date_digits / 10000, chacha_init+4). */
+static __always_inline __u32 write_sip_header(__u8 *buf, struct gut_config *cfg,
+                                              __u8 wg_type, __u32 wg_len)
+{
+    __u32 off = 0;
+    __u32 slen = cfg->sni_domain_len;
+    if (slen > 32)
+        slen = 32;
+
+    /* ── Timestamp (TAI → UTC) ── */
+    __u64 ns = bpf_ktime_get_tai_ns();
+    __u64 secs = ns / 1000000000ULL - 37;
+    __u32 tod = (__u32)(secs % 86400);
+    __u32 hour = tod / 3600;
+    __u32 min = (tod % 3600) / 60;
+    __u32 sec = tod % 60;
+    __u32 us = (__u32)((ns / 1000) % 1000000);
+
+    /* Civil date (Howard Hinnant) */
+    __u32 days_since_epoch = (__u32)(secs / 86400);
+    __u32 z = days_since_epoch + 719468;
+    __u32 era = z / 146097;
+    __u32 doe = z - era * 146097;
+    __u32 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    __u32 y = yoe + era * 400;
+    __u32 doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    __u32 mp = (5 * doy + 2) / 153;
+    __u32 d = doy - (153 * mp + 2) / 5 + 1;
+    __u32 m = mp < 10 ? mp + 3 : mp - 9;
+    if (m <= 2)
+        y++;
+
+    /* Day of week: 1970-01-01 = Thursday; Mon=0 */
+    __u32 dow = (days_since_epoch + 3) % 7;
+
+    /* date_numeric: all digits from "Dow, DD Mon YYYY HH:MM:SS.UUUUUU GMT"
+     * left to right — must match ingress sip_date_extract_cb. */
+    __u64 date_numeric = (__u64)d * 10000000000000000ULL + (__u64)y * 1000000000000ULL + (__u64)hour * 10000000000ULL + (__u64)min * 100000000ULL + (__u64)sec * 1000000ULL + (__u64)us;
+    __u32 ts_100ms = (__u32)(date_numeric / 10000);
+    __u32 auth_token = sip_hash32(ts_100ms, cfg->chacha_init + 4);
+
+    /* ── Request/status line (depends on WG type) ── */
+    if (wg_type == 1)
+    {
+        /* REGISTER sip:DOMAIN SIP/2.0\r\n */
+        __builtin_memcpy(buf, "REGISTER sip:", 13);
+        off = 13;
+        for (int i = 0; i < 32; i++)
+        {
+            if (i >= slen)
+                break;
+            buf[off + i] = cfg->sni_domain[i];
+        }
+        off += slen;
+        __builtin_memcpy(buf + off, " SIP/2.0\r\n", 10);
+        off += 10;
+    }
+    else if (wg_type == 2)
+    {
+        /* SIP/2.0 200 OK\r\n */
+        __builtin_memcpy(buf, "SIP/2.0 200 OK\r\n", 17);
+        off = 17;
+    }
+    else if (wg_type == 3)
+    {
+        /* SIP/2.0 401 Unauthorized\r\n */
+        __builtin_memcpy(buf, "SIP/2.0 401 Unauthorized\r\n", 26);
+        off = 26;
+    }
+    else if (wg_type == 4 && wg_len == 32)
+    {
+        /* OPTIONS sip:5060@DOMAIN SIP/2.0\r\n */
+        __builtin_memcpy(buf, "OPTIONS sip:5060@", 17);
+        off = 17;
+        for (int i = 0; i < 32; i++)
+        {
+            if (i >= slen)
+                break;
+            buf[off + i] = cfg->sni_domain[i];
+        }
+        off += slen;
+        __builtin_memcpy(buf + off, " SIP/2.0\r\n", 10);
+        off += 10;
+    }
+    else
+    {
+        /* MESSAGE sip:5060@DOMAIN SIP/2.0\r\n */
+        __builtin_memcpy(buf, "MESSAGE sip:5060@", 17);
+        off = 17;
+        for (int i = 0; i < 32; i++)
+        {
+            if (i >= slen)
+                break;
+            buf[off + i] = cfg->sni_domain[i];
+        }
+        off += slen;
+        __builtin_memcpy(buf + off, " SIP/2.0\r\n", 10);
+        off += 10;
+    }
+
+    /* ── Via: SIP/2.0/UDP DOMAIN;branch=z9hG4bK-XXXXXXXX\r\n ── */
+    __builtin_memcpy(buf + off, "Via: SIP/2.0/UDP ", 17);
+    off += 17;
+    for (int i = 0; i < 32; i++)
+    {
+        if (i >= slen)
+            break;
+        buf[off + i] = cfg->sni_domain[i];
+    }
+    off += slen;
+    __builtin_memcpy(buf + off, ";branch=z9hG4bK-", 16);
+    off += 16;
+    /* Auth token: 8 hex chars */
+    {
+        __u32 tok = auth_token;
+        for (int i = 7; i >= 0; i--)
+        {
+            __u32 nib = tok & 0xF;
+            buf[off + i] = (nib < 10) ? ('0' + nib) : ('a' + nib - 10);
+            tok >>= 4;
+        }
+    }
+    off += 8;
+    buf[off++] = '\r';
+    buf[off++] = '\n';
+
+    /* ── Date: Dow, DD Mon YYYY HH:MM:SS.UUUUUU GMT\r\n ── */
+    __builtin_memcpy(buf + off, "Date: ", 6);
+    off += 6;
+
+    /* Day-of-week name */
+    switch (dow % 7)
+    {
+    case 0:
+        buf[off] = 'M';
+        buf[off + 1] = 'o';
+        buf[off + 2] = 'n';
+        break;
+    case 1:
+        buf[off] = 'T';
+        buf[off + 1] = 'u';
+        buf[off + 2] = 'e';
+        break;
+    case 2:
+        buf[off] = 'W';
+        buf[off + 1] = 'e';
+        buf[off + 2] = 'd';
+        break;
+    case 3:
+        buf[off] = 'T';
+        buf[off + 1] = 'h';
+        buf[off + 2] = 'u';
+        break;
+    case 4:
+        buf[off] = 'F';
+        buf[off + 1] = 'r';
+        buf[off + 2] = 'i';
+        break;
+    case 5:
+        buf[off] = 'S';
+        buf[off + 1] = 'a';
+        buf[off + 2] = 't';
+        break;
+    default:
+        buf[off] = 'S';
+        buf[off + 1] = 'u';
+        buf[off + 2] = 'n';
+        break;
+    }
+    off += 3;
+    buf[off++] = ',';
+    buf[off++] = ' ';
+
+    buf[off++] = '0' + d / 10;
+    buf[off++] = '0' + d % 10;
+    buf[off++] = ' ';
+
+    /* Month name */
+    switch ((m - 1) % 12)
+    {
+    case 0:
+        buf[off] = 'J';
+        buf[off + 1] = 'a';
+        buf[off + 2] = 'n';
+        break;
+    case 1:
+        buf[off] = 'F';
+        buf[off + 1] = 'e';
+        buf[off + 2] = 'b';
+        break;
+    case 2:
+        buf[off] = 'M';
+        buf[off + 1] = 'a';
+        buf[off + 2] = 'r';
+        break;
+    case 3:
+        buf[off] = 'A';
+        buf[off + 1] = 'p';
+        buf[off + 2] = 'r';
+        break;
+    case 4:
+        buf[off] = 'M';
+        buf[off + 1] = 'a';
+        buf[off + 2] = 'y';
+        break;
+    case 5:
+        buf[off] = 'J';
+        buf[off + 1] = 'u';
+        buf[off + 2] = 'n';
+        break;
+    case 6:
+        buf[off] = 'J';
+        buf[off + 1] = 'u';
+        buf[off + 2] = 'l';
+        break;
+    case 7:
+        buf[off] = 'A';
+        buf[off + 1] = 'u';
+        buf[off + 2] = 'g';
+        break;
+    case 8:
+        buf[off] = 'S';
+        buf[off + 1] = 'e';
+        buf[off + 2] = 'p';
+        break;
+    case 9:
+        buf[off] = 'O';
+        buf[off + 1] = 'c';
+        buf[off + 2] = 't';
+        break;
+    case 10:
+        buf[off] = 'N';
+        buf[off + 1] = 'o';
+        buf[off + 2] = 'v';
+        break;
+    default:
+        buf[off] = 'D';
+        buf[off + 1] = 'e';
+        buf[off + 2] = 'c';
+        break;
+    }
+    off += 3;
+    buf[off++] = ' ';
+
+    buf[off++] = '0' + (y / 1000) % 10;
+    buf[off++] = '0' + (y / 100) % 10;
+    buf[off++] = '0' + (y / 10) % 10;
+    buf[off++] = '0' + y % 10;
+    buf[off++] = ' ';
+
+    buf[off++] = '0' + hour / 10;
+    buf[off++] = '0' + hour % 10;
+    buf[off++] = ':';
+    buf[off++] = '0' + min / 10;
+    buf[off++] = '0' + min % 10;
+    buf[off++] = ':';
+    buf[off++] = '0' + sec / 10;
+    buf[off++] = '0' + sec % 10;
+    buf[off++] = '.';
+    buf[off++] = '0' + (us / 100000) % 10;
+    buf[off++] = '0' + (us / 10000) % 10;
+    buf[off++] = '0' + (us / 1000) % 10;
+    buf[off++] = '0' + (us / 100) % 10;
+    buf[off++] = '0' + (us / 10) % 10;
+    buf[off++] = '0' + us % 10;
+    __builtin_memcpy(buf + off, " GMT\r\n", 6);
+    off += 6;
+
+    /* ── Content-Type + empty line + SDP + marker ── */
+    __builtin_memcpy(buf + off, "Content-Type: application/sdp\r\n\r\n", 33);
+    off += 33;
+    __builtin_memcpy(buf + off, "v=0\r\nm=audio 0 RTP/AVP 0\r\na=fmtp:0 ", 35);
+    off += 35;
+
+    return off;
+}
+
 static __always_inline void write_quic_short_header(__u8 *quic, void *data_end, __u32 dcid, __u32 ppn, __u32 enc_ports, __u32 pad_len)
 {
     if ((__u8 *)quic + GUT_QUIC_SHORT_HEADER_SIZE > (__u8 *)data_end)
@@ -2227,7 +2433,7 @@ static __always_inline void write_quic_long_header(__u8 *quic, void *data_end, _
         return;
 
     /* Fill entire header with PRNG first */
-    __u32 time_gost = feistel32((__u32)bpf_ktime_get_ns(), cfg->feistel_rk);
+    __u32 time_gost = sip_hash32((__u32)bpf_ktime_get_ns(), cfg->chacha_init + 4);
     __u8 gb0 = (__u8)(time_gost);
     __u8 gb1 = (__u8)(time_gost >> 8);
     __u8 gb2 = (__u8)(time_gost >> 16);
@@ -2252,7 +2458,7 @@ static __always_inline void write_quic_long_header(__u8 *quic, void *data_end, _
     /* SCID: PPN (host-order) in first 4 bytes for ingress fast-path, rest random */
     quic[14] = 0x08;
     __builtin_memcpy(quic + 15, &ppn, 4);
-    __u32 scid2 = feistel32(wg_idx ^ 0x12345678, cfg->feistel_rk);
+    __u32 scid2 = sip_hash32(wg_idx ^ 0x12345678, cfg->chacha_init + 4);
     __builtin_memcpy(quic + 19, &scid2, 4);
 
     /* Token: enc_ports (4 bytes, readable without AEAD decryption) */
