@@ -166,7 +166,52 @@ fn compile_tc_ebpf() {
         .build_and_generate(&ingress_syslog_skel)
         .expect("Failed to generate XDP ingress Syslog skeleton");
 
-    println!("cargo:warning=TC eBPF skeletons generated successfully (QUIC + Gost + Syslog)");
+    // ── SIP mode skeletons ────────────────────────────────────────
+
+    // Generate skeleton for egress SIP mode (outer IPv4)
+    let egress_sip_skel = out_dir.join("tc_gut_egress_sip.skel.rs");
+    SkeletonBuilder::new()
+        .source("src/tc/bpf/tc_gut_egress.bpf.c")
+        .clang_args([
+            "-I",
+            "src/tc/bpf",
+            &chacha_define,
+            "-DGUT_MODE_SIP",
+            &arch_include,
+        ])
+        .build_and_generate(&egress_sip_skel)
+        .expect("Failed to generate TC egress SIP (v4) skeleton");
+
+    // Generate skeleton for egress SIP mode (outer IPv6)
+    let egress_sip_v6_skel = out_dir.join("tc_gut_egress_sip_v6.skel.rs");
+    SkeletonBuilder::new()
+        .source("src/tc/bpf/tc_gut_egress.bpf.c")
+        .clang_args([
+            "-I",
+            "src/tc/bpf",
+            &chacha_define,
+            "-DGUT_MODE_SIP",
+            "-DGUT_OUTER_IPV6",
+            &arch_include,
+        ])
+        .build_and_generate(&egress_sip_v6_skel)
+        .expect("Failed to generate TC egress SIP (v6) skeleton");
+
+    // Generate skeleton for XDP ingress SIP mode
+    let ingress_sip_skel = out_dir.join("xdp_gut_ingress_sip.skel.rs");
+    SkeletonBuilder::new()
+        .source("src/tc/bpf/xdp_gut_ingress.bpf.c")
+        .clang_args([
+            "-I",
+            "src/tc/bpf",
+            &chacha_define,
+            "-DGUT_MODE_SIP",
+            &arch_include,
+        ])
+        .build_and_generate(&ingress_sip_skel)
+        .expect("Failed to generate XDP ingress SIP skeleton");
+
+    println!("cargo:warning=TC eBPF skeletons generated successfully (QUIC + Gost + Syslog + SIP)");
 }
 
 fn get_git_version() -> Option<String> {

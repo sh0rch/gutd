@@ -28,8 +28,14 @@ jobs:
     with:
       update_readme: false
 
+  ndpi-evasion:
+    needs: build
+    uses: ./.github/workflows/ndpi-evasion.yml
+    with:
+      skip_build: true
+
   verify_and_prepare:
-    needs: [build, integration-test]
+    needs: [build, integration-test, ndpi-evasion]
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4

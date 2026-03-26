@@ -36,7 +36,8 @@ BPF_CFLAGS += -Wno-unused-value -Wno-pointer-sign -Wno-compare-distinct-pointer-
 QUIC_TARGETS := tc_gut_egress.o xdp_gut_ingress.o
 GOST_TARGETS := tc_gut_egress_gost.o xdp_gut_ingress_gost.o
 SYSLOG_TARGETS := tc_gut_egress_syslog.o xdp_gut_ingress_syslog.o
-TARGETS := $(QUIC_TARGETS) $(GOST_TARGETS) $(SYSLOG_TARGETS)
+SIP_TARGETS := tc_gut_egress_sip.o xdp_gut_ingress_sip.o
+TARGETS := $(QUIC_TARGETS) $(GOST_TARGETS) $(SYSLOG_TARGETS) $(SIP_TARGETS)
 
 .PHONY: all clean debug verify
 
@@ -67,6 +68,15 @@ tc_gut_egress_syslog.o: tc_gut_egress.bpf.c gut_common.h
 
 xdp_gut_ingress_syslog.o: xdp_gut_ingress.bpf.c gut_common.h
 	$(CLANG) $(BPF_CFLAGS) -DGUT_MODE_SYSLOG -c $< -o $@
+	$(LLVM_STRIP) -g $@
+
+# ── SIP mode ──
+tc_gut_egress_sip.o: tc_gut_egress.bpf.c gut_common.h
+	$(CLANG) $(BPF_CFLAGS) -DGUT_MODE_SIP -c $< -o $@
+	$(LLVM_STRIP) -g $@
+
+xdp_gut_ingress_sip.o: xdp_gut_ingress.bpf.c gut_common.h
+	$(CLANG) $(BPF_CFLAGS) -DGUT_MODE_SIP -c $< -o $@
 	$(LLVM_STRIP) -g $@
 
 # Debug build: enables bpf_debug() → bpf_printk traces visible in trace_pipe.
@@ -101,4 +111,12 @@ verify: $(TARGETS)
 	@echo "=== Verifying TC egress (Syslog) ==="
 	sudo bpftool prog load tc_gut_egress_syslog.o /sys/fs/bpf/gut_verify_tc \
 		&& echo "tc_gut_egress_syslog: PASS" || { echo "tc_gut_egress_syslog: FAIL"; exit 1; }
+	sudo rm -f /sys/fs/bpf/gut_verify_tc
+	@echo "=== Verifying XDP ingress (SIP) ==="
+	sudo bpftool prog load xdp_gut_ingress_sip.o /sys/fs/bpf/gut_verify_xdp type xdp \
+		&& echo "xdp_gut_ingress_sip: PASS" || { echo "xdp_gut_ingress_sip: FAIL"; exit 1; }
+	sudo rm -f /sys/fs/bpf/gut_verify_xdp
+	@echo "=== Verifying TC egress (SIP) ==="
+	sudo bpftool prog load tc_gut_egress_sip.o /sys/fs/bpf/gut_verify_tc \
+		&& echo "tc_gut_egress_sip: PASS" || { echo "tc_gut_egress_sip: FAIL"; exit 1; }
 	sudo rm -f /sys/fs/bpf/gut_verify_tc
