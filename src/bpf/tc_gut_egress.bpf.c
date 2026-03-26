@@ -38,6 +38,9 @@ int gut_egress(struct __sk_buff *skb)
     if (!scratch)
         return TC_ACT_OK;
 
+    struct gut_stats *stats = bpf_map_lookup_elem(&stats_map, &zero);
+    /* stats is per-CPU; NULL means kernel memory error — only gated writes below */
+
     if (skb->len < 14 + 20 + 8 + WG_MIN_PACKET)
         return TC_ACT_OK;
 
@@ -115,26 +118,22 @@ int gut_egress(struct __sk_buff *skb)
     __u32 sip_hdr_len = 0;
 #endif
 
-#if defined(GUT_MODE_B64)
-    /* Enforce MTU limit for base64 signaling path only.
-     * SIP RTP data path bypasses b64 and has no MTU limit here. */
-#if defined(GUT_MODE_SIP)
-    if (!sip_is_rtp)
+#if defined(GUT_MODE_SYSLOG)
+    /* Syslog mode: ALL WG packets are base64-encoded.
+     * Enforce MTU limit so the encoded payload fits in GUT_B64_MAX_INNER scratch. */
+    if (wg_len > GUT_B64_WG_MTU_MAX)
     {
-#endif
-        if (wg_len > GUT_B64_WG_MTU_MAX)
-        {
-            struct gut_stats *stats = bpf_map_lookup_elem(&stats_map, &zero);
-            if (stats)
-                __sync_fetch_and_add(&stats->packets_oversized, 1);
-            bpf_debug("DROP oversized WG pkt %d > %d, set WG MTU ≤ 800",
-                      wg_len, GUT_B64_WG_MTU_MAX);
-            return TC_ACT_SHOT;
-        }
-#if defined(GUT_MODE_SIP)
+        if (stats)
+            __sync_fetch_and_add(&stats->packets_oversized, 1);
+        bpf_debug("DROP oversized WG pkt %d > %d, set WG MTU ≤ 800",
+                  wg_len, GUT_B64_WG_MTU_MAX);
+        return TC_ACT_SHOT;
     }
 #endif
-#endif
+    /* SIP mode: data packets (type 4, wg_len > 32) take the RTP path and
+     * carry raw (GOST-masked) WG payload — no base64, no MTU cap here.
+     * Signaling packets (type 1/2/3/keepalive) pass through the b64 path
+     * but are always < 200 bytes, so no explicit cap is needed. */
 
     /* Save inner UDP ports BEFORE bpf_skb_adjust_room invalidates SKB pointers.
      * enc_ports is computed after ks47 is ready (plain_ports ^ ks47[11]).
@@ -150,22 +149,33 @@ int gut_egress(struct __sk_buff *skb)
         seq = 1;
     counters->seq = seq + 1;
 
+#if defined(GUT_MODE_SIP)
+    /* SIP port dispatch is always overridden below:
+     *   signaling (type 1/2/3/keepalive) → ports[0]  (SIP port)
+     *   data (type 4, len > 32)          → ports[1+] (RTP ports)
+     * Use ports[0] as the initial value — just needs to be non-zero
+     * to pass the early-exit check; the override always fires. */
+    if (cfg->num_ports == 0 || cfg->ports[0] == 0)
+        return TC_ACT_OK;
+    __u16 tunnel_port = cfg->ports[0];
+#else
     __u16 tunnel_port = select_port(seq, cfg);
     if (tunnel_port == 0)
         return TC_ACT_OK;
+#endif
 
 #if defined(GUT_MODE_GOST) || defined(GUT_MODE_B64)
-    __u32 quic_hdr_len = GUT_GOST_HEADER_SIZE;
+    __u32 outer_hdr_len = GUT_GOST_HEADER_SIZE;
 #else /* GUT_MODE_QUIC */
-    __u32 quic_hdr_len;
+    __u32 outer_hdr_len;
     if (wg_type == 1 || wg_type == 3)
     {
         /* WG Init / Cookie Reply → QUIC Initial long header (ClientHello + AEAD) */
-        quic_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
+        outer_hdr_len = GUT_QUIC_LONG_HEADER_SIZE;
     }
     else
     {
-        quic_hdr_len = GUT_QUIC_SHORT_HEADER_SIZE;
+        outer_hdr_len = GUT_QUIC_SHORT_HEADER_SIZE;
     }
 #endif
 
@@ -185,7 +195,7 @@ int gut_egress(struct __sk_buff *skb)
 #if defined(GUT_MODE_GOST)
     /* GOST: 16-byte alignment for small packets (< 256 bytes) only */
     {
-        __u32 base_udp = 8 + quic_hdr_len + wg_len;
+        __u32 base_udp = 8 + outer_hdr_len + wg_len;
         if (wg_len < 256)
         {
             __u32 remainder = base_udp & 0x0F;
@@ -326,7 +336,7 @@ int gut_egress(struct __sk_buff *skb)
         {
             __u8 *inner = scratch + B64_INNER_OFF;
             __u32 wg_total = wg_len + pad_len;
-            if (wg_total < WG_MIN_PACKET || wg_total > GUT_B64_MAX_INNER - quic_hdr_len)
+            if (wg_total < WG_MIN_PACKET || wg_total > GUT_B64_MAX_INNER - outer_hdr_len)
                 return TC_ACT_OK;
 
             /* GOST inner header: PPN(4) + enc_ports(4) + 0x00 + pad_byte */
@@ -348,11 +358,11 @@ int gut_egress(struct __sk_buff *skb)
                              :);
                 if (load_len < 1 || load_len > 886)
                     return TC_ACT_OK;
-                if (bpf_skb_load_bytes(skb, wg_off, inner + quic_hdr_len, load_len) < 0)
+                if (bpf_skb_load_bytes(skb, wg_off, inner + outer_hdr_len, load_len) < 0)
                     return TC_ACT_OK;
             }
 
-            __u32 inner_len = quic_hdr_len + wg_total;
+            __u32 inner_len = outer_hdr_len + wg_total;
             b64_len = b64_encode(scratch, B64_INNER_OFF, inner_len, B64_ENC_OFF);
             if (b64_len == 0 || b64_len > GUT_B64_MAX_OUT)
                 return TC_ACT_OK;
@@ -394,8 +404,11 @@ int gut_egress(struct __sk_buff *skb)
         /* ── RTP data path: raw GOST, no base64 ── */
         room = GUT_RTP_HEADER_SIZE + GUT_GOST_HEADER_SIZE;
         b64_total = GUT_RTP_HEADER_SIZE + GUT_GOST_HEADER_SIZE + wg_len + pad_len;
-        /* Override port: RTP data → ports[1+] */
-        if (cfg->num_ports > 1)
+        /* RTP data MUST go to ports[1+]. ports[0] is reserved for SIP signaling.
+         * Drop if no RTP port is configured (config validator prevents this,
+         * but enforce here as a hard BPF guarantee). */
+        if (cfg->num_ports < 2)
+            return TC_ACT_SHOT;
         {
             __u32 rtp_idx = 1 + (seq % (cfg->num_ports - 1));
             if (rtp_idx >= MAX_PORTS)
@@ -403,13 +416,14 @@ int gut_egress(struct __sk_buff *skb)
             tunnel_port = cfg->ports[rtp_idx];
         }
     }
-    /* Signaling: always use ports[0] */
+    /* Signaling path: always use ports[0]. Assigned last so it cannot be
+     * accidentally overwritten by the RTP branch above. */
     if (!sip_is_rtp)
         tunnel_port = cfg->ports[0];
 #endif /* GUT_MODE_SIP */
 
 #else
-    __u32 room = quic_hdr_len;
+    __u32 room = outer_hdr_len;
 #endif
 
     if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, 0) < 0)
@@ -570,7 +584,7 @@ int gut_egress(struct __sk_buff *skb)
     write_gost_header(quic, data_end, ppn, enc_ports, pad_len);
 #else  /* GUT_MODE_QUIC */
     __u8 *quic = (__u8 *)data + new_quic_off;
-    if (quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
+    if (outer_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
     {
         __u32 dcid = ks47[9]; /* per-packet keyed value, no need for Feistel PRP */
         write_quic_short_header(quic, data_end, dcid, ppn, enc_ports, pad_len);
@@ -601,7 +615,7 @@ int gut_egress(struct __sk_buff *skb)
 #if defined(GUT_MODE_B64)
         __u32 new_udp_len = b64_total + sizeof(struct udphdr);
 #else
-        __u32 new_udp_len = wg_len + quic_hdr_len + pad_len + sizeof(struct udphdr);
+        __u32 new_udp_len = wg_len + outer_hdr_len + pad_len + sizeof(struct udphdr);
 #endif
         __u32 new_ip_len = new_udp_len + 20;
 
@@ -675,7 +689,7 @@ int gut_egress(struct __sk_buff *skb)
 #if defined(GUT_MODE_B64)
         __u32 new_udp_len = b64_total + sizeof(struct udphdr);
 #else
-        __u32 new_udp_len = wg_len + quic_hdr_len + pad_len + sizeof(struct udphdr);
+        __u32 new_udp_len = wg_len + outer_hdr_len + pad_len + sizeof(struct udphdr);
 #endif
 
         ip6h->payload_len = bpf_htons(new_udp_len);
@@ -736,7 +750,13 @@ int gut_egress(struct __sk_buff *skb)
     __builtin_memcpy(eth->h_dest, cfg->dst_mac, 6);
     __builtin_memcpy(eth->h_source, cfg->src_mac, 6);
 
-    bpf_debug("TC egress: wg_type=%d quic_len=%d pad=%d port=%d", wg_type, quic_hdr_len, pad_len, tunnel_port);
+    if (stats)
+    {
+        stats->packets_processed++;
+        stats->packets_egress++;
+        stats->bytes_processed += (__u64)skb->len;
+    }
+    bpf_debug("TC egress: wg_type=%d outer_hdr=%d pad=%d port=%d", wg_type, outer_hdr_len, pad_len, tunnel_port);
     return bpf_redirect(cfg->egress_ifindex, 0);
 }
 

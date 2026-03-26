@@ -49,7 +49,7 @@
 #define GUT_RTP_HEADER_SIZE 12 /* RTP header: V(1)+PT(1)+seq(2)+ts(4)+SSRC(4) */
 #define GUT_B64_MAX_INNER 896  /* max inner before b64: GOST_HDR(10) + wg(800) + pad(64) */
 #define GUT_B64_MAX_OUT 1200   /* ceil(896/3)*4 = 1200 */
-#define GUT_B64_WG_MTU_MAX 800 /* max WG packet size for b64 modes (syslog/sip) */
+#define GUT_B64_WG_MTU_MAX 800 /* max WG packet size for syslog mode (full base64 encap) */
 #define SIP_SCAN_OFF 2560      /* scratch offset for SIP marker scan on ingress */
 
 /* Combined base64 mode flag for shared syslog/SIP code paths */
@@ -159,13 +159,15 @@ struct peer_endpoint
 /* Per-CPU statistics */
 struct gut_stats
 {
-    __u64 packets_processed;
+    __u64 packets_processed; /* combined egress+ingress (legacy, kept for ABI) */
     __u64 packets_dropped;
     __u64 bytes_processed;
     __u64 packets_oversized;
     __u64 mask_count;
     __u64 packets_fragmented;
     __u64 inner_tcp_seen;
+    __u64 packets_egress;  /* TC egress: WG→outer (obfuscated) packets sent */
+    __u64 packets_ingress; /* XDP ingress: outer→WG (de-obfuscated) packets received */
 };
 
 /* Monotonic sequence counter for packets */
@@ -577,6 +579,9 @@ static __always_inline __u16 select_port(__u32 pkt_id, const struct gut_config *
     if (cfg->num_ports == 0)
         return 0;
     __u32 idx = pkt_id % cfg->num_ports;
+    /* The loader caps num_ports to MAX_PORTS, so idx < MAX_PORTS always.
+     * Defensive guard: if somehow violated, return 0 so the caller
+     * (TC egress) drops the packet rather than silently misrouting. */
     if (idx >= MAX_PORTS)
         return 0;
     return cfg->ports[idx];
@@ -2137,8 +2142,13 @@ static __always_inline __u32 write_syslog_ascii(__u8 *buf, struct gut_config *cf
  *   4 (keepalive, len==32) → OPTIONS, else → MESSAGE.
  * Returns total bytes written, ending right after "a=fmtp:0 " marker.
  * Auth token in Via branch = sip_hash32(date_digits / 10000, chacha_init+4). */
-static __always_inline __u32 write_sip_header(__u8 *buf, struct gut_config *cfg,
-                                              __u8 wg_type, __u32 wg_len)
+/* noinline so BPF verifier sees it as a subprogram verified ONCE independently
+ * of its multiple call sites.  The 5-way wg_type switch + 7-way day-of-week
+ * + 12-way month inline would multiply verifier path count beyond complexity
+ * budget for the full TC egress SIP program.  Caller bounds the return value
+ * with &= 0x1FF + range check before any further use. */
+static __attribute__((noinline)) __attribute__((unused)) __u32 write_sip_header(__u8 *buf, struct gut_config *cfg,
+                                                                                __u8 wg_type, __u32 wg_len)
 {
     __u32 off = 0;
     __u32 slen = cfg->sni_domain_len;

@@ -258,6 +258,12 @@ pub fn load_config_from_env() -> Result<Config> {
             .into())
         }
     };
+    if obfs == ObfsMode::Sip && ports.len() < 2 {
+        return Err("GUTD_OBFS=sip requires at least 2 ports in GUTD_PORTS: \
+             ports[0] = SIP signaling, ports[1+] = RTP media"
+            .into());
+    }
+
     let stats_interval: u32 = std::env::var("GUTD_STATS_INTERVAL")
         .unwrap_or_else(|_| "5".to_string())
         .parse()
@@ -393,6 +399,14 @@ impl PeerBuilder {
             self.peer_ip.ok_or("peer_ip not set")?
         };
         let ports = self.ports.ok_or("ports not set")?;
+        if self.obfs == ObfsMode::Sip && ports.len() < 2 {
+            return Err(format!(
+                "SIP mode requires at least 2 ports (peer '{}'): \
+                 ports[0] = SIP signaling, ports[1+] = RTP media",
+                self.name
+            )
+            .into());
+        }
         let key = match (self.key, self.passphrase) {
             (Some(k), _) => k,
             (None, Some(p)) => {

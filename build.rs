@@ -25,10 +25,10 @@ fn compile_tc_ebpf() {
     use std::env;
     use std::path::PathBuf;
 
-    println!("cargo:rerun-if-changed=src/tc/bpf/");
-    println!("cargo:rerun-if-changed=src/tc/bpf/tc_gut_egress.bpf.c");
-    println!("cargo:rerun-if-changed=src/tc/bpf/xdp_gut_ingress.bpf.c");
-    println!("cargo:rerun-if-changed=src/tc/bpf/gut_common.h");
+    println!("cargo:rerun-if-changed=src/bpf/");
+    println!("cargo:rerun-if-changed=src/bpf/tc_gut_egress.bpf.c");
+    println!("cargo:rerun-if-changed=src/bpf/xdp_gut_ingress.bpf.c");
+    println!("cargo:rerun-if-changed=src/bpf/gut_common.h");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
 
@@ -49,18 +49,18 @@ fn compile_tc_ebpf() {
     // Generate skeleton for egress (outer IPv4)
     let egress_skel = out_dir.join("tc_gut_egress.skel.rs");
     SkeletonBuilder::new()
-        .source("src/tc/bpf/tc_gut_egress.bpf.c")
-        .clang_args(["-I", "src/tc/bpf", &chacha_define, &arch_include])
+        .source("src/bpf/tc_gut_egress.bpf.c")
+        .clang_args(["-I", "src/bpf", &chacha_define, &arch_include])
         .build_and_generate(&egress_skel)
         .expect("Failed to generate TC egress (v4) skeleton");
 
     // Generate skeleton for egress (outer IPv6)
     let egress_v6_skel = out_dir.join("tc_gut_egress_v6.skel.rs");
     SkeletonBuilder::new()
-        .source("src/tc/bpf/tc_gut_egress.bpf.c")
+        .source("src/bpf/tc_gut_egress.bpf.c")
         .clang_args([
             "-I",
-            "src/tc/bpf",
+            "src/bpf",
             &chacha_define,
             "-DGUT_OUTER_IPV6",
             &arch_include,
@@ -71,8 +71,8 @@ fn compile_tc_ebpf() {
     // Generate skeleton for XDP ingress (contains both xdp_gut_ingress + gut_tc_redirect)
     let ingress_skel = out_dir.join("xdp_gut_ingress.skel.rs");
     SkeletonBuilder::new()
-        .source("src/tc/bpf/xdp_gut_ingress.bpf.c")
-        .clang_args(["-I", "src/tc/bpf", &chacha_define, &arch_include])
+        .source("src/bpf/xdp_gut_ingress.bpf.c")
+        .clang_args(["-I", "src/bpf", &chacha_define, &arch_include])
         .build_and_generate(&ingress_skel)
         .expect("Failed to generate XDP ingress skeleton");
 
@@ -81,10 +81,10 @@ fn compile_tc_ebpf() {
     // Generate skeleton for egress Gost mode (outer IPv4)
     let egress_gost_skel = out_dir.join("tc_gut_egress_gost.skel.rs");
     SkeletonBuilder::new()
-        .source("src/tc/bpf/tc_gut_egress.bpf.c")
+        .source("src/bpf/tc_gut_egress.bpf.c")
         .clang_args([
             "-I",
-            "src/tc/bpf",
+            "src/bpf",
             &chacha_define,
             "-DGUT_MODE_GOST",
             &arch_include,
@@ -95,10 +95,10 @@ fn compile_tc_ebpf() {
     // Generate skeleton for egress Gost mode (outer IPv6)
     let egress_gost_v6_skel = out_dir.join("tc_gut_egress_gost_v6.skel.rs");
     SkeletonBuilder::new()
-        .source("src/tc/bpf/tc_gut_egress.bpf.c")
+        .source("src/bpf/tc_gut_egress.bpf.c")
         .clang_args([
             "-I",
-            "src/tc/bpf",
+            "src/bpf",
             &chacha_define,
             "-DGUT_MODE_GOST",
             "-DGUT_OUTER_IPV6",
@@ -110,10 +110,10 @@ fn compile_tc_ebpf() {
     // Generate skeleton for XDP ingress Gost mode
     let ingress_gost_skel = out_dir.join("xdp_gut_ingress_gost.skel.rs");
     SkeletonBuilder::new()
-        .source("src/tc/bpf/xdp_gut_ingress.bpf.c")
+        .source("src/bpf/xdp_gut_ingress.bpf.c")
         .clang_args([
             "-I",
-            "src/tc/bpf",
+            "src/bpf",
             &chacha_define,
             "-DGUT_MODE_GOST",
             &arch_include,
@@ -126,10 +126,10 @@ fn compile_tc_ebpf() {
     // Generate skeleton for egress Syslog mode (outer IPv4)
     let egress_syslog_skel = out_dir.join("tc_gut_egress_syslog.skel.rs");
     SkeletonBuilder::new()
-        .source("src/tc/bpf/tc_gut_egress.bpf.c")
+        .source("src/bpf/tc_gut_egress.bpf.c")
         .clang_args([
             "-I",
-            "src/tc/bpf",
+            "src/bpf",
             &chacha_define,
             "-DGUT_MODE_SYSLOG",
             &arch_include,
@@ -140,10 +140,10 @@ fn compile_tc_ebpf() {
     // Generate skeleton for egress Syslog mode (outer IPv6)
     let egress_syslog_v6_skel = out_dir.join("tc_gut_egress_syslog_v6.skel.rs");
     SkeletonBuilder::new()
-        .source("src/tc/bpf/tc_gut_egress.bpf.c")
+        .source("src/bpf/tc_gut_egress.bpf.c")
         .clang_args([
             "-I",
-            "src/tc/bpf",
+            "src/bpf",
             &chacha_define,
             "-DGUT_MODE_SYSLOG",
             "-DGUT_OUTER_IPV6",
@@ -155,10 +155,10 @@ fn compile_tc_ebpf() {
     // Generate skeleton for XDP ingress Syslog mode
     let ingress_syslog_skel = out_dir.join("xdp_gut_ingress_syslog.skel.rs");
     SkeletonBuilder::new()
-        .source("src/tc/bpf/xdp_gut_ingress.bpf.c")
+        .source("src/bpf/xdp_gut_ingress.bpf.c")
         .clang_args([
             "-I",
-            "src/tc/bpf",
+            "src/bpf",
             &chacha_define,
             "-DGUT_MODE_SYSLOG",
             &arch_include,
@@ -171,10 +171,10 @@ fn compile_tc_ebpf() {
     // Generate skeleton for egress SIP mode (outer IPv4)
     let egress_sip_skel = out_dir.join("tc_gut_egress_sip.skel.rs");
     SkeletonBuilder::new()
-        .source("src/tc/bpf/tc_gut_egress.bpf.c")
+        .source("src/bpf/tc_gut_egress.bpf.c")
         .clang_args([
             "-I",
-            "src/tc/bpf",
+            "src/bpf",
             &chacha_define,
             "-DGUT_MODE_SIP",
             &arch_include,
@@ -185,10 +185,10 @@ fn compile_tc_ebpf() {
     // Generate skeleton for egress SIP mode (outer IPv6)
     let egress_sip_v6_skel = out_dir.join("tc_gut_egress_sip_v6.skel.rs");
     SkeletonBuilder::new()
-        .source("src/tc/bpf/tc_gut_egress.bpf.c")
+        .source("src/bpf/tc_gut_egress.bpf.c")
         .clang_args([
             "-I",
-            "src/tc/bpf",
+            "src/bpf",
             &chacha_define,
             "-DGUT_MODE_SIP",
             "-DGUT_OUTER_IPV6",
@@ -200,10 +200,10 @@ fn compile_tc_ebpf() {
     // Generate skeleton for XDP ingress SIP mode
     let ingress_sip_skel = out_dir.join("xdp_gut_ingress_sip.skel.rs");
     SkeletonBuilder::new()
-        .source("src/tc/bpf/xdp_gut_ingress.bpf.c")
+        .source("src/bpf/xdp_gut_ingress.bpf.c")
         .clang_args([
             "-I",
-            "src/tc/bpf",
+            "src/bpf",
             &chacha_define,
             "-DGUT_MODE_SIP",
             &arch_include,

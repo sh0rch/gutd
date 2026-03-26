@@ -16,6 +16,8 @@ GUTD_US="${GUTD_US:-true}"
 # SIP uses RTP (raw GOST, no base64) for data — can use normal MTU.
 if [[ "${OBFS_MODE}" == "syslog" ]]; then
     WG_MTU="${WG_MTU:-500}"
+elif [[ "${OBFS_MODE}" == "sip" ]]; then
+    WG_MTU="${WG_MTU:-1400}"
 else
     WG_MTU="${WG_MTU:-1420}"
 fi
