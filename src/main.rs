@@ -57,20 +57,23 @@ fn print_bpf_stats(managers: &[gutd::tc::TcBpfManager]) {
             Ok(stats) => {
                 eprintln!("  [{}]", manager.interface());
                 eprintln!(
-                    "    Egress:  pkts={} drop={} bytes={} mask={} frag={}",
-                    stats.egress.packets_processed,
+                    "    Egress:  pkts={} drop(cp1)={} bytes(cp4)={} mask(cp5)={} frag(cp2)={} oversz(cp3)={} xdp_decoded_fail={} ",
+                    stats.egress.packets_egress,
                     stats.egress.packets_dropped,
                     stats.egress.bytes_processed,
                     stats.egress.mask_count,
-                    stats.egress.packets_fragmented
+                    stats.egress.packets_fragmented,
+                    stats.egress.packets_oversized,
+                    stats.egress.inner_tcp_seen,
                 );
                 eprintln!(
-                    "    Ingress: pkts={} drop={} bytes={} mask={} frag={}",
-                    stats.ingress.packets_processed,
-                    stats.ingress.packets_dropped,
-                    stats.ingress.bytes_processed,
-                    stats.ingress.mask_count,
-                    stats.ingress.packets_fragmented
+                    "    Ingress: pkts={} drop={} bytes={} mask={} frag={} oversized={}",
+                    stats.egress.packets_ingress,
+                    stats.egress.packets_dropped,
+                    stats.egress.bytes_processed,
+                    stats.egress.mask_count,
+                    stats.egress.packets_fragmented,
+                    stats.egress.packets_oversized
                 );
             }
             Err(e) => eprintln!("  [{}] Failed to read BPF stats: {e}", manager.interface()),
@@ -102,11 +105,7 @@ fn dump_counters_file(
         let peer = manager.interface();
         match manager.get_stats() {
             Ok(stats) => {
-                let _ = writeln!(
-                    buf,
-                    "{peer}_egress_packets={}",
-                    stats.egress.packets_processed
-                );
+                let _ = writeln!(buf, "{peer}_egress_packets={}", stats.egress.packets_egress);
                 let _ = writeln!(
                     buf,
                     "{peer}_egress_dropped={}",
@@ -126,29 +125,35 @@ fn dump_counters_file(
                 );
                 let _ = writeln!(
                     buf,
+                    "{peer}_egress_oversized={}",
+                    stats.egress.packets_oversized
+                );
+                let _ = writeln!(
+                    buf,
                     "{peer}_ingress_packets={}",
-                    stats.ingress.packets_processed
+                    stats.egress.packets_ingress
                 );
                 let _ = writeln!(
                     buf,
                     "{peer}_ingress_dropped={}",
-                    stats.ingress.packets_dropped
+                    stats.egress.packets_dropped
                 );
-                let _ = writeln!(
-                    buf,
-                    "{peer}_ingress_bytes={}",
-                    stats.ingress.bytes_processed
-                );
-                let _ = writeln!(buf, "{peer}_ingress_mask_ops={}", stats.ingress.mask_count);
+                let _ = writeln!(buf, "{peer}_ingress_bytes={}", stats.egress.bytes_processed);
+                let _ = writeln!(buf, "{peer}_ingress_mask_ops={}", stats.egress.mask_count);
                 let _ = writeln!(
                     buf,
                     "{peer}_ingress_fragmented={}",
-                    stats.ingress.packets_fragmented
+                    stats.egress.packets_fragmented
                 );
                 let _ = writeln!(
                     buf,
                     "{peer}_ingress_inner_tcp_seen={}",
-                    stats.ingress.inner_tcp_seen
+                    stats.egress.inner_tcp_seen
+                );
+                let _ = writeln!(
+                    buf,
+                    "{peer}_ingress_oversized={}",
+                    stats.egress.packets_oversized
                 );
             }
             Err(e) => {

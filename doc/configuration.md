@@ -31,20 +31,41 @@ Full reference with all defaults shown:
 peer_ip = 203.0.113.10      # remote peer IP (or "dynamic" — see below)
 ports = 41000,41001         # UDP ports (must match WG listen/endpoint ports)
 # keepalive_drop_percent = 30
-# own_http3 = true           # eBPF XDP responder for active DPI probes
-# obfs = quic                # obfuscation mode: quic (default) or noise (random UDP)
+# own_http3 = true          # XDP active-probe deflection (quic+sip only)
+# obfs = quic               # obfuscation mode: quic (default) | gost | sip | syslog
 key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 # passphrase = my-secret     # alternative to key (HKDF-SHA256 derived)
 ```
 
-### Obfuscation mode
+### Obfuscation modes
 
-The `obfs` key controls how gutd-encapsulated packets look on the wire:
+The `obfs` key controls how gutd-encapsulated packets look on the wire.
+Both peers must use the same mode.
 
-- **`quic`** (default) — packets carry a recognizable QUIC Long Header with a fake SNI. Effective against WireGuard-specific DPI, but packets are identifiable as QUIC.
-- **`noise`** — additionally masks the first bytes of the QUIC header so that packets appear as random UDP traffic. Useful when QUIC itself is blocked or throttled.
+| `obfs=` | Wire appearance | Active-probe reply | Ports |
+|---|---|---|---|
+| **`quic`** *(default)* | Fake QUIC Long Header + SNI (looks like HTTPS/3) | QUIC Version Negotiation | any UDP |
+| **`gost`** | Random-looking UDP — no QUIC/TLS byte patterns | silent drop | any UDP |
+| **`sip`** | Signaling in SIP headers; data in RTP frames | `200 OK` / `401` / `403` | `ports[0]`=SIP, `ports[1+]`=RTP (**≥2 required**) |
+| **`syslog`** | WG payload base64-encoded inside a fake syslog message | silent drop | any UDP |
 
-Both sides of the tunnel must use the same `obfs` mode.
+ChaCha payload masking is applied in all modes on top of the protocol envelope.
+
+#### SIP mode port contract
+
+SIP mode **requires at least 2 ports**. Port assignment is fixed:
+- `ports[0]` — SIP signaling (WireGuard handshake and keepalive packets)
+- `ports[1], ports[2], …` — RTP media (WireGuard data packets)
+
+Gutd will refuse to start with `obfs = sip` and fewer than 2 ports.
+
+```ini
+# Minimum SIP config
+obfs  = sip
+ports = 5060, 10000          # [0]=signaling, [1]=RTP
+sni   = sip.example.com
+mtu   = 1400                 # required — see MTU section below
+```
 
 ### Responder role
 
@@ -77,7 +98,7 @@ When `GUTD_PEER_IP` is set and no config file is passed via CLI, gutd reads all 
 | `GUTD_DEFAULT_POLICY` | no | `allow` | `default_policy` |
 | `GUTD_KEEPALIVE_DROP_PCT` | no | `30` | `keepalive_drop_percent` |
 | `GUTD_OWN_HTTP3` | no | `true` | `own_http3` |
-| `GUTD_OBFS` | no | `quic` | `obfs` (`quic` or `noise`) |
+| `GUTD_OBFS` | no | `quic` | `obfs` (`quic`, `gost`, `sip`, or `syslog`) |
 | `GUTD_USERSPACE_ONLY` | no | `false` | `userspace_only` |
 | `GUTD_STATS_INTERVAL` | no | `5` | `stats_interval` |
 | `GUTD_STAT_FILE` | no | `/run/gutd.stat` | `stat_file` |
@@ -186,36 +207,61 @@ gutd genkey --passphrase "my secret phrase"
 
 ## MTU
 
-gutd v2 encapsulates WireGuard UDP packets inside a fake QUIC wrapper.
-It prepends a QUIC Long Header (including SNI) to every packet and appends
-variable padding to obfuscate packet length. These additions increase the
-packet size.
+Each obfuscation mode adds a different amount of overhead to every WireGuard
+packet. If the resulting outer frame exceeds the link MTU, packets are silently
+dropped — you will see WireGuard connectivity (pings work) but zero iperf
+throughput. Always set the WireGuard interface MTU to match the mode.
+
+### Per-mode WireGuard MTU table
+
+| Mode | Overhead added by gutd | Recommended WG MTU\* |
+|---|---|---|
+| `quic` | 16 bytes (QUIC short header) | **1420** (default) |
+| `gost` | 10 bytes (GOST header) | **1420** |
+| `sip` | 22 bytes (RTP 12 + GOST 10) | **1400** |
+| `syslog` | base64 expansion (~4/3× payload) | **800** |
+
+\* For a 1500-byte outer link MTU (standard Ethernet). Adjust proportionally
+for PPPoE (1492), tunnels, or other reduced-MTU links.
+
+> **Why does SIP need 1400 and not 1408?**
+> Empirical testing shows frames above ~1400-byte WG MTU are dropped on
+> Linux veth/bridge setups due to alignment and bookkeeping overhead. Use
+> **1400** as the safe value for `sip` mode.
+
+> **Why does syslog need 800?**
+> Syslog mode base64-encodes the entire WireGuard payload, expanding it
+> by ~33 %. A 800-byte inner packet produces ~1196 bytes on the wire,
+> safely within the 1500-byte outer MTU. Values above ~870 will overflow
+> the internal BPF scratch buffer and packets will be dropped.
 
 ### gutd config `mtu`
 
-Sets the MTU of the gut TUN interface (the veth pair gutd creates). gutd also
-applies this value as `gso_max_size` on both veth endpoints to prevent the
-kernel from generating super-segments larger than the link can carry.
+Sets the MTU of the gutd veth interface. gutd also applies this as
+`gso_max_size` on both veth endpoints to prevent the kernel from generating
+super-segments larger than the link can carry. This value must match the
+WireGuard interface MTU on the same host.
 
-Default: `1420`. This is the standard WireGuard veth MTU and works for most
-setups. The 4-byte gutd metadata overhead is covered by the built-in 20-byte
-PMTU reserve.
-
-### WireGuard `wg0` MTU
-
-Set `wg0` MTU to the standard WireGuard recommendation for your link:
-
-```
-wg0 mtu = outer_link_mtu - 60   (20 IP + 8 UDP + 32 WireGuard header/tag)
+```ini
+[peer]
+mtu = 1400   # for sip mode
 ```
 
-For a 1500-byte Ethernet link: `wg0 mtu = 1420` (default WireGuard value).
+### WireGuard interface MTU
 
-The 4 extra bytes added by gutd fit within the 20-byte PMTU headroom already
-accounted for in WireGuard's MTU formula, so **no adjustment to wg0 MTU is
-needed** when running WireGuard over gutd.
+Set `wg0` MTU to the value from the table above:
+
+```bash
+# SIP mode example
+ip link set wg0 mtu 1400
+
+# Syslog mode example
+ip link set wg0 mtu 800
+```
+
+For `quic` and `gost` the default WireGuard value of 1420 is correct.
 
 ### `outer_mtu` config key
 
 Maximum size of the outer Ethernet frame on the physical link. Default: `1500`.
-Override only if your uplink uses jumbo frames or has a reduced MTU (e.g. PPPoE: `1492`).
+Override only if your uplink has a reduced MTU (e.g. PPPoE: `1492`, some VPNs).

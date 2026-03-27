@@ -1,4 +1,4 @@
-.PHONY: help build test test-unit test-integration test-wg check-deps clean install \
+.PHONY: help build test test-unit test-integration test-wg test-ndpi check-deps clean install \
         docker-build docker-build-multiarch docker-push
 
 CARGO := cargo
@@ -12,6 +12,7 @@ help:
 	@echo "  test-unit          - Run unit tests only"
 	@echo "  test-integration   - Run integration tests with WireGuard"
 	@echo "  test-wg            - Alias for test-integration"
+	@echo "  test-ndpi          - Run nDPI evasion test for all obfuscation modes"
 	@echo "  check-deps         - Check if integration test dependencies are installed"
 	@echo "  clean              - Clean build artifacts"
 	@echo "  install            - Install gutd to /usr/local/bin"
@@ -49,6 +50,14 @@ test-integration: build check-deps
 	sudo -E GUTD_BINARY=$(PWD)/$(GUTD_BINARY) bash tests/integration-wg.sh
 
 test-wg: test-integration
+
+test-ndpi: build
+	@echo "Running nDPI evasion test for all obfuscation modes (requires sudo)..."
+	@if [ ! -f $(GUTD_BINARY) ]; then \
+		echo "Error: gutd binary not found. Run 'make build' first."; \
+		exit 1; \
+	fi
+	sudo -E GUTD_BINARY=$(PWD)/$(GUTD_BINARY) bash tests/test_ndpi_all_modes.sh
 
 clean:
 	$(CARGO) clean

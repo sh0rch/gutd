@@ -51,7 +51,11 @@ pub enum ObfsMode {
     /// Packets look like QUIC (default).
     Quic,
     /// QUIC signatures masked — packets look like random UDP.
-    Noise,
+    Gost,
+    /// Base64 Encoded with Syslog header pretending to be logs
+    Syslog,
+    /// Base64 Encoded with SIP header
+    Sip,
 }
 
 #[derive(Clone)]
@@ -71,7 +75,9 @@ pub struct PeerConfig {
     pub outer_mtu: u16,
     pub own_http3: bool,
     pub wg_host: String,
+    pub sip_domain: String,
     pub obfs: ObfsMode,
+    pub bind_port: u16,
 }
 
 /// Global runtime settings (from config file [global] section or CLI).
@@ -242,11 +248,22 @@ pub fn load_config_from_env() -> Result<Config> {
         .as_str()
     {
         "quic" => ObfsMode::Quic,
-        "noise" => ObfsMode::Noise,
+        "gost" | "noise" => ObfsMode::Gost,
+        "syslog" => ObfsMode::Syslog,
+        "sip" => ObfsMode::Sip,
         other => {
-            return Err(format!("GUTD_OBFS: unknown value '{other}', expected quic|noise").into())
+            return Err(format!(
+                "GUTD_OBFS: unknown value '{other}', expected quic|gost|noise|syslog|sip"
+            )
+            .into())
         }
     };
+    if obfs == ObfsMode::Sip && ports.len() < 2 {
+        return Err("GUTD_OBFS=sip requires at least 2 ports in GUTD_PORTS: \
+             ports[0] = SIP signaling, ports[1+] = RTP media"
+            .into());
+    }
+
     let stats_interval: u32 = std::env::var("GUTD_STATS_INTERVAL")
         .unwrap_or_else(|_| "5".to_string())
         .parse()
@@ -280,7 +297,15 @@ pub fn load_config_from_env() -> Result<Config> {
             own_http3,
             wg_host: std::env::var("GUTD_WG_HOST")
                 .unwrap_or_else(|_| "127.0.0.1:51820".to_string()),
+            sip_domain: std::env::var("GUTD_SNI")
+                .or_else(|_| std::env::var("GUTD_SIP_DOMAIN"))
+                .or_else(|_| std::env::var("GUTD_SERVICE_NAME"))
+                .unwrap_or_else(|_| "nginx".to_string()),
             obfs,
+            bind_port: std::env::var("GUTD_BIND_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
         }],
     })
 }
@@ -303,7 +328,9 @@ struct PeerBuilder {
     keepalive_drop_percent: u8,
     own_http3: bool,
     wg_host: Option<String>,
+    sip_domain: Option<String>,
     obfs: ObfsMode,
+    bind_port: Option<u16>,
 }
 
 impl Default for PeerBuilder {
@@ -325,6 +352,8 @@ impl Default for PeerBuilder {
             own_http3: true,
             wg_host: None,
             obfs: ObfsMode::Quic,
+            sip_domain: None,
+            bind_port: None,
         }
     }
 }
@@ -370,6 +399,14 @@ impl PeerBuilder {
             self.peer_ip.ok_or("peer_ip not set")?
         };
         let ports = self.ports.ok_or("ports not set")?;
+        if self.obfs == ObfsMode::Sip && ports.len() < 2 {
+            return Err(format!(
+                "SIP mode requires at least 2 ports (peer '{}'): \
+                 ports[0] = SIP signaling, ports[1+] = RTP media",
+                self.name
+            )
+            .into());
+        }
         let key = match (self.key, self.passphrase) {
             (Some(k), _) => k,
             (None, Some(p)) => {
@@ -407,6 +444,8 @@ impl PeerBuilder {
                 .wg_host
                 .unwrap_or_else(|| "127.0.0.1:51820".to_string()),
             obfs: self.obfs,
+            sip_domain: self.sip_domain.unwrap_or_else(|| "127.0.0.1".to_string()),
+            bind_port: self.bind_port.unwrap_or(0),
         })
     }
 }
@@ -491,6 +530,7 @@ fn parse_config(content: &str) -> Result<Config> {
                             };
                         }
                         "bind_ip" => b.bind_ip = Some(value.parse()?),
+                        "bind_port" => b.bind_port = Some(value.parse()?),
                         "peer_ip" => {
                             if value.eq_ignore_ascii_case("dynamic") {
                                 b.dynamic_peer = true;
@@ -544,13 +584,18 @@ fn parse_config(content: &str) -> Result<Config> {
                         "responder" => {
                             b.responder = Some(value == "true" || value == "1");
                         }
+                        "sip_domain" | "sni" | "service_name" => {
+                            b.sip_domain = Some(value.trim_matches('"').to_string());
+                        }
                         "obfs" => {
                             b.obfs = match value {
                                 "quic" => ObfsMode::Quic,
-                                "noise" => ObfsMode::Noise,
+                                "gost" | "noise" => ObfsMode::Gost,
+                                "syslog" => ObfsMode::Syslog,
+                                "sip" => ObfsMode::Sip,
                                 _ => {
                                     return Err(format!(
-                                        "Invalid obfs value: {value} (expected quic|noise)"
+                                        "Invalid obfs value: {value} (expected quic|gost|noise|syslog|sip)"
                                     )
                                     .into())
                                 }
@@ -571,7 +616,7 @@ fn parse_config(content: &str) -> Result<Config> {
     }
 
     if peers.is_empty() {
-        return Err("No [peer] sections found in config".into());
+        return Err("No [peer] sections found in config ".into());
     }
 
     // Validate: peer names must be unique.

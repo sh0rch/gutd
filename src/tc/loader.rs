@@ -129,12 +129,72 @@ mod xdp_gut_ingress {
     include!(concat!(env!("OUT_DIR"), "/xdp_gut_ingress.skel.rs"));
 }
 
-/// Egress skeleton: either outer-IPv4 or outer-IPv6 variant.
-/// Both compiled from the same source with/without `-DGUT_OUTER_IPV6`.
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+#[allow(clippy::all, clippy::pedantic)]
+mod tc_gut_egress_gost {
+    include!(concat!(env!("OUT_DIR"), "/tc_gut_egress_gost.skel.rs"));
+}
+
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+#[allow(clippy::all, clippy::pedantic)]
+mod tc_gut_egress_gost_v6 {
+    include!(concat!(env!("OUT_DIR"), "/tc_gut_egress_gost_v6.skel.rs"));
+}
+
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+#[allow(clippy::all, clippy::pedantic)]
+mod xdp_gut_ingress_gost {
+    include!(concat!(env!("OUT_DIR"), "/xdp_gut_ingress_gost.skel.rs"));
+}
+
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+#[allow(clippy::all, clippy::pedantic)]
+mod tc_gut_egress_syslog {
+    include!(concat!(env!("OUT_DIR"), "/tc_gut_egress_syslog.skel.rs"));
+}
+
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+#[allow(clippy::all, clippy::pedantic)]
+mod tc_gut_egress_syslog_v6 {
+    include!(concat!(env!("OUT_DIR"), "/tc_gut_egress_syslog_v6.skel.rs"));
+}
+
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+#[allow(clippy::all, clippy::pedantic)]
+mod xdp_gut_ingress_syslog {
+    include!(concat!(env!("OUT_DIR"), "/xdp_gut_ingress_syslog.skel.rs"));
+}
+
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+#[allow(clippy::all, clippy::pedantic)]
+mod tc_gut_egress_sip {
+    include!(concat!(env!("OUT_DIR"), "/tc_gut_egress_sip.skel.rs"));
+}
+
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+#[allow(clippy::all, clippy::pedantic)]
+mod tc_gut_egress_sip_v6 {
+    include!(concat!(env!("OUT_DIR"), "/tc_gut_egress_sip_v6.skel.rs"));
+}
+
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+#[allow(clippy::all, clippy::pedantic)]
+mod xdp_gut_ingress_sip {
+    include!(concat!(env!("OUT_DIR"), "/xdp_gut_ingress_sip.skel.rs"));
+}
+
+/// Egress skeleton: mode × outer-AF variant.
+/// Compiled from the same source with different -D flags.
 #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
 enum EgressSkel {
     V4(tc_gut_egress::TcGutEgressSkel<'static>),
     V6(tc_gut_egress_v6::TcGutEgressSkel<'static>),
+    GostV4(tc_gut_egress_gost::TcGutEgressSkel<'static>),
+    GostV6(tc_gut_egress_gost_v6::TcGutEgressSkel<'static>),
+    SyslogV4(tc_gut_egress_syslog::TcGutEgressSkel<'static>),
+    SyslogV6(tc_gut_egress_syslog_v6::TcGutEgressSkel<'static>),
+    SipV4(tc_gut_egress_sip::TcGutEgressSkel<'static>),
+    SipV6(tc_gut_egress_sip_v6::TcGutEgressSkel<'static>),
 }
 
 #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
@@ -155,6 +215,36 @@ impl EgressSkel {
                 .maps
                 .config_map
                 .update(&0u32.to_ne_bytes(), value, MapFlags::ANY)?,
+            Self::GostV4(s) => {
+                s.maps
+                    .config_map
+                    .update(&0u32.to_ne_bytes(), value, MapFlags::ANY)?
+            }
+            Self::GostV6(s) => {
+                s.maps
+                    .config_map
+                    .update(&0u32.to_ne_bytes(), value, MapFlags::ANY)?
+            }
+            Self::SyslogV4(s) => {
+                s.maps
+                    .config_map
+                    .update(&0u32.to_ne_bytes(), value, MapFlags::ANY)?
+            }
+            Self::SyslogV6(s) => {
+                s.maps
+                    .config_map
+                    .update(&0u32.to_ne_bytes(), value, MapFlags::ANY)?
+            }
+            Self::SipV4(s) => {
+                s.maps
+                    .config_map
+                    .update(&0u32.to_ne_bytes(), value, MapFlags::ANY)?
+            }
+            Self::SipV6(s) => {
+                s.maps
+                    .config_map
+                    .update(&0u32.to_ne_bytes(), value, MapFlags::ANY)?
+            }
         }
         Ok(())
     }
@@ -172,6 +262,36 @@ impl EgressSkel {
                     .counters_map
                     .update(&0u32.to_ne_bytes(), &bytes, MapFlags::ANY)?
             }
+            Self::GostV4(s) => {
+                s.maps
+                    .counters_map
+                    .update(&0u32.to_ne_bytes(), &bytes, MapFlags::ANY)?
+            }
+            Self::GostV6(s) => {
+                s.maps
+                    .counters_map
+                    .update(&0u32.to_ne_bytes(), &bytes, MapFlags::ANY)?
+            }
+            Self::SyslogV4(s) => {
+                s.maps
+                    .counters_map
+                    .update(&0u32.to_ne_bytes(), &bytes, MapFlags::ANY)?
+            }
+            Self::SyslogV6(s) => {
+                s.maps
+                    .counters_map
+                    .update(&0u32.to_ne_bytes(), &bytes, MapFlags::ANY)?
+            }
+            Self::SipV4(s) => {
+                s.maps
+                    .counters_map
+                    .update(&0u32.to_ne_bytes(), &bytes, MapFlags::ANY)?
+            }
+            Self::SipV6(s) => {
+                s.maps
+                    .counters_map
+                    .update(&0u32.to_ne_bytes(), &bytes, MapFlags::ANY)?
+            }
         }
         Ok(())
     }
@@ -180,34 +300,46 @@ impl EgressSkel {
         match self {
             Self::V4(s) => s.progs.gut_egress.as_fd(),
             Self::V6(s) => s.progs.gut_egress.as_fd(),
+            Self::GostV4(s) => s.progs.gut_egress.as_fd(),
+            Self::GostV6(s) => s.progs.gut_egress.as_fd(),
+            Self::SyslogV4(s) => s.progs.gut_egress.as_fd(),
+            Self::SyslogV6(s) => s.progs.gut_egress.as_fd(),
+            Self::SipV4(s) => s.progs.gut_egress.as_fd(),
+            Self::SipV6(s) => s.progs.gut_egress.as_fd(),
         }
     }
 
     fn is_v6(&self) -> bool {
-        matches!(self, Self::V6(_))
+        matches!(
+            self,
+            Self::V6(_) | Self::GostV6(_) | Self::SyslogV6(_) | Self::SipV6(_)
+        )
     }
 
     fn get_map_fd(&self, name: &str) -> Option<std::os::unix::io::BorrowedFd<'_>> {
         use std::os::unix::io::AsFd;
+        macro_rules! map_fd {
+            ($s:expr) => {
+                match name {
+                    "client_map" => Some($s.maps.client_map.as_fd()),
+                    "session_map" => Some($s.maps.session_map.as_fd()),
+                    "config_map" => Some($s.maps.config_map.as_fd()),
+                    "counters_map" => Some($s.maps.counters_map.as_fd()),
+                    "stats_map" => Some($s.maps.stats_map.as_fd()),
+                    "scratch_map" => Some($s.maps.scratch_map.as_fd()),
+                    _ => None,
+                }
+            };
+        }
         match self {
-            Self::V4(s) => match name {
-                "client_map" => Some(s.maps.client_map.as_fd()),
-                "session_map" => Some(s.maps.session_map.as_fd()),
-                "config_map" => Some(s.maps.config_map.as_fd()),
-                "counters_map" => Some(s.maps.counters_map.as_fd()),
-                "stats_map" => Some(s.maps.stats_map.as_fd()),
-                "scratch_map" => Some(s.maps.scratch_map.as_fd()),
-                _ => None,
-            },
-            Self::V6(s) => match name {
-                "client_map" => Some(s.maps.client_map.as_fd()),
-                "session_map" => Some(s.maps.session_map.as_fd()),
-                "config_map" => Some(s.maps.config_map.as_fd()),
-                "counters_map" => Some(s.maps.counters_map.as_fd()),
-                "stats_map" => Some(s.maps.stats_map.as_fd()),
-                "scratch_map" => Some(s.maps.scratch_map.as_fd()),
-                _ => None,
-            },
+            Self::V4(s) => map_fd!(s),
+            Self::V6(s) => map_fd!(s),
+            Self::GostV4(s) => map_fd!(s),
+            Self::GostV6(s) => map_fd!(s),
+            Self::SyslogV4(s) => map_fd!(s),
+            Self::SyslogV6(s) => map_fd!(s),
+            Self::SipV4(s) => map_fd!(s),
+            Self::SipV6(s) => map_fd!(s),
         }
     }
 
@@ -218,6 +350,12 @@ impl EgressSkel {
         match self {
             Self::V4(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
             Self::V6(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
+            Self::GostV4(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
+            Self::GostV6(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
+            Self::SyslogV4(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
+            Self::SyslogV6(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
+            Self::SipV4(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
+            Self::SipV6(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
         }
     }
 }
@@ -227,7 +365,7 @@ pub struct TcBpfManager {
     interface: String,
     ingress_interface: String,
     egress_skel: EgressSkel,
-    ingress_skel: xdp_gut_ingress::XdpGutIngressSkel<'static>,
+    _ingress_skel: Box<dyn std::any::Any>,
     _egress_hook: libbpf_rs::TcHook,
     _xdp_link: libbpf_rs::Link,
     _veth_pass_link: libbpf_rs::Link,
@@ -353,32 +491,77 @@ impl TcBpfManager {
         let tun_ifindex = Self::get_ifindex(ifname)?;
         let ingress_ifindex = Self::get_ifindex(&ingress_ifname)?;
         let gut_config = Self::build_gut_config(config, ifname, &ingress_ifname)?;
+        let obfs_mode = config.peer().obfs;
         // gso_max_size = max total WireGuard packet (IP+UDP+WG_data) through gut0.
         // GUT TC BPF only *inserts* the 14-byte QUIC Short Header — the existing
         // WireGuard IP+UDP headers are moved back in-place (same size, rewritten).
         // So the net wire overhead is just +14 bytes, and gso_max_size must be:
         //   inner_mtu_v4 (max WG UDP payload) + IP_HDR(20) + UDP_HDR(8) = 1466
-        let gso_target = u32::from(gut_config.inner_mtu_v4) + 20 + 8;
-        Self::set_iface_gso_max_size(ifname, gso_target);
-        Self::set_iface_gso_max_size(&veth_xdp_name, gso_target);
+        let _gso_target = u32::from(gut_config.inner_mtu_v4) + 20 + 8;
+
+        // For absolute consistency with eBPF egress logic, we must ensure gso_max_size
+        // is high enough to allow any packet that BPF is willing to process.
+        // 9000 is safer to avoid any kernel-level fragmentation of TSO/GSO segments
+        // before they reach TC. eBPF datapath has enough memory (16KB) to handle this.
+        let final_gso = 9000;
+
+        Self::set_iface_gso_max_size(ifname, final_gso);
+        Self::set_iface_gso_max_size(&veth_xdp_name, final_gso);
         eprintln!(
             "  Applied GSO cap: {}={} {}={} (gso_max_size)",
-            ifname, gso_target, veth_xdp_name, gso_target
+            ifname, final_gso, veth_xdp_name, final_gso
         );
 
-        // ── Load egress skeleton (v4 or v6 based on peer AF) ────────
-        let egress_skel = if peer_is_v6 {
-            let builder = tc_gut_egress_v6::TcGutEgressSkelBuilder::default();
-            let open_obj: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
-                Box::leak(Box::new(MaybeUninit::uninit()));
-            let skel = builder.open(open_obj)?.load()?;
-            EgressSkel::V6(skel)
-        } else {
-            let builder = tc_gut_egress::TcGutEgressSkelBuilder::default();
-            let open_obj: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
-                Box::leak(Box::new(MaybeUninit::uninit()));
-            let skel = builder.open(open_obj)?.load()?;
-            EgressSkel::V4(skel)
+        // ── Load egress skeleton (mode × AF) ──────────────────────────
+        let egress_skel = match (obfs_mode, peer_is_v6) {
+            (crate::config::ObfsMode::Gost, true) => {
+                let b = tc_gut_egress_gost_v6::TcGutEgressSkelBuilder::default();
+                let o: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
+                    Box::leak(Box::new(MaybeUninit::uninit()));
+                EgressSkel::GostV6(b.open(o)?.load()?)
+            }
+            (crate::config::ObfsMode::Gost, false) => {
+                let b = tc_gut_egress_gost::TcGutEgressSkelBuilder::default();
+                let o: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
+                    Box::leak(Box::new(MaybeUninit::uninit()));
+                EgressSkel::GostV4(b.open(o)?.load()?)
+            }
+            (crate::config::ObfsMode::Syslog, true) => {
+                let b = tc_gut_egress_syslog_v6::TcGutEgressSkelBuilder::default();
+                let o: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
+                    Box::leak(Box::new(MaybeUninit::uninit()));
+                EgressSkel::SyslogV6(b.open(o)?.load()?)
+            }
+            (crate::config::ObfsMode::Syslog, false) => {
+                let b = tc_gut_egress_syslog::TcGutEgressSkelBuilder::default();
+                let o: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
+                    Box::leak(Box::new(MaybeUninit::uninit()));
+                EgressSkel::SyslogV4(b.open(o)?.load()?)
+            }
+            (crate::config::ObfsMode::Sip, true) => {
+                let b = tc_gut_egress_sip_v6::TcGutEgressSkelBuilder::default();
+                let o: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
+                    Box::leak(Box::new(MaybeUninit::uninit()));
+                EgressSkel::SipV6(b.open(o)?.load()?)
+            }
+            (crate::config::ObfsMode::Sip, false) => {
+                let b = tc_gut_egress_sip::TcGutEgressSkelBuilder::default();
+                let o: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
+                    Box::leak(Box::new(MaybeUninit::uninit()));
+                EgressSkel::SipV4(b.open(o)?.load()?)
+            }
+            (_, true) => {
+                let b = tc_gut_egress_v6::TcGutEgressSkelBuilder::default();
+                let o: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
+                    Box::leak(Box::new(MaybeUninit::uninit()));
+                EgressSkel::V6(b.open(o)?.load()?)
+            }
+            (_, false) => {
+                let b = tc_gut_egress::TcGutEgressSkelBuilder::default();
+                let o: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
+                    Box::leak(Box::new(MaybeUninit::uninit()));
+                EgressSkel::V4(b.open(o)?.load()?)
+            }
         };
 
         egress_skel.update_config_map(&gut_config)?;
@@ -398,62 +581,67 @@ impl TcBpfManager {
         egress_hook.attach()?;
         eprintln!("  TC egress attached on {ifname} (outer {outer_af})");
 
-        // ── Load ingress skeleton (XDP, handles both v4 and v6 outer) ───
-        let skel_builder_ingress = xdp_gut_ingress::XdpGutIngressSkelBuilder::default();
-        let open_ingress: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
-            Box::leak(Box::new(MaybeUninit::uninit()));
-
-        let mut open_skel = skel_builder_ingress.open(open_ingress)?;
-        if let Some(fd) = egress_skel.get_map_fd("client_map") {
-            open_skel.maps.client_map.reuse_fd(fd)?;
-        }
-        if let Some(fd) = egress_skel.get_map_fd("session_map") {
-            open_skel.maps.session_map.reuse_fd(fd)?;
-        }
-        if let Some(fd) = egress_skel.get_map_fd("config_map") {
-            open_skel.maps.config_map.reuse_fd(fd)?;
-        }
-        if let Some(fd) = egress_skel.get_map_fd("counters_map") {
-            open_skel.maps.counters_map.reuse_fd(fd)?;
-        }
-        if let Some(fd) = egress_skel.get_map_fd("stats_map") {
-            open_skel.maps.stats_map.reuse_fd(fd)?;
-        }
-        if let Some(fd) = egress_skel.get_map_fd("scratch_map") {
-            open_skel.maps.scratch_map.reuse_fd(fd)?;
-        }
-
-        let ingress_skel = open_skel.load()?;
-
-        // Populate devmap with veth_xdp ifindex
+        // ── Load ingress skeleton (mode-specific, XDP) ─────────────────
         let veth_xdp_ifindex = Self::get_ifindex(&veth_xdp_name)? as u32;
-        ingress_skel.maps.tx_devmap.update(
-            &0u32.to_ne_bytes(),
-            &veth_xdp_ifindex.to_ne_bytes(),
-            MapFlags::ANY,
-        )?;
+        macro_rules! load_ingress {
+            ($mod:ident) => {{
+                let builder = $mod::XdpGutIngressSkelBuilder::default();
+                let open_obj: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
+                    Box::leak(Box::new(MaybeUninit::uninit()));
+                let mut os = builder.open(open_obj)?;
+                if let Some(fd) = egress_skel.get_map_fd("client_map") {
+                    os.maps.client_map.reuse_fd(fd)?;
+                }
+                if let Some(fd) = egress_skel.get_map_fd("session_map") {
+                    os.maps.session_map.reuse_fd(fd)?;
+                }
+                if let Some(fd) = egress_skel.get_map_fd("config_map") {
+                    os.maps.config_map.reuse_fd(fd)?;
+                }
+                if let Some(fd) = egress_skel.get_map_fd("counters_map") {
+                    os.maps.counters_map.reuse_fd(fd)?;
+                }
+                if let Some(fd) = egress_skel.get_map_fd("stats_map") {
+                    os.maps.stats_map.reuse_fd(fd)?;
+                }
+                if let Some(fd) = egress_skel.get_map_fd("scratch_map") {
+                    os.maps.scratch_map.reuse_fd(fd)?;
+                }
+                let skel = os.load()?;
+                skel.maps.tx_devmap.update(
+                    &0u32.to_ne_bytes(),
+                    &veth_xdp_ifindex.to_ne_bytes(),
+                    MapFlags::ANY,
+                )?;
+                let xl = skel.progs.xdp_gut_ingress.attach_xdp(ingress_ifindex)?;
+                let vpl = skel.progs.xdp_veth_pass.attach_xdp(tun_ifindex)?;
+                (Box::new(skel) as Box<dyn std::any::Any>, xl, vpl)
+            }};
+        }
         eprintln!("  devmap[0] = {veth_xdp_name} (ifindex={veth_xdp_ifindex})");
 
-        // Attach XDP on NIC (decap + unmask + devmap redirect)
-        let xdp_link = ingress_skel
-            .progs
-            .xdp_gut_ingress
-            .attach_xdp(ingress_ifindex)?;
-
-        // Attach XDP_PASS stub on user-facing veth — required for devmap redirect.
-        // veth ndo_xdp_xmit checks that the PEER has an XDP program;
-        // without this, bpf_redirect_map to gut_xdp silently drops packets.
-        let veth_pass_link = ingress_skel.progs.xdp_veth_pass.attach_xdp(tun_ifindex)?;
+        let (_ingress_skel, xdp_link, veth_pass_link) = match obfs_mode {
+            crate::config::ObfsMode::Gost => load_ingress!(xdp_gut_ingress_gost),
+            crate::config::ObfsMode::Syslog => load_ingress!(xdp_gut_ingress_syslog),
+            crate::config::ObfsMode::Sip => load_ingress!(xdp_gut_ingress_sip),
+            _ => load_ingress!(xdp_gut_ingress),
+        };
 
         let xdp_mode = Self::detect_xdp_mode(&ingress_ifname);
+        let mode_name = match obfs_mode {
+            crate::config::ObfsMode::Gost => "gost",
+            crate::config::ObfsMode::Syslog => "syslog",
+            crate::config::ObfsMode::Sip => "sip",
+            _ => "quic",
+        };
         eprintln!("  XDP ingress on {ingress_ifname} ({xdp_mode}, devmap → {veth_xdp_name})");
-        eprintln!("GUT TC eBPF: Successfully attached");
+        eprintln!("GUT TC eBPF: Successfully attached (mode={mode_name})");
 
         Ok(Self {
             interface: ifname.to_string(),
             ingress_interface: ingress_ifname,
             egress_skel,
-            ingress_skel,
+            _ingress_skel,
             _egress_hook: egress_hook,
             _xdp_link: xdp_link,
             _veth_pass_link: veth_pass_link,
@@ -1286,9 +1474,63 @@ impl TcBpfManager {
         }
 
         // Obfuscation mode
-        if config.peer().obfs == crate::config::ObfsMode::Noise {
-            gut_config.obfs_noise = 1;
-            eprintln!("  Obfuscation mode: noise (QUIC signatures masked)");
+        match config.peer().obfs {
+            crate::config::ObfsMode::Gost => {
+                gut_config.obfs_gost = 1;
+                eprintln!("  Obfuscation mode: gost (BPF per-mode)");
+            }
+            crate::config::ObfsMode::Quic => {
+                eprintln!("  Obfuscation mode: quic (BPF per-mode)");
+            }
+            crate::config::ObfsMode::Syslog => {
+                eprintln!("  Obfuscation mode: syslog (BPF per-mode)");
+            }
+            crate::config::ObfsMode::Sip => {
+                eprintln!("  Obfuscation mode: sip (BPF per-mode)");
+            }
+        }
+
+        // ── QUIC AEAD: precompute keys from fixed DCID so BPF only needs AES-GCM ──
+        {
+            // Fixed DCID derived from GUT key (ChaCha block 99, nonce 0)
+            let chacha_init = gut_config.chacha_init;
+            let chacha_rounds = gut_config.chacha_rounds;
+            let ks99 =
+                crate::proto::mask_balanced::chacha_block_fast(&chacha_init, 99, 0, chacha_rounds);
+            gut_config.quic_dcid[0..4].copy_from_slice(&ks99[0].to_le_bytes());
+            gut_config.quic_dcid[4..8].copy_from_slice(&ks99[1].to_le_bytes());
+
+            // QUIC v1 key derivation: DCID → Initial Secret → Client Secret → keys
+            let initial_secret =
+                crate::proto::quic::derive_quic_initial_secret(&gut_config.quic_dcid);
+            let client_secret = crate::proto::quic::derive_client_initial_secret(&initial_secret);
+            let (q_key, q_iv, q_hp) = crate::proto::quic::derive_quic_keys(&client_secret);
+            gut_config.quic_key_rk = crate::crypto::aes128_expand_key(&q_key);
+            gut_config.quic_hp_rk = crate::crypto::aes128_expand_key(&q_hp);
+            gut_config.quic_iv = q_iv;
+
+            // SNI domain (= sip_domain from config), space-padded to 32 for fixed-size BPF syslog header
+            let sni = config.peer().sip_domain.as_bytes();
+            let sni_len = sni.len().min(31);
+            gut_config.sni_domain[..sni_len].copy_from_slice(&sni[..sni_len]);
+            // Pad remaining bytes with spaces so syslog header has no null bytes
+            for b in &mut gut_config.sni_domain[sni_len..] {
+                *b = b' ';
+            }
+            gut_config.sni_domain_len = sni_len as u8;
+
+            eprintln!(
+                "  QUIC AEAD: dcid={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} sni=\"{}\"",
+                gut_config.quic_dcid[0],
+                gut_config.quic_dcid[1],
+                gut_config.quic_dcid[2],
+                gut_config.quic_dcid[3],
+                gut_config.quic_dcid[4],
+                gut_config.quic_dcid[5],
+                gut_config.quic_dcid[6],
+                gut_config.quic_dcid[7],
+                &config.peer().sip_domain,
+            );
         }
 
         Ok(gut_config)
@@ -1321,25 +1563,17 @@ impl TcBpfManager {
 
         self.egress_skel.update_config_map(&gut_config)?;
 
-        self.ingress_skel.maps.config_map.update(
-            &0u32.to_ne_bytes(),
-            unsafe {
-                std::slice::from_raw_parts(
-                    (&gut_config as *const GutConfig).cast::<u8>(),
-                    std::mem::size_of::<GutConfig>(),
-                )
-            },
-            MapFlags::ANY,
-        )?;
-
         let outer_af = if self.egress_skel.is_v6() {
             "IPv6"
         } else {
             "IPv4"
         };
         eprintln!(
-            "GUT TC eBPF: Config reloaded (egress={}, ingress={}, outer={})",
-            self.interface, self.ingress_interface, outer_af
+            "GUT TC eBPF: Config reloaded (egress={}, ingress={}, outer={}, obfs={:?})",
+            self.interface,
+            self.ingress_interface,
+            outer_af,
+            config.peer().obfs
         );
         Ok(())
     }
@@ -1355,19 +1589,13 @@ impl TcBpfManager {
         let value_size = std::mem::size_of::<GutStats>();
 
         let egress = match self.egress_skel.lookup_stats(&key)? {
-            Some(per_cpu) => Self::parse_percpu_stats(&per_cpu, value_size),
+            Some(ref per_cpu) => Self::parse_percpu_stats(per_cpu, value_size),
             None => GutStats::default(),
         };
 
-        let ingress = match self
-            .ingress_skel
-            .maps
-            .stats_map
-            .lookup_percpu(&key, MapFlags::ANY)?
-        {
-            Some(per_cpu) => Self::parse_percpu_stats(&per_cpu, value_size),
-            None => GutStats::default(),
-        };
+        // Ingress stats_map shares FD with egress (reuse_fd at load time),
+        // so both programs' counters are combined in the same percpu map.
+        let ingress = GutStats::default();
 
         Ok(TcStats { egress, ingress })
     }

@@ -13,17 +13,27 @@
 <sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. [See test logic and full logs](https://github.com/sh0rch/gutd/actions/runs/23104163772). Last updated: 2026-03-15 05:31</i></sub>
 <!-- INTEGRATION_TEST_RESULTS_END -->
 
-**gutd v2** transparently obfuscates WireGuard UDP traffic using a Linux TC/XDP eBPF datapath. On egress it wraps each packet in a fake QUIC Long Header with a fake SNI, adds variable padding and masks the payload with a ChaCha keystream. On ingress the XDP program strips the QUIC emulation and unmasks the packet before the kernel stack sees it. WireGuard is completely unaware of gutd. A **pure userspace mode** (dual-thread, wire-compatible with eBPF path) is available for older kernels, unprivileged containers, MikroTik RouterOS, and **Windows**.
+**gutd v2** transparently obfuscates WireGuard UDP traffic using a Linux TC/XDP eBPF datapath. On egress the TC BPF program wraps each WireGuard packet in a chosen obfuscation envelope, masks the payload with a ChaCha keystream and optionally pads it. On ingress the XDP program validates, strips the envelope and restores the original packet before WireGuard sees it. WireGuard is completely unaware of gutd. A **pure userspace mode** (wire-compatible with the eBPF path) is available for older kernels, unprivileged containers, MikroTik RouterOS, and **Windows**.
+
+## Obfuscation Modes
+
+| Mode | `obfs=` | Wire appearance | Anti-probing | Ports |
+|---|---|---|---|---|
+| **QUIC** *(default)* | `quic` | Fake QUIC Long Header + SNI (looks like HTTPS/3) | XDP replies with QUIC Version Negotiation | any UDP |
+| **GOST** | `gost` | Looks like random UDP — no QUIC/TLS signatures | silent drop | any UDP |
+| **SIP/RTP** | `sip` | Signaling packets wrapped in SIP headers; data in RTP frames | XDP replies with `200 OK` / `401` / `403` | `ports[0]` = SIP (5060), `ports[1+]` = RTP (≥ 2 required) |
+| **Syslog** | `syslog` | Payload base64-encoded inside a fake syslog message | silent drop | any UDP (514 typical) |
+
+All modes apply ChaCha payload masking on top of the envelope. Both peers must use the same mode.
 
 ## Features
 
-- Fake QUIC Long Header encapsulation to mimic typical HTTPS/QUIC traffic
-- Optional `obfs=noise` mode — masks QUIC signatures so packets look like random UDP
-- Built-in lightweight HTTP/3 (QUIC) responder at the XDP layer to mock DPI active probes
+- Four obfuscation modes: QUIC, GOST (random UDP), SIP/RTP, Syslog — selectable per peer
+- Active DPI probe deflection at XDP layer (QUIC: Version Negotiation; SIP: `200 OK`/`401`/`403`)
 - WireGuard payload masking with ChaCha (4 rounds by default)
 - TC egress hook on a veth pair, XDP ingress hook on the physical NIC
-- Port striping: multiple fixed UDP ports per peer
-- Keepalive probabilistic drop to suppress WireGuard timing patterns
+- Port striping: multiple UDP ports per peer with per-packet rotation
+- Keepalive probabilistic drop to suppress WireGuard timing fingerprints
 - Variable padding to obscure packet sizes
 - Hot reload via SIGHUP (BPF map update, no restart)
 - Pure userspace fallback mode (zero eBPF requirements, ~500 Mbps capable)
@@ -49,7 +59,18 @@ gutd genkey          # → prints 256-bit hex key
 peer_ip    = 203.0.113.10    # remote peer public IP
 ports      = 41000
 key        = <output of gutd genkey>
+# obfs = quic               # quic (default) | gost | sip | syslog
 ```
+
+> **MTU note:** The obfuscation envelope adds overhead on top of the WireGuard packet.
+> Set your WireGuard interface MTU accordingly (see [MTU reference](#mtu-reference) below):
+>
+> | Mode | Overhead | Recommended WG MTU |
+> |---|---|---|
+> | `quic` | 16 bytes | 1420 (default) |
+> | `gost` | 10 bytes | 1420 |
+> | `sip` | 22 bytes (RTP+GOST) | **1400** |
+> | `syslog` | base64 expansion | **800** |
 
 ## Running
 
@@ -82,16 +103,45 @@ cargo build --release --target x86_64-pc-windows-gnu --no-default-features
 
 See [BUILD.md](BUILD.md) for cross-compilation and musl details.
 
+## MTU Reference
+
+Each obfuscation mode adds a different amount of overhead to every WireGuard packet.
+You **must** set the WireGuard interface MTU lower than the default 1420 for modes
+that add more than 16 bytes, otherwise oversized frames will be silently dropped by
+the network link.
+
+| Mode | Header added by gutd | Max safe WG MTU\* |
+|---|---|---|
+| `quic` | 16 bytes (QUIC short header) | **1420** |
+| `gost` | 10 bytes (GOST header) | **1420** |
+| `sip` | 22 bytes (RTP 12 + GOST 10) | **1400** |
+| `syslog` | base64 expansion (~4/3×) | **800** |
+
+\* For a 1500-byte outer link MTU (standard Ethernet). Adjust proportionally for PPPoE (1492) or other links.
+
+**SIP special requirement:** `sip` mode requires at least **2 ports** — `ports[0]` carries
+SIP signaling packets and `ports[1+]` carry RTP data frames. gutd will refuse to start
+with fewer than 2 ports in SIP mode.
+
+```ini
+# Correct SIP config example
+[peer]
+obfs  = sip
+ports = 5060, 10000, 10001   # [0]=signaling  [1+]=RTP
+mtu   = 1400
+sni   = sip.example.com
+key   = <shared key>
+```
+
 ## Documentation
 
 | Document | Description |
 |---|---|
-| [doc/configuration.md](doc/configuration.md) | Full config reference, key generation, MTU tuning |
+| [doc/configuration.md](doc/configuration.md) | Full config reference, obfs modes, MTU tuning |
 | [doc/running.md](doc/running.md) | All running modes: basic, P2P, RouterOS, relay |
-| [doc/architecture.md](doc/architecture.md) | Egress/ingress datapath, userspace daemon, security, related projects |
+| [doc/architecture.md](doc/architecture.md) | Egress/ingress datapath, userspace daemon, security |
 | [doc/testing.md](doc/testing.md) | Unit and integration tests |
 | [doc/troubleshooting.md](doc/troubleshooting.md) | Troubleshooting, firewall notes |
-| [IMPLEMENTATION.md](IMPLEMENTATION.md) | Architecture and internals |
 | [BUILD.md](BUILD.md) | Build instructions |
 | [METRICS.md](METRICS.md) | Stats counters |
 
