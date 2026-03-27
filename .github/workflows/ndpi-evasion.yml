@@ -48,7 +48,7 @@ jobs:
         make -j$(nproc)
 
     - name: Verify ndpiReader
-      run: /tmp/nDPI/example/ndpiReader -V
+      run: /tmp/nDPI/example/ndpiReader 2>&1 | grep -m1 "Welcome to nDPI"
 
     - name: Upload ndpiReader
       uses: actions/upload-artifact@v4
@@ -89,7 +89,7 @@ jobs:
         chmod +x /tmp/ndpi-bin/ndpiReader
         sudo cp /tmp/ndpi-bin/ndpiReader /usr/local/bin/ndpiReader
         /tmp/bin/gutd-x86_64 --version
-        ndpiReader -V
+        ndpiReader 2>&1 | grep -m1 "Welcome to nDPI"
 
     - name: Run nDPI evasion test (${{ matrix.mode }})
       env:
