@@ -469,3 +469,31 @@ pub fn write_rtp_header(buf: &mut [u8], seq: u16, ts: u32, ssrc: u32) -> usize {
     buf[8..12].copy_from_slice(&ssrc.to_be_bytes());
     RTP_HEADER_LEN
 }
+
+/// Format Unix timestamp as RFC 2822 date (date portion only, no time component).
+/// Lives here so it compiles on all target platforms.
+pub fn format_sip_date_only(timestamp: u64) -> String {
+    const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    let days_since_epoch = timestamp / 86400;
+    let day_of_week = ((days_since_epoch + 4) % 7) as usize; // 1970-01-01 was Thursday
+
+    let days = days_since_epoch as i64 + 719468;
+    let era = (if days >= 0 { days } else { days - 146096 }) / 146097;
+    let doe = (days - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let year = yoe as i32 + era as i32 * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u8;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as usize - 1;
+    let year = if month <= 1 { year + 1 } else { year };
+
+    format!(
+        "{}, {:02} {} {}",
+        DAYS[day_of_week], day, MONTHS[month], year
+    )
+}

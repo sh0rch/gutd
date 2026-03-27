@@ -21,34 +21,8 @@ pub const DEFAULT_INNER_MTU: u16 = 1492;
 /// ChaCha round count — compile-time constant, must match BPF CHACHA_ROUNDS.
 pub const CHACHA_ROUNDS: u8 = 4;
 
-/// Format Unix timestamp as RFC 2822 date (only date part, no time)
-pub fn format_sip_date_only(timestamp: u64) -> String {
-    const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-
-    let secs_per_day = 86400u64;
-    let days_since_epoch = timestamp / secs_per_day;
-    let day_of_week = ((days_since_epoch + 4) % 7) as usize; // 1970-01-01 was Thursday
-
-    // Simplified date calculation (works for 2000-2099)
-    let days = days_since_epoch as i64 + 719468; // Days since 0000-03-01
-    let era = (if days >= 0 { days } else { days - 146096 }) / 146097;
-    let doe = (days - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let year = yoe as i32 + era as i32 * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u8;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as usize - 1;
-    let year = if month <= 1 { year + 1 } else { year };
-
-    format!(
-        "{}, {:02} {} {}",
-        DAYS[day_of_week], day, MONTHS[month], year
-    )
-}
+/// Re-exported so callers within the `tc` module can still use the same path.
+pub use crate::proto::sip::format_sip_date_only;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]

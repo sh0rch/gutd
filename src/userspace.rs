@@ -1117,7 +1117,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 let src_ip_str = src.ip().to_string();
                                 let dst_ip_str = dest.ip().to_string();
                                 let rtp_port = peer.ports.get(1).copied().unwrap_or(10000);
-                                let date_str = crate::tc::maps::format_sip_date_only(
+                                let date_str = crate::proto::sip::format_sip_date_only(
                                     SystemTime::now()
                                         .duration_since(UNIX_EPOCH)
                                         .unwrap()
@@ -1234,7 +1234,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                             sip_resp.fill(0);
                             let src_ip_str = ingress_peer.bind_ip.to_string();
                             let dst_ip_str = src.ip().to_string();
-                            let date_str = crate::tc::maps::format_sip_date_only(
+                            let date_str = crate::proto::sip::format_sip_date_only(
                                 SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
                                     .unwrap()
@@ -1322,7 +1322,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 sip_resp.fill(0);
                                 let src_ip_str = ingress_peer.bind_ip.to_string();
                                 let dst_ip_str = src.ip().to_string();
-                                let date_str = crate::tc::maps::format_sip_date_only(
+                                let date_str = crate::proto::sip::format_sip_date_only(
                                     SystemTime::now()
                                         .duration_since(UNIX_EPOCH)
                                         .unwrap()
