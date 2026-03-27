@@ -91,6 +91,9 @@ mkdir -p target/musl
 docker_exec run --rm \
     -u "$(id -u):$(id -g)" \
     -v "$PROJECT_ROOT:/work" \
+    -v /etc/ssl/certs:/etc/ssl/certs:ro \
+    -v /usr/share/ca-certificates:/usr/share/ca-certificates:ro \
+    -v /usr/local/share/ca-certificates:/usr/local/share/ca-certificates:ro \
     -w /work \
     -e RUST_TARGET="$TARGET" \
     -e RUSTUP_HOME=/usr/local/rustup \

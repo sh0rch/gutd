@@ -125,4 +125,3 @@ sudo ip netns exec relay_ns ping -c 3 10.200.0.2
 ## See also
 - [WireGuard Relay Configuration](../examples/wireguard-relay.md)
 - [Build Documentation](../BUILD.md)
-- [Implementation Details](../IMPLEMENTATION.md)

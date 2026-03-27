@@ -13,7 +13,7 @@
 #   CID=$(docker create gutd) && docker cp "$CID:/out/gutd" gutd && docker rm "$CID"
 
 # ── Stage 1: extract musl libs + headers from Alpine ─────────────
-FROM alpine:3.21 AS sysroot
+FROM mirror.gcr.io/library/alpine:3.21 AS sysroot
 
 RUN apk add --no-cache \
     elfutils-dev \
@@ -32,7 +32,7 @@ RUN apk add --no-cache \
     /usr/include/linux /sysroot/include/
 
 # ── Stage 2: build toolchain ─────────────────────────────────────
-FROM rust:bookworm AS toolchain
+FROM mirror.gcr.io/library/rust:bookworm AS toolchain
 
 RUN export DEBIAN_FRONTEND=noninteractive && \
     export TZ=Etc/UTC && \
