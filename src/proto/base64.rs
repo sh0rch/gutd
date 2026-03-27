@@ -26,13 +26,13 @@ pub fn encode(input: &[u8], output: &mut [u8]) -> usize {
 
         output[o] = ALPHABET[(b0 >> 2) as usize];
         output[o + 1] = ALPHABET[(((b0 & 0x3) << 4) | (b1 >> 4)) as usize];
-        
+
         if i + 1 < len {
             output[o + 2] = ALPHABET[(((b1 & 0xF) << 2) | (b2 >> 6)) as usize];
         } else {
             output[o + 2] = b'=';
         }
-        
+
         if i + 2 < len {
             output[o + 3] = ALPHABET[(b2 & 0x3F) as usize];
         } else {
@@ -67,7 +67,7 @@ pub fn decode(input: &[u8], output: &mut [u8]) -> Option<usize> {
 
         output[o] = (v0 << 2) | (v1 >> 4);
         let mut written = 1;
-        
+
         if input[i + 2] != b'=' {
             output[o + 1] = (v1 << 4) | (v2 >> 2);
             written += 1;
