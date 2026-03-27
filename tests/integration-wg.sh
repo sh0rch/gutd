@@ -9,16 +9,47 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUTD_BINARY="${GUTD_BINARY:-$SCRIPT_DIR/../target/musl/gutd}"
 RESULTS_FILE="${RESULTS_FILE:-/tmp/gutd-test-results.txt}"
 GUTD_OBFS="${GUTD_OBFS:-quic}"
-GUT_PORTS_CSV="${GUT_PORTS_CSV:-41000,41001}"
 
-# Base MTU: syslog base64 path has a hard limit of 800 bytes for WG payload.
-# SIP uses RTP for data (no base64), so it can use the full 1420 MTU.
-# For QUIC/Gost it can be higher (default 1420).
-if [[ "$GUTD_OBFS" == "syslog" ]]; then
-    WG_MTU="${WG_MTU:-800}"
-else
-    WG_MTU="${WG_MTU:-1420}"
+# Per-mode default ports (override via GUT_PORTS_CSV):
+#   quic   — any UDP port(s)
+#   gost   — single random-looking UDP port
+#   sip    — ports[0]=SIP signaling, ports[1+]=RTP media (≥2 required)
+#   syslog — standard syslog UDP
+if [[ -z "${GUT_PORTS_CSV:-}" ]]; then
+    case "$GUTD_OBFS" in
+        gost)   GUT_PORTS_CSV="2046" ;;
+        sip)    GUT_PORTS_CSV="5060,10000,10001" ;;
+        syslog) GUT_PORTS_CSV="514" ;;
+        b64)    GUT_PORTS_CSV="8080" ;;
+        *)      GUT_PORTS_CSV="41000,41001" ;;  # quic / unknown
+    esac
 fi
+
+# Per-mode SNI / service name (override via GUTD_SNI):
+#   quic   — TLS SNI domain in QUIC ClientHello
+#   sip    — SIP domain in Via/To/From headers
+#   syslog — syslog hostname / service name
+#   gost   — unused
+if [[ -z "${GUTD_SNI:-}" ]]; then
+    case "$GUTD_OBFS" in
+        syslog) GUTD_SNI="asterisk" ;;
+        sip)    GUTD_SNI="sip.example.com" ;;
+        gost)   GUTD_SNI="" ;;
+        *)      GUTD_SNI="example.com" ;;  # quic / unknown
+    esac
+fi
+
+# Per-mode WG MTU (affects both the WireGuard interface MTU and the gutd peer mtu):
+#   syslog — base64 expands payload; WG_MTU=800 → wg_len≈832 ≤ GUT_B64_WG_MTU_MAX(886) ✓
+#   sip    — RTP(12)+GOST(10)=22 bytes added by BPF; WG_MTU=1400 verified working;
+#            WG_MTU=1408+ causes oversized frames on veth (empirically confirmed)
+#   quic   — QUIC short header adds 16 bytes; keeps outer packet ≤ 1500, use 1420
+#   gost   — GOST adds 10 bytes; keeps outer packet ≤ 1500, use 1420
+case "$GUTD_OBFS" in
+    syslog) WG_MTU="${WG_MTU:-800}"  ;;
+    sip)    WG_MTU="${WG_MTU:-1400}" ;;
+    *)      WG_MTU="${WG_MTU:-1420}" ;;
+esac
 
 build_udp_port_filter() {
     local csv="$1"
@@ -142,6 +173,17 @@ setup_namespaces() {
     
     ip netns exec server_ns ip addr add 10.100.2.2/24 dev veth_srv
     ip netns exec server_ns ip link set veth_srv up
+
+    # Disable segmentation offloads so BPF sees individual segments at the real MTU
+    # (mirrors the ndpi test approach; prevents TSO/GSO from inflating effective packet size)
+    for ns_cmd in \
+        "ip netns exec relay_ns  ethtool -K veth_relay  gso off gro off tso off" \
+        "ip netns exec server_ns ethtool -K veth_server gso off gro off tso off" \
+        "ip netns exec server_ns ethtool -K veth_srv    gso off gro off tso off" \
+        "ethtool -K veth_host gso off gro off tso off"
+    do
+        $ns_cmd 2>/dev/null || true
+    done
     
     # Routing
     ip netns exec relay_ns ip route add default via 10.100.1.2
@@ -207,13 +249,15 @@ capture_packets() {
     local output_file=$2
     local count=${3:-5}
     local namespace=${4:-}
-    
+    # Optional BPF filter (5th arg); default to plain 'udp'
+    local filter="${5:-udp}"
+
     log "Capturing $count packets on $interface -> $output_file"
-    
+
     if [ -n "$namespace" ]; then
-        timeout 10 ip netns exec "$namespace" tcpdump -i "$interface" -c "$count" -w "$output_file" udp 2>/dev/null || true
+        timeout 10 ip netns exec "$namespace" tcpdump -i "$interface" -c "$count" -w "$output_file" $filter 2>/dev/null || true
     else
-        timeout 10 tcpdump -i "$interface" -c "$count" -w "$output_file" udp 2>/dev/null || true
+        timeout 10 tcpdump -i "$interface" -c "$count" -w "$output_file" $filter 2>/dev/null || true
     fi
 }
 
@@ -282,6 +326,14 @@ setup_gutd() {
         relay_responder_line="responder = false"
         server_responder_line="responder = true"
     fi
+
+    # Optional config lines that vary by obfuscation mode
+    local sni_line=""
+    [[ -n "${GUTD_SNI:-}" ]] && sni_line="sni = $GUTD_SNI"
+    # own_http3: anti-probe handler flag — meaningful for quic (QUIC VerNeg) and sip (SIP 401/403).
+    # Other modes have no XDP anti-probe handler so keep it false.
+    local own_http3_line="own_http3 = false"
+    [[ "$GUTD_OBFS" == "quic" || "$GUTD_OBFS" == "sip" ]] && own_http3_line="own_http3 = true"
     
     # gutd config for relay (in server_ns)
     cat > /tmp/gutd-relay.conf <<EOF
@@ -293,7 +345,7 @@ $userspace_line
 [peer]
 name = gut0
 nic = veth_srv
-mtu = 1420
+mtu = $WG_MTU
 address = 10.254.0.1/30
 bind_ip = 10.100.2.2
 peer_ip = 10.100.2.1
@@ -301,6 +353,8 @@ ports = $GUT_PORTS_CSV
 obfs = $GUTD_OBFS
 keepalive_drop_percent = 30
 key = $GUTD_SHARED_KEY
+$sni_line
+$own_http3_line
 $relay_responder_line
 EOF
     
@@ -314,7 +368,7 @@ $userspace_line
 [peer]
 name = gut1
 nic = veth_host
-mtu = 1420
+mtu = $WG_MTU
 address = 10.254.0.2/30
 bind_ip = 10.100.2.1
 peer_ip = 10.100.2.2
@@ -322,6 +376,8 @@ ports = $GUT_PORTS_CSV
 obfs = $GUTD_OBFS
 keepalive_drop_percent = 30
 key = $GUTD_SHARED_KEY
+$sni_line
+$own_http3_line
 $server_responder_line
 EOF
     
@@ -631,21 +687,26 @@ test_wireguard_via_gutd() {
     iperf3 -s -B 10.200.0.2 -p 5201 -D > /tmp/iperf3-server-gutd.log 2>&1
     sleep 1
     
+    # Separate pcap files per mode so the userspace run can't show
+    # stale eBPF capture data and both can be inspected independently.
+    local wire_pcap="/tmp/gutd-test-gutd-wire-${mode}.pcap"
+    local tunnel_pcap="/tmp/gutd-test-gutd-tunnel-${mode}.pcap"
+    rm -f "$wire_pcap" "$tunnel_pcap"
+
     # Capture packets at two levels
     # 1. Wire (veth_host): should see gutd UDP on configured ports
     log "Capturing wire packets with full details..."
     local wire_filter
     wire_filter="$(build_udp_port_filter "$GUT_PORTS_CSV")"
-    #timeout 6 tcpdump -i veth_host -n -vv -c 10 "$wire_filter" > /tmp/gutd-test-wire-details.txt 2>&1 &
-    timeout 6 tcpdump -i veth_host -n -vv -c 10  > /tmp/gutd-test-wire-details.txt 2>&1 &
+    timeout 6 tcpdump -i veth_host -n -vv -c 10 $wire_filter > /tmp/gutd-test-wire-details.txt 2>&1 &
     TCPDUMP_DETAIL_PID=$!
-    
-    capture_packets veth_host /tmp/gutd-test-gutd-wire.pcap 5 &
+
+    capture_packets veth_host "$wire_pcap" 5 "" "$wire_filter" &
     TCPDUMP1_PID=$!
-    
+
     # 2. Tunnel (gut1): only in eBPF mode (no gut interfaces in userspace)
     if [ "$mode" != "userspace" ]; then
-        capture_packets gut1 /tmp/gutd-test-gutd-tunnel.pcap 5 &
+        capture_packets gut1 "$tunnel_pcap" 5 &
         TCPDUMP2_PID=$!
     fi
     
@@ -689,15 +750,15 @@ test_wireguard_via_gutd() {
     
     # Analyze captured packets
     local wire_packets
-    wire_packets=$(tcpdump -r /tmp/gutd-test-gutd-wire.pcap 2>/dev/null | wc -l)
+    wire_packets=$(tcpdump -r "$wire_pcap" 2>/dev/null | wc -l)
     log "Captured $wire_packets gutd packets on wire"
-    echo "gutd_wire_packets=$wire_packets" >> "$RESULTS_FILE"
-    
+    echo "gutd_${mode}_wire_packets=$wire_packets" >> "$RESULTS_FILE"
+
     if [ "$mode" != "userspace" ]; then
         local tunnel_packets
-        tunnel_packets=$(tcpdump -r /tmp/gutd-test-gutd-tunnel.pcap 2>/dev/null | wc -l)
+        tunnel_packets=$(tcpdump -r "$tunnel_pcap" 2>/dev/null | wc -l)
         log "Captured $tunnel_packets WireGuard packets in gutd tunnel"
-        echo "gutd_tunnel_packets=$tunnel_packets" >> "$RESULTS_FILE"
+        echo "gutd_${mode}_tunnel_packets=$tunnel_packets" >> "$RESULTS_FILE"
     fi
     
     # Collect interface statistics
@@ -716,7 +777,7 @@ test_wireguard_via_gutd() {
     
     # Verify obfuscation: wire packets should be gutd UDP, not WireGuard
     log "Analyzing packet obfuscation..."
-    tcpdump -r /tmp/gutd-test-gutd-wire.pcap -n 2>/dev/null | head -n 5 | tee -a "$RESULTS_FILE"
+    tcpdump -r "$wire_pcap" -n 2>/dev/null | head -n 5 | tee -a "$RESULTS_FILE"
     
     # Show performance stats from gutd logs
     log "=== gutd performance stats ==="
@@ -725,6 +786,71 @@ test_wireguard_via_gutd() {
     echo "Relay stats:" >&2
     grep -A 10 "Performance Stats" /tmp/gutd-test-relay.log | tail -n 20 >&2 || echo "No stats found" >&2
     log "============================="
+}
+
+# Test SIP anti-probing (own_http3, SIP mode only)
+# Sends SIP probes from server_ns to the host GUT port (ports[0] = signaling).
+# Traffic arrives at veth_host XDP ingress -> handle_sip_probe replies with
+# 200 OK / 401 Unauthorized / 403 Forbidden via XDP_TX.
+test_sip_antiprobe() {
+    log "Testing SIP anti-probing (own_http3)..."
+
+    if ! command -v python3 &>/dev/null; then
+        warn "python3 not found — skipping SIP probe test"
+        echo "sip_antiprobe=SKIP" >> "$RESULTS_FILE"
+        return
+    fi
+
+    # ports[0] is the SIP signaling port (first in the CSV)
+    local probe_port
+    probe_port=$(echo "$GUT_PORTS_CSV" | cut -d, -f1 | xargs)
+
+    log "Sending SIP probes from server_ns -> 10.100.2.1:$probe_port"
+
+    # Inline probe script — mirrors test_anti_probing.sh logic
+    if ip netns exec server_ns python3 - 10.100.2.1 "$probe_port" <<'PYEOF'
+import socket, sys
+host, port = sys.argv[1], int(sys.argv[2])
+fail = False
+
+def probe(name, payload, want):
+    global fail
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(2.0)
+    s.sendto(payload, (host, port))
+    try:
+        data, _ = s.recvfrom(4096)
+        if want is None:
+            print(f"[FAIL] {name}: expected no response, got {len(data)} bytes")
+            fail = True
+        elif want in data:
+            print(f"[OK]   {name}: got expected '{want.decode()}'")
+        else:
+            print(f"[FAIL] {name}: expected '{want.decode()}', got: {data[:80]}")
+            fail = True
+    except socket.timeout:
+        if want is None:
+            print(f"[OK]   {name}: dropped (no response expected)")
+        else:
+            print(f"[FAIL] {name}: expected '{want.decode()}', got timeout")
+            fail = True
+    finally:
+        s.close()
+
+probe("SIP OPTIONS",  b"OPTIONS sip:user@example.com SIP/2.0\r\n\r\n",  b"200 OK")
+probe("SIP REGISTER", b"REGISTER sip:user@example.com SIP/2.0\r\n\r\n", b"401 Unauthorized")
+probe("SIP INVITE",   b"INVITE sip:user@example.com SIP/2.0\r\n\r\n",  b"403 Forbidden")
+probe("GARBAGE",      b"\xff\xff\xff\xff",                               None)
+probe("RTP PROBE",    b"\x80\x60\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00", None)
+sys.exit(1 if fail else 0)
+PYEOF
+    then
+        log "[ok] SIP anti-probing: PASS"
+        echo "sip_antiprobe=PASS" >> "$RESULTS_FILE"
+    else
+        warn "[FAIL] SIP anti-probing: FAIL"
+        echo "sip_antiprobe=FAIL" >> "$RESULTS_FILE"
+    fi
 }
 
 # Test QUIC Version Negotiation anti-probing (own_http3)
@@ -817,28 +943,32 @@ compare_results() {
     echo "" >> "$RESULTS_FILE"
     echo "=== Test Summary ===" >> "$RESULTS_FILE"
     
-    local baseline_mbps=$(grep "wireguard_baseline_mbps=" "$RESULTS_FILE" | cut -d= -f2)
-    local gutd_mbps=$(grep "wireguard_gutd_mbps=" "$RESULTS_FILE" | cut -d= -f2)
-    
-    if [ -n "$baseline_mbps" ] && [ -n "$gutd_mbps" ]; then
-        local overhead=$(echo "scale=2; (1 - $gutd_mbps / $baseline_mbps) * 100" | bc)
-        echo "Throughput overhead: ${overhead}%" >> "$RESULTS_FILE"
-        
-        log "WireGuard baseline: ${baseline_mbps} Mbps"
-        log "WireGuard via gutd: ${gutd_mbps} Mbps"
-        log "Overhead: ${overhead}%"
-        
-        # Check if overhead is acceptable (<30%)
-        local overhead_int=${overhead%.*}
-        if [ "${overhead_int:-100}" -lt 30 ]; then
-            log "[ok] Throughput overhead is acceptable (<30%)"
-        else
-            warn "Throughput overhead is high (>${overhead}%)"
-        fi
-    fi
+    local baseline_mbps
+    baseline_mbps=$(grep "wireguard_baseline_mbps=" "$RESULTS_FILE" | cut -d= -f2)
+    local gutd_ebpf_mbps gutd_userspace_mbps
+    gutd_ebpf_mbps=$(grep    "wireguard_gutd_mbps="           "$RESULTS_FILE" | cut -d= -f2)
+    gutd_userspace_mbps=$(grep "wireguard_gutd_userspace_mbps=" "$RESULTS_FILE" | cut -d= -f2)
 
-    local probe_result
-    probe_result=$(grep "quic_antiprobe=" "$RESULTS_FILE" | cut -d= -f2)
+    log "WireGuard baseline:              ${baseline_mbps:-N/A} Mbps"
+
+    _report_overhead() {
+        local label="$1" mbps="$2"
+        if [ -n "$baseline_mbps" ] && [ -n "$mbps" ]; then
+            local overhead
+            overhead=$(echo "scale=2; (1 - $mbps / $baseline_mbps) * 100" | bc)
+            echo "Throughput overhead (${label}): ${overhead}%" >> "$RESULTS_FILE"
+            log "WireGuard via gutd (${label}):   ${mbps} Mbps  (overhead: ${overhead}%)"
+            local oi=${overhead%.*}
+            if [ "${oi:-100}" -lt 30 ]; then
+                log "[ok] ${label} overhead acceptable (<30%)"
+            else
+                warn "${label} overhead is high (${overhead}%)"
+            fi
+        fi
+    }
+    _report_overhead "eBPF"      "$gutd_ebpf_mbps"
+    _report_overhead "userspace" "$gutd_userspace_mbps"
+
     local ping_rtt ping_loss
     ping_rtt=$(grep  "wg_gutd_ping_rtt="  "$RESULTS_FILE" | cut -d= -f2-)
     ping_loss=$(grep "wg_gutd_ping_loss=" "$RESULTS_FILE" | cut -d= -f2-)
@@ -847,17 +977,30 @@ compare_results() {
         log "WG-over-gutd packet loss:      ${ping_loss:-0% packet loss}"
     fi
 
-    case "${probe_result:-}" in
-        PASS) log "QUIC anti-probing:             PASS" ;;
-        FAIL) warn "QUIC anti-probing:             FAIL" ;;
-        SKIP) warn "QUIC anti-probing:             SKIP (python3 missing)" ;;
-        *)    warn "QUIC anti-probing:             NOT RUN" ;;
+    # Anti-probing result — key name varies by obfs mode
+    local quic_result sip_result
+    quic_result=$(grep "quic_antiprobe=" "$RESULTS_FILE" | cut -d= -f2)
+    sip_result=$(grep  "sip_antiprobe="  "$RESULTS_FILE" | cut -d= -f2)
+    case "${quic_result:-}" in
+        PASS)    log  "QUIC anti-probing:             PASS" ;;
+        FAIL)    warn "QUIC anti-probing:             FAIL" ;;
+        SKIP)    warn "QUIC anti-probing:             SKIP (python3 missing)" ;;
+        SKIPPED) log  "QUIC anti-probing:             SKIPPED (not quic mode)" ;;
+        '') ;; # not run for this mode
+    esac
+    case "${sip_result:-}" in
+        PASS)    log  "SIP anti-probing:              PASS" ;;
+        FAIL)    warn "SIP anti-probing:              FAIL" ;;
+        SKIP)    warn "SIP anti-probing:              SKIP (python3 missing)" ;;
+        SKIPPED) log  "SIP anti-probing:              SKIPPED (not sip mode)" ;;
+        '') ;; # not run for this mode
     esac
 }
 
 # Main execution
 main() {
     log "Starting WireGuard + gutd integration test..."
+    log "  obfs=${GUTD_OBFS}  ports=${GUT_PORTS_CSV}  SNI=${GUTD_SNI:-none}  WG_MTU=${WG_MTU}"
     
     # Init results file
     echo "=== Integration Test Results ===" > "$RESULTS_FILE"
@@ -886,9 +1029,23 @@ main() {
     setup_wireguard_via_gutd "ebpf"
     test_wireguard_via_gutd "ebpf"
 
-    # Test 3: QUIC anti-probing (requires eBPF XDP to be loaded)
-    log "=== Test 3: QUIC anti-probing ==="
-    test_quic_antiprobe
+    # Test 3: anti-probing — mechanism differs by mode
+    #   quic  → QUIC Version Negotiation (handle_quic_probe, XDP_TX)
+    #   sip   → SIP 200/401/403 responses (handle_sip_probe, XDP_TX)
+    #   other → no XDP anti-probe handler compiled in
+    case "$GUTD_OBFS" in
+        quic)
+            log "=== Test 3: QUIC Version Negotiation anti-probing ==="
+            test_quic_antiprobe
+            ;;
+        sip)
+            log "=== Test 3: SIP anti-probing ==="
+            test_sip_antiprobe
+            ;;
+        *)
+            log "=== Test 3: anti-probing SKIPPED (obfs=${GUTD_OBFS} has no XDP probe handler) ==="
+            ;;
+    esac
     
     cleanup_gutd
     sleep 2

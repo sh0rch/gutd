@@ -1160,7 +1160,15 @@ static __always_inline int handle_sip_probe(struct xdp_md *ctx)
         return XDP_PASS;
 
     /* Identify SIP method from first byte(s) */
-    /* Response lines: "SIP/2.0 " — not a probe, ignore */
+    /* Only respond to actual SIP text requests.
+     * SIP methods are always uppercase ASCII (A-Z).  If the payload starts
+     * with a non-letter byte (binary RTP, RTCP, STUN, etc.) we silently
+     * drop it — sending 403 to binary probes would identify us as a SIP
+     * server even more precisely than silence would. */
+    if (sip[0] < 'A' || sip[0] > 'Z')
+        return XDP_DROP;
+
+    /* Response lines: "SIP/2.0 " — already validated traffic, not a probe */
     if (sip[0] == 'S' && sip[1] == 'I' && sip[2] == 'P')
         return XDP_PASS;
 
