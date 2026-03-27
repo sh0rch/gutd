@@ -49,7 +49,9 @@
 #define GUT_RTP_HEADER_SIZE 12 /* RTP header: V(1)+PT(1)+seq(2)+ts(4)+SSRC(4) */
 #define GUT_B64_MAX_INNER 896  /* max inner before b64: GOST_HDR(10) + wg(800) + pad(64) */
 #define GUT_B64_MAX_OUT 1200   /* ceil(896/3)*4 = 1200 */
-#define GUT_B64_WG_MTU_MAX 800 /* max WG packet size for syslog mode (full base64 encap) */
+#define GUT_B64_WG_MTU_MAX 886 /* max wg_total (wg_len+pad_len) for syslog b64 path;
+                                 * = GUT_B64_MAX_INNER(896) - GOST_HDR(10);
+                                 * WG_MTU=800 → wg_len=832 ≤ 886, output ~ 1196 bytes ≤ 1500 */
 #define SIP_SCAN_OFF 2560      /* scratch offset for SIP marker scan on ingress */
 
 /* Combined base64 mode flag for shared syslog/SIP code paths */
