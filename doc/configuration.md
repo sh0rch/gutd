@@ -32,7 +32,7 @@ peer_ip = 203.0.113.10      # remote peer IP (or "dynamic" — see below)
 ports = 41000,41001         # UDP ports (must match WG listen/endpoint ports)
 # keepalive_drop_percent = 30
 # own_http3 = true          # XDP active-probe deflection (quic+sip only)
-# obfs = quic               # obfuscation mode: quic (default) | gost | sip | syslog
+# obfs = quic               # obfuscation mode: quic (default) | gut | sip | syslog
 key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 # passphrase = my-secret     # alternative to key (HKDF-SHA256 derived)
 ```
@@ -45,11 +45,15 @@ Both peers must use the same mode.
 | `obfs=` | Wire appearance | Active-probe reply | Ports |
 |---|---|---|---|
 | **`quic`** *(default)* | Fake QUIC Long Header + SNI (looks like HTTPS/3) | QUIC Version Negotiation | any UDP |
-| **`gost`** | Random-looking UDP — no QUIC/TLS byte patterns | silent drop | any UDP |
+| **`gut`** | GOST-like random UDP — no QUIC/TLS byte patterns | silent drop | any UDP |
 | **`sip`** | Signaling in SIP headers; data in RTP frames | `200 OK` / `401` / `403` | `ports[0]`=SIP, `ports[1+]`=RTP (**≥2 required**) |
 | **`syslog`** | WG payload base64-encoded inside a fake syslog message | silent drop | any UDP |
 
 ChaCha payload masking is applied in all modes on top of the protocol envelope.
+
+> **Kernel note (eBPF mode):** `quic` and `sip` require kernel ≥ 6.3 for reliable
+> BPF verifier pass. On kernels 6.1–6.2 use `gut` or `syslog` mode, or
+> `GUTD_USERSPACE=1`. See [troubleshooting](troubleshooting.md#bpf-verifier-rejects-program-on-kernel-61--62).
 
 #### SIP mode port contract
 
@@ -98,7 +102,7 @@ When `GUTD_PEER_IP` is set and no config file is passed via CLI, gutd reads all 
 | `GUTD_DEFAULT_POLICY` | no | `allow` | `default_policy` |
 | `GUTD_KEEPALIVE_DROP_PCT` | no | `30` | `keepalive_drop_percent` |
 | `GUTD_OWN_HTTP3` | no | `true` | `own_http3` |
-| `GUTD_OBFS` | no | `quic` | `obfs` (`quic`, `gost`, `sip`, or `syslog`) |
+| `GUTD_OBFS` | no | `quic` | `obfs` (`quic`, `gut`, `sip`, or `syslog`) |
 | `GUTD_USERSPACE_ONLY` | no | `false` | `userspace_only` |
 | `GUTD_STATS_INTERVAL` | no | `5` | `stats_interval` |
 | `GUTD_STAT_FILE` | no | `/run/gutd.stat` | `stat_file` |
@@ -217,8 +221,8 @@ throughput. Always set the WireGuard interface MTU to match the mode.
 | Mode | Overhead added by gutd | Recommended WG MTU\* |
 |---|---|---|
 | `quic` | 16 bytes (QUIC short header) | **1420** (default) |
-| `gost` | 10 bytes (GOST header) | **1420** |
-| `sip` | 22 bytes (RTP 12 + GOST 10) | **1400** |
+| `gut` | 10 bytes (GUT header) | **1420** |
+| `sip` | 22 bytes (RTP 12 + GUT 10) | **1400** |
 | `syslog` | base64 expansion (~4/3× payload) | **800** |
 
 \* For a 1500-byte outer link MTU (standard Ethernet). Adjust proportionally
@@ -259,7 +263,7 @@ ip link set wg0 mtu 1400
 ip link set wg0 mtu 800
 ```
 
-For `quic` and `gost` the default WireGuard value of 1420 is correct.
+For `quic` and `gut` the default WireGuard value of 1420 is correct.
 
 ### `outer_mtu` config key
 

@@ -51,7 +51,7 @@ pub enum ObfsMode {
     /// Packets look like QUIC (default).
     Quic,
     /// QUIC signatures masked — packets look like random UDP.
-    Gost,
+    Gut,
     /// Base64 Encoded with Syslog header pretending to be logs
     Syslog,
     /// Base64 Encoded with SIP header
@@ -248,12 +248,12 @@ pub fn load_config_from_env() -> Result<Config> {
         .as_str()
     {
         "quic" => ObfsMode::Quic,
-        "gost" | "noise" => ObfsMode::Gost,
+        "gut" | "gost" | "noise" => ObfsMode::Gut,
         "syslog" => ObfsMode::Syslog,
         "sip" => ObfsMode::Sip,
         other => {
             return Err(format!(
-                "GUTD_OBFS: unknown value '{other}', expected quic|gost|noise|syslog|sip"
+                "GUTD_OBFS: unknown value '{other}', expected quic|gut|gost|noise|syslog|sip"
             )
             .into())
         }
@@ -590,12 +590,12 @@ fn parse_config(content: &str) -> Result<Config> {
                         "obfs" => {
                             b.obfs = match value {
                                 "quic" => ObfsMode::Quic,
-                                "gost" | "noise" => ObfsMode::Gost,
+                                "gut" | "gost" | "noise" => ObfsMode::Gut,
                                 "syslog" => ObfsMode::Syslog,
                                 "sip" => ObfsMode::Sip,
                                 _ => {
                                     return Err(format!(
-                                        "Invalid obfs value: {value} (expected quic|gost|noise|syslog|sip)"
+                                        "Invalid obfs value: {value} (expected quic|gut|gost|noise|syslog|sip)"
                                     )
                                     .into())
                                 }

@@ -20,7 +20,7 @@
 | Mode | `obfs=` | Wire appearance | Anti-probing | Ports |
 |---|---|---|---|---|
 | **QUIC** *(default)* | `quic` | Fake QUIC Long Header + SNI (looks like HTTPS/3) | XDP replies with QUIC Version Negotiation | any UDP |
-| **GOST** | `gost` | Looks like random UDP — no QUIC/TLS signatures | silent drop | any UDP |
+| **GUT** | `gut` | GOST-like random UDP — no QUIC/TLS signatures | silent drop | any UDP |
 | **SIP/RTP** | `sip` | Signaling packets wrapped in SIP headers; data in RTP frames | XDP replies with `200 OK` / `401` / `403` | `ports[0]` = SIP (5060), `ports[1+]` = RTP (≥ 2 required) |
 | **Syslog** | `syslog` | Payload base64-encoded inside a fake syslog message | silent drop | any UDP (514 typical) |
 
@@ -28,7 +28,7 @@ All modes apply ChaCha payload masking on top of the envelope. Both peers must u
 
 ## Features
 
-- Four obfuscation modes: QUIC, GOST (random UDP), SIP/RTP, Syslog — selectable per peer
+- Four obfuscation modes: QUIC, GUT (GOST-like random UDP), SIP/RTP, Syslog — selectable per peer
 - Active DPI probe deflection at XDP layer (QUIC: Version Negotiation; SIP: `200 OK`/`401`/`403`)
 - WireGuard payload masking with ChaCha (4 rounds by default)
 - TC egress hook on a veth pair, XDP ingress hook on the physical NIC
@@ -59,7 +59,7 @@ gutd genkey          # → prints 256-bit hex key
 peer_ip    = 203.0.113.10    # remote peer public IP
 ports      = 41000
 key        = <output of gutd genkey>
-# obfs = quic               # quic (default) | gost | sip | syslog
+# obfs = quic               # quic (default) | gut | sip | syslog
 ```
 
 > **MTU note:** The obfuscation envelope adds overhead on top of the WireGuard packet.
@@ -68,14 +68,14 @@ key        = <output of gutd genkey>
 > | Mode | Overhead | Recommended WG MTU |
 > |---|---|---|
 > | `quic` | 16 bytes | 1420 (default) |
-> | `gost` | 10 bytes | 1420 |
-> | `sip` | 22 bytes (RTP+GOST) | **1400** |
+> | `gut` | 10 bytes | 1420 |
+> | `sip` | 22 bytes (RTP+GUT) | **1400** |
 > | `syslog` | base64 expansion | **800** |
 
 ## Running
 
 ```bash
-# eBPF mode (default on Linux, requires root and kernel ≥ 5.2)
+# eBPF mode (default on Linux, requires root and kernel ≥ 5.17)
 sudo ./gutd /etc/gutd/gutd.conf
 
 # Pure userspace mode (Linux — no eBPF, no root with capabilities)
@@ -113,8 +113,8 @@ the network link.
 | Mode | Header added by gutd | Max safe WG MTU\* |
 |---|---|---|
 | `quic` | 16 bytes (QUIC short header) | **1420** |
-| `gost` | 10 bytes (GOST header) | **1420** |
-| `sip` | 22 bytes (RTP 12 + GOST 10) | **1400** |
+| `gut` | 10 bytes (GUT header) | **1420** |
+| `sip` | 22 bytes (RTP 12 + GUT 10) | **1400** |
 | `syslog` | base64 expansion (~4/3×) | **800** |
 
 \* For a 1500-byte outer link MTU (standard Ethernet). Adjust proportionally for PPPoE (1492) or other links.
@@ -122,6 +122,23 @@ the network link.
 **SIP special requirement:** `sip` mode requires at least **2 ports** — `ports[0]` carries
 SIP signaling packets and `ports[1+]` carry RTP data frames. gutd will refuse to start
 with fewer than 2 ports in SIP mode.
+
+## Kernel Compatibility (eBPF mode)
+
+gutd eBPF programs use `bpf_loop` (kernel ≥ 5.17) and `noinline` BPF subprograms.
+The BPF verifier complexity budget (`processed insns`) varies significantly across
+kernel versions due to verifier improvements in state pruning and precision tracking.
+
+| Kernel | QUIC | GUT | Syslog | SIP | Notes |
+|---|---|---|---|---|---|
+| **≥ 6.6** | ✅ | ✅ | ✅ | ✅ | Full `mark_precise` for callbacks; recommended |
+| **6.3 – 6.5** | ✅ | ✅ | ✅ | ✅ | `parent track_live` state merge |
+| **6.1 – 6.2** | ⚠️ | ✅ | ✅ | ⚠️ | QUIC/SIP egress may exceed 1M insn limit |
+| **5.17 – 6.0** | ⚠️ | ✅ | ⚠️ | ⚠️ | Only GUT mode is reliable |
+| **< 5.17** | ❌ | ❌ | ❌ | ❌ | No `bpf_loop`; use userspace mode |
+
+⚠️ = may fail to load depending on kernel config and compiler optimization.
+Use `GUTD_USERSPACE=1` as a fallback on older kernels.
 
 ```ini
 # Correct SIP config example

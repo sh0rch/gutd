@@ -79,7 +79,7 @@ test_probe("SIP REGISTER", b"REGISTER sip:user@example.com SIP/2.0\r\n\r\n", b"4
 test_probe("SIP INVITE (Catch-all)", b"INVITE sip:user@example.com SIP/2.0\r\n\r\n", b"403 Forbidden")
 
 # 4. SIP GARBAGE (Not starting with valid keyword but parsing as sip header somehow, or just pure SIP drop)
-# If it doesn't match check_header it will be tested against GOST/QUIC and dropped
+# If it doesn't match check_header it will be tested against GUT/QUIC and dropped
 test_probe("RANDOM GARBAGE", b"\xff\xff\xff\xff", None)
 
 # 5. RTP Probe (0x80 0x60...)
