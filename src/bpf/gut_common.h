@@ -25,7 +25,7 @@
 /* ── Compile-time obfuscation mode ─────────────────────────────────────
  * Exactly one GUT_MODE_* must be defined via -D flag in build.rs.
  * Default: GUT_MODE_QUIC (backward-compatible QUIC encapsulation).   */
-#if !defined(GUT_MODE_QUIC) && !defined(GUT_MODE_GOST) && \
+#if !defined(GUT_MODE_QUIC) && !defined(GUT_MODE_GUT) && \
     !defined(GUT_MODE_SYSLOG) && !defined(GUT_MODE_SIP)
 #define GUT_MODE_QUIC
 #endif
@@ -41,16 +41,16 @@
  * after decapsulation, preserving the conntrack/WG port numbers end-to-end. */
 #define GUT_QUIC_SHORT_HEADER_SIZE 16
 #define GUT_QUIC_LONG_HEADER_SIZE 1200
-#define GUT_GOST_HEADER_SIZE 10
+#define GUT_HEADER_SIZE 10
 #define GUT_SYSLOG_HDR_BASE 36 /* "<165>1 YYYY-MM-DDTHH:MM:SSZ " + " - - -  " = 28 + 8 */
 #define GUT_SYSLOG_HDR_MAX 68  /* 36 + max sni_domain_len(32) */
 #define GUT_SIP_HDR_BASE 182   /* Fixed bytes in write_sip_header() (excl. 2 × sni_domain) */
 #define GUT_SIP_HDR_MAX 256    /* Max SIP header: GUT_SIP_HDR_BASE + 2*32 + margin */
 #define GUT_RTP_HEADER_SIZE 12 /* RTP header: V(1)+PT(1)+seq(2)+ts(4)+SSRC(4) */
-#define GUT_B64_MAX_INNER 896  /* max inner before b64: GOST_HDR(10) + wg(800) + pad(64) */
+#define GUT_B64_MAX_INNER 896  /* max inner before b64: GUT_HDR(10) + wg(800) + pad(64) */
 #define GUT_B64_MAX_OUT 1200   /* ceil(896/3)*4 = 1200 */
 #define GUT_B64_WG_MTU_MAX 886 /* max wg_total (wg_len+pad_len) for syslog b64 path;
-                                 * = GUT_B64_MAX_INNER(896) - GOST_HDR(10);
+                                 * = GUT_B64_MAX_INNER(896) - GUT_HDR(10);
                                  * WG_MTU=800 → wg_len=832 ≤ 886, output ~ 1196 bytes ≤ 1500 */
 #define SIP_SCAN_OFF 2560      /* scratch offset for SIP marker scan on ingress */
 
@@ -129,7 +129,7 @@ struct gut_config
     __u8 tun_peer_ip6[16];       /* Remote veth peer IPv6 (zero if v4 only) */
     __u8 own_http3;              /* Respond to DPI probes via XDP_TX (1=yes) */
     __u8 dynamic_peer;           /* 1 = peer_ip unknown, learn from validated inbound packets */
-    __u8 obfs_gost;              /* 1 = noise mode: XOR quic[0..6] with quic[6..12] to hide QUIC signatures */
+    __u8 obfs_gut;              /* 1 = noise mode: XOR quic[0..6] with quic[6..12] to hide QUIC signatures */
 
     /* ── QUIC crypto: precomputed by loader for BPF AEAD on Long Headers ── */
     __u8 sni_domain[32];   /* SNI domain for ClientHello (null-terminated) */
@@ -155,7 +155,7 @@ struct peer_endpoint
     __u8 server_ip6[16]; /* Last-seen IPv6 dest (server) */
     __u16 server_port;   /* Last-seen UDP dest port (server) */
     __u8 valid;          /* 1 = endpoint learned, 0 = not yet */
-    __u8 obfs_gost;      /* 1 = this client uses noise mode, 0 = plain quic (auto-detected) */
+    __u8 obfs_gut;      /* 1 = this client uses noise mode, 0 = plain quic (auto-detected) */
 };
 
 /* Per-CPU statistics */
@@ -1575,9 +1575,9 @@ static __attribute__((noinline)) void gcm_ghash_tag_128(
 
 #endif /* __GUT_COMMON_H__ */
 
-static __always_inline void write_gost_header(__u8 *quic, void *data_end, __u32 ppn, __u32 enc_ports, __u32 pad_len)
+static __always_inline void write_gut_header(__u8 *quic, void *data_end, __u32 ppn, __u32 enc_ports, __u32 pad_len)
 {
-    if ((__u8 *)quic + GUT_GOST_HEADER_SIZE > (__u8 *)data_end)
+    if ((__u8 *)quic + GUT_HEADER_SIZE > (__u8 *)data_end)
         return;
     __builtin_memcpy((__u8 *)quic + 0, &ppn, 4);
     __builtin_memcpy((__u8 *)quic + 4, &enc_ports, 4);
@@ -2445,16 +2445,16 @@ static __always_inline void write_quic_long_header(__u8 *quic, void *data_end, _
         return;
 
     /* Fill entire header with PRNG first */
-    __u32 time_gost = sip_hash32((__u32)bpf_ktime_get_ns(), cfg->chacha_init + 4);
-    __u8 gb0 = (__u8)(time_gost);
-    __u8 gb1 = (__u8)(time_gost >> 8);
-    __u8 gb2 = (__u8)(time_gost >> 16);
-    __u8 gb3 = (__u8)(time_gost >> 24);
-    __u8 gost_bytes[4] = {gb0, gb1, gb2, gb3};
+    __u32 time_gut = sip_hash32((__u32)bpf_ktime_get_ns(), cfg->chacha_init + 4);
+    __u8 gb0 = (__u8)(time_gut);
+    __u8 gb1 = (__u8)(time_gut >> 8);
+    __u8 gb2 = (__u8)(time_gut >> 16);
+    __u8 gb3 = (__u8)(time_gut >> 24);
+    __u8 gut_bytes[4] = {gb0, gb1, gb2, gb3};
 
 #pragma unroll
     for (int i = 0; i < 64; i++)
-        quic[i] = pad_block[(i * 13) & 0x3F] ^ gost_bytes[i & 3];
+        quic[i] = pad_block[(i * 13) & 0x3F] ^ gut_bytes[i & 3];
 
     /* Unprotected header: RFC 9000 QUIC Initial */
     quic[0] = (wg_type == 3) ? 0xF3 : 0xC3; /* Long Header, 4-byte PN */
@@ -2513,7 +2513,7 @@ static __always_inline void write_quic_long_header(__u8 *quic, void *data_end, _
     cf[9] = 0x03; /* legacy version 0x0303 */
     /* Random 32 bytes from pad_block + time */
     for (int i = 0; i < 32; i++)
-        cf[10 + i] = pad_block[i & 0x3F] ^ gost_bytes[(i + 1) & 3];
+        cf[10 + i] = pad_block[i & 0x3F] ^ gut_bytes[(i + 1) & 3];
     cf[42] = 0x00; /* session ID len = 0 */
     cf[43] = 0x00;
     cf[44] = 0x02; /* cipher suites len = 2 */
@@ -2647,7 +2647,7 @@ static __always_inline void write_quic_long_header(__u8 *quic, void *data_end, _
 
     /* Fill rest of 1200-byte header with PRNG (after AEAD+tag region) */
     for (__u32 i = 178; i < GUT_QUIC_LONG_HEADER_SIZE - 1 && i < 1199; i++)
-        quic[i] = pad_block[(i * 7) & 0x3F] ^ gost_bytes[i & 3];
+        quic[i] = pad_block[(i * 7) & 0x3F] ^ gut_bytes[i & 3];
 
     /* Ballast encoding in last byte (outside AEAD region) */
     quic[GUT_QUIC_LONG_HEADER_SIZE - 1] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;

@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUTD_BINARY="${GUTD_BINARY:-$SCRIPT_DIR/../target/release/gutd}"
 PCAP_FILE="/tmp/gutd_ndpi.pcap"
 NDPI_DIR="/tmp/nDPI"
-OBFS_MODE="${GUTD_OBFS:-sip}" # 'quic', 'gost', 'sip', 'syslog'
+OBFS_MODE="${GUTD_OBFS:-sip}" # 'quic', 'gut', 'sip', 'syslog'
 SNI_DOMAIN="${GUTD_SNI:-example.com}"
 # For syslog mode, use a different default service name
 if [[ "${OBFS_MODE}" == "syslog" ]]; then
@@ -13,7 +13,7 @@ if [[ "${OBFS_MODE}" == "syslog" ]]; then
 fi
 GUTD_US="${GUTD_US:-true}"
 # Syslog expands entire payload via base64 — reduce WG MTU to avoid fragmentation.
-# SIP uses RTP (raw GOST, no base64) for data — can use normal MTU.
+# SIP uses RTP (raw GUT, no base64) for data — can use normal MTU.
 if [[ "${OBFS_MODE}" == "syslog" ]]; then
     WG_MTU="${WG_MTU:-500}"
 elif [[ "${OBFS_MODE}" == "sip" ]]; then
@@ -107,7 +107,7 @@ ip netns exec ndpi_server ip link set lo up
 
 # Define target ports based on obfuscation mode
 case "$OBFS_MODE" in
-    "gost")
+    "gut")
         GUTD_PORTS="2046"
         ;;
     "sip")
@@ -221,14 +221,13 @@ log "Configuring WireGuard..."
 
 log "Starting packet capture..."
 rm -f $PCAP_FILE
-# Capture only UDP on ports 5060 (SIP) and 10000-11000 (RTP) + ICMP for debugging
 ip netns exec ndpi_client tcpdump -i veth_c -w $PCAP_FILE -s 0 -n > /dev/null 2>&1 &
 TCPDUMP_PID=$!
 sleep 1
 
 ip netns exec ndpi_server ip link add wg0 type wireguard
 ip netns exec ndpi_server ip addr add 10.10.0.2/24 dev wg0
-# Low MTU for GOST fragmentation evasion
+# Low MTU for GUT fragmentation evasion
 ip netns exec ndpi_server ip link set mtu $WG_MTU dev wg0
 ip netns exec ndpi_server wg set wg0 private-key <(echo "$SERVER_PRIV") listen-port 51820 peer "$CLIENT_PUB" allowed-ips 10.10.0.1/32
 ip netns exec ndpi_server ip link set wg0 up
@@ -272,9 +271,27 @@ case "$OBFS_MODE" in
     quic)   EXPECT="QUIC" ;;
     sip)    EXPECT="SIP" ;;
     syslog) EXPECT="Syslog" ;;
-    gost)   EXPECT="" ;;  # random UDP, no specific protocol expected
+    gut)    EXPECT="" ;;  # random UDP, no specific protocol expected
 esac
 
 if [ -n "$EXPECT" ]; then
     grep -qi "$EXPECT" "$RESULTS_FILE" || err "nDPI did not classify traffic as $EXPECT"
 fi
+
+# Extract the GUT flow port used for this mode
+GUT_PORT="${GUTD_PORTS%%,*}"  # first port
+GUT_PORT="${GUT_PORT// /}"    # trim spaces
+
+# Check that the GUT flow itself has no risk flags.
+# Other flows (ICMP, ICMPv6) are normal OS traffic passed transparently —
+# only the obfuscated flow matters.
+GUT_FLOW=$(grep "UDP.*:${GUT_PORT} " "$RESULTS_FILE" || true)
+if [ -z "$GUT_FLOW" ]; then
+    err "GUT flow on port $GUT_PORT not found in nDPI output"
+fi
+if echo "$GUT_FLOW" | grep -qi "Risk:"; then
+    echo -e "${RED}[!]${NC} GUT flow has nDPI risks:"
+    echo "$GUT_FLOW" | grep -oi '\[Risk: [^]]*\]'
+    err "GUT flow on port $GUT_PORT flagged with risks by nDPI"
+fi
+log "GUT flow (port $GUT_PORT) — clean, no risks"

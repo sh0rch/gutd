@@ -9,7 +9,7 @@ use crate::proto::feistel::sip_hash32;
 use crate::proto::mask_balanced::{chacha_block_fast, chacha_init};
 
 const GUT_QUIC_SHORT_HEADER_SIZE: usize = 16;
-const GUT_GOST_HEADER_SIZE: usize = 10;
+const GUT_HEADER_SIZE: usize = 10;
 const GUT_QUIC_LONG_HEADER_SIZE: usize = 1200;
 const SOCKET_BUF_SIZE: usize = 4 * 1024 * 1024; // 4 MiB send/recv buffer
 
@@ -281,7 +281,7 @@ pub fn obfs_encap(
 
     let wg_type = buf[0] & 0x1F;
     let quic_hdr_len = if obfs != crate::config::ObfsMode::Quic {
-        GUT_GOST_HEADER_SIZE
+        GUT_HEADER_SIZE
     } else if wg_type == 3 {
         // Cookie Reply → QUIC Retry long header (must never be dropped)
         GUT_QUIC_LONG_HEADER_SIZE
@@ -334,8 +334,8 @@ pub fn obfs_encap(
     let pad_block: [u8; 64] = unsafe { std::mem::transmute(ks69) };
 
     let mut pad_len = 0;
-    if obfs == crate::config::ObfsMode::Gost {
-        // GOST: 16-byte alignment for small packets (< 256 bytes) only
+    if obfs == crate::config::ObfsMode::Gut {
+        // GUT: 16-byte alignment for small packets (< 256 bytes) only
         if orig_len < 256 {
             let base_udp_size = 8 + quic_hdr_len + orig_len;
             let remainder = base_udp_size % 16;
@@ -375,8 +375,8 @@ pub fn obfs_encap(
 
     let dcid = ks47[9];
 
-    if quic_hdr_len == GUT_GOST_HEADER_SIZE {
-        write_gost_header(buf, ppn, enc_ports, pad_len);
+    if quic_hdr_len == GUT_HEADER_SIZE {
+        write_gut_header(buf, ppn, enc_ports, pad_len);
     } else if quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
         write_quic_short_header(buf, dcid, ppn, enc_ports, pad_len);
     } else {
@@ -390,10 +390,10 @@ pub fn obfs_encap(
 }
 /// Verify DCID and PPN in QUIC header match the crypto-derived values.
 /// Returns `true` if the packet is authentic GUT traffic.
-/// In gost mode, unmasking is applied to the first 6 bytes in-place on success;
+/// In gut mode, unmasking is applied to the first 6 bytes in-place on success;
 /// on failure, the original bytes are restored.
 #[inline]
-fn write_gost_header(buf: &mut [u8], ppn: u32, enc_ports: u32, pad_len: usize) {
+fn write_gut_header(buf: &mut [u8], ppn: u32, enc_ports: u32, pad_len: usize) {
     buf[0..4].copy_from_slice(&ppn.to_le_bytes());
     buf[4..8].copy_from_slice(&enc_ports.to_le_bytes());
     buf[8] = 0x00;
@@ -454,16 +454,16 @@ fn write_quic_long_header(
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos() as u32;
-    let time_gost = t_ns.wrapping_mul(0x9E3779B9u32).rotate_left(13);
-    let gost_b = time_gost.to_le_bytes();
+    let time_gut = t_ns.wrapping_mul(0x9E3779B9u32).rotate_left(13);
+    let gut_b = time_gut.to_le_bytes();
 
     let head = (GUT_QUIC_LONG_HEADER_SIZE / 2).min(200);
     for i in 1..head {
-        buf[i] = entropy_source[i & 31] ^ gost_b[i & 3];
+        buf[i] = entropy_source[i & 31] ^ gut_b[i & 3];
     }
     // Fill the rest with combination of entropy and pad_block
     for i in head..(GUT_QUIC_LONG_HEADER_SIZE - 1) {
-        buf[i] = pad_block[(i * 13) & 0x3F] ^ entropy_source[i & 31] ^ gost_b[(i >> 2) & 3];
+        buf[i] = pad_block[(i * 13) & 0x3F] ^ entropy_source[i & 31] ^ gut_b[(i >> 2) & 3];
     }
 
     buf[1] = 0x00;
@@ -653,7 +653,7 @@ pub fn obfs_verify(
     }
     let first_byte = buf[0];
     let hdr_len = if obfs != crate::config::ObfsMode::Quic {
-        GUT_GOST_HEADER_SIZE
+        GUT_HEADER_SIZE
     } else if (first_byte & 0xC0) == 0xC0 {
         if buf.len() <= 5 || buf[5] != 0x08 {
             return false;
@@ -758,7 +758,7 @@ pub fn obfs_decap(
         return None;
     }
     let hdr_len = if obfs != crate::config::ObfsMode::Quic {
-        GUT_GOST_HEADER_SIZE
+        GUT_HEADER_SIZE
     } else {
         let first_byte = buf[0];
         if (first_byte & 0x80) == 0x80 {
@@ -788,7 +788,7 @@ pub fn obfs_decap(
     }
     let actual_wg_len = wg_len - ballast_len;
 
-    let enc_ports = if hdr_len == GUT_GOST_HEADER_SIZE {
+    let enc_ports = if hdr_len == GUT_HEADER_SIZE {
         u32::from_le_bytes(buf[4..8].try_into().unwrap())
     } else if hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
         u32::from_le_bytes(buf[10..14].try_into().unwrap())
@@ -906,7 +906,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let obfs = match std::env::var("GUTD_OBFS").as_deref() {
         Ok("syslog") => crate::config::ObfsMode::Syslog,
         Ok("quic") => crate::config::ObfsMode::Quic,
-        Ok("gost") | Ok("noise") => crate::config::ObfsMode::Gost,
+        Ok("gut") | Ok("gost") | Ok("noise") => crate::config::ObfsMode::Gut,
         Ok(_) => peer.obfs,
         Err(_) => peer.obfs,
     };
@@ -962,7 +962,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     // Shared maps for dynamic_peer routing (egress reads client_map, ingress writes it; vice versa for session_map)
     let client_map: Arc<Mutex<HashMap<u32, SocketAddr>>> = Arc::new(Mutex::new(HashMap::new()));
     let session_map: Arc<Mutex<HashMap<u32, u32>>> = Arc::new(Mutex::new(HashMap::new()));
-    // Per-client gost mode (auto-detected by ingress, read by egress in server mode)
+    // Per-client gut mode (auto-detected by ingress, read by egress in server mode)
     let client_obfs: Arc<Mutex<HashMap<SocketAddr, crate::config::ObfsMode>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
@@ -1258,9 +1258,9 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         continue;
                     }
 
-                    // Verify this is GUT traffic — auto-detect gost mode in server mode
+                    // Verify this is GUT traffic — auto-detect gut mode in server mode
                     let (is_gut, detected_obfs) = if is_server {
-                        // Save first 6 bytes for fallback, as obfs_verify(Gost) modifies them
+                        // Save first 6 bytes for fallback, as obfs_verify(Gut) modifies them
                         let mut original_start = [0u8; 6];
                         original_start.copy_from_slice(&buf[..6]);
 
@@ -1276,18 +1276,18 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         {
                             (true, crate::config::ObfsMode::Quic)
                         } else {
-                            // Restore and try GOST/Sip/Syslog (they all use gost_mask)
+                            // Restore and try GUT/Sip/Syslog (they all use gut_mask)
                             buf[..6].copy_from_slice(&original_start);
                             if obfs_verify(
                                 &buf,
                                 size,
                                 &key_init,
                                 rounds,
-                                crate::config::ObfsMode::Gost,
+                                crate::config::ObfsMode::Gut,
                             ) {
                                 (
                                     true,
-                                    detected_prepend.unwrap_or(crate::config::ObfsMode::Gost),
+                                    detected_prepend.unwrap_or(crate::config::ObfsMode::Gut),
                                 )
                             } else {
                                 (false, crate::config::ObfsMode::Quic)
@@ -1300,7 +1300,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 size,
                                 &key_init,
                                 rounds,
-                                crate::config::ObfsMode::Gost,
+                                crate::config::ObfsMode::Gut,
                             );
                         (ok, obfs)
                     } else {
@@ -1354,7 +1354,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         continue;
                     }
 
-                    // Store detected gost mode per client
+                    // Store detected gut mode per client
                     if is_server {
                         ingress_client_obfs
                             .lock()

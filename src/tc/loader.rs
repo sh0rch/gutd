@@ -131,20 +131,20 @@ mod xdp_gut_ingress {
 
 #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
 #[allow(clippy::all, clippy::pedantic)]
-mod tc_gut_egress_gost {
-    include!(concat!(env!("OUT_DIR"), "/tc_gut_egress_gost.skel.rs"));
+mod tc_gut_egress_quic {
+    include!(concat!(env!("OUT_DIR"), "/tc_gut_egress_quic.skel.rs"));
 }
 
 #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
 #[allow(clippy::all, clippy::pedantic)]
-mod tc_gut_egress_gost_v6 {
-    include!(concat!(env!("OUT_DIR"), "/tc_gut_egress_gost_v6.skel.rs"));
+mod tc_gut_egress_quic_v6 {
+    include!(concat!(env!("OUT_DIR"), "/tc_gut_egress_quic_v6.skel.rs"));
 }
 
 #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
 #[allow(clippy::all, clippy::pedantic)]
-mod xdp_gut_ingress_gost {
-    include!(concat!(env!("OUT_DIR"), "/xdp_gut_ingress_gost.skel.rs"));
+mod xdp_gut_ingress_quic {
+    include!(concat!(env!("OUT_DIR"), "/xdp_gut_ingress_quic.skel.rs"));
 }
 
 #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
@@ -183,14 +183,20 @@ mod xdp_gut_ingress_sip {
     include!(concat!(env!("OUT_DIR"), "/xdp_gut_ingress_sip.skel.rs"));
 }
 
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+#[allow(clippy::all, clippy::pedantic)]
+mod xdp_dispatcher {
+    include!(concat!(env!("OUT_DIR"), "/xdp_dispatcher.skel.rs"));
+}
+
 /// Egress skeleton: mode × outer-AF variant.
 /// Compiled from the same source with different -D flags.
 #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
 enum EgressSkel {
     V4(tc_gut_egress::TcGutEgressSkel<'static>),
     V6(tc_gut_egress_v6::TcGutEgressSkel<'static>),
-    GostV4(tc_gut_egress_gost::TcGutEgressSkel<'static>),
-    GostV6(tc_gut_egress_gost_v6::TcGutEgressSkel<'static>),
+    QuicV4(tc_gut_egress_quic::TcGutEgressSkel<'static>),
+    QuicV6(tc_gut_egress_quic_v6::TcGutEgressSkel<'static>),
     SyslogV4(tc_gut_egress_syslog::TcGutEgressSkel<'static>),
     SyslogV6(tc_gut_egress_syslog_v6::TcGutEgressSkel<'static>),
     SipV4(tc_gut_egress_sip::TcGutEgressSkel<'static>),
@@ -207,6 +213,16 @@ impl EgressSkel {
             )
         };
         match self {
+            Self::QuicV4(s) => {
+                s.maps
+                    .config_map
+                    .update(&0u32.to_ne_bytes(), value, MapFlags::ANY)?
+            }
+            Self::QuicV6(s) => {
+                s.maps
+                    .config_map
+                    .update(&0u32.to_ne_bytes(), value, MapFlags::ANY)?
+            }
             Self::V4(s) => s
                 .maps
                 .config_map
@@ -215,16 +231,6 @@ impl EgressSkel {
                 .maps
                 .config_map
                 .update(&0u32.to_ne_bytes(), value, MapFlags::ANY)?,
-            Self::GostV4(s) => {
-                s.maps
-                    .config_map
-                    .update(&0u32.to_ne_bytes(), value, MapFlags::ANY)?
-            }
-            Self::GostV6(s) => {
-                s.maps
-                    .config_map
-                    .update(&0u32.to_ne_bytes(), value, MapFlags::ANY)?
-            }
             Self::SyslogV4(s) => {
                 s.maps
                     .config_map
@@ -252,22 +258,22 @@ impl EgressSkel {
     fn update_counters_map(&self, initial_seq: u32) -> crate::Result<()> {
         let bytes = initial_seq.to_ne_bytes();
         match self {
+            Self::QuicV4(s) => {
+                s.maps
+                    .counters_map
+                    .update(&0u32.to_ne_bytes(), &bytes, MapFlags::ANY)?
+            }
+            Self::QuicV6(s) => {
+                s.maps
+                    .counters_map
+                    .update(&0u32.to_ne_bytes(), &bytes, MapFlags::ANY)?
+            }
             Self::V4(s) => {
                 s.maps
                     .counters_map
                     .update(&0u32.to_ne_bytes(), &bytes, MapFlags::ANY)?
             }
             Self::V6(s) => {
-                s.maps
-                    .counters_map
-                    .update(&0u32.to_ne_bytes(), &bytes, MapFlags::ANY)?
-            }
-            Self::GostV4(s) => {
-                s.maps
-                    .counters_map
-                    .update(&0u32.to_ne_bytes(), &bytes, MapFlags::ANY)?
-            }
-            Self::GostV6(s) => {
                 s.maps
                     .counters_map
                     .update(&0u32.to_ne_bytes(), &bytes, MapFlags::ANY)?
@@ -298,10 +304,10 @@ impl EgressSkel {
 
     fn gut_egress_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         match self {
+            Self::QuicV4(s) => s.progs.gut_egress.as_fd(),
+            Self::QuicV6(s) => s.progs.gut_egress.as_fd(),
             Self::V4(s) => s.progs.gut_egress.as_fd(),
             Self::V6(s) => s.progs.gut_egress.as_fd(),
-            Self::GostV4(s) => s.progs.gut_egress.as_fd(),
-            Self::GostV6(s) => s.progs.gut_egress.as_fd(),
             Self::SyslogV4(s) => s.progs.gut_egress.as_fd(),
             Self::SyslogV6(s) => s.progs.gut_egress.as_fd(),
             Self::SipV4(s) => s.progs.gut_egress.as_fd(),
@@ -312,7 +318,7 @@ impl EgressSkel {
     fn is_v6(&self) -> bool {
         matches!(
             self,
-            Self::V6(_) | Self::GostV6(_) | Self::SyslogV6(_) | Self::SipV6(_)
+            Self::QuicV6(_) | Self::V6(_) | Self::SyslogV6(_) | Self::SipV6(_)
         )
     }
 
@@ -332,10 +338,10 @@ impl EgressSkel {
             };
         }
         match self {
+            Self::QuicV4(s) => map_fd!(s),
+            Self::QuicV6(s) => map_fd!(s),
             Self::V4(s) => map_fd!(s),
             Self::V6(s) => map_fd!(s),
-            Self::GostV4(s) => map_fd!(s),
-            Self::GostV6(s) => map_fd!(s),
             Self::SyslogV4(s) => map_fd!(s),
             Self::SyslogV6(s) => map_fd!(s),
             Self::SipV4(s) => map_fd!(s),
@@ -343,20 +349,105 @@ impl EgressSkel {
         }
     }
 
+    /// Populate PROG_ARRAY map for QUIC/SIP tail-call split (kernel ≤6.2 compat).
+    /// QUIC: gut_egress_quic_long → tc_progs[0]
+    /// SIP:  gut_egress_sip_signal → tc_progs[0]
+    fn setup_tail_call(&self) -> crate::Result<()> {
+        use std::os::fd::AsRawFd;
+        match self {
+            Self::QuicV4(s) => {
+                let fd = s.progs.gut_egress_quic_long.as_fd().as_raw_fd() as u32;
+                s.maps
+                    .tc_progs
+                    .update(&0u32.to_ne_bytes(), &fd.to_ne_bytes(), MapFlags::ANY)?;
+            }
+            Self::QuicV6(s) => {
+                let fd = s.progs.gut_egress_quic_long.as_fd().as_raw_fd() as u32;
+                s.maps
+                    .tc_progs
+                    .update(&0u32.to_ne_bytes(), &fd.to_ne_bytes(), MapFlags::ANY)?;
+            }
+            Self::SipV4(s) => {
+                let fd = s.progs.gut_egress_sip_signal.as_fd().as_raw_fd() as u32;
+                s.maps
+                    .tc_progs
+                    .update(&0u32.to_ne_bytes(), &fd.to_ne_bytes(), MapFlags::ANY)?;
+            }
+            Self::SipV6(s) => {
+                let fd = s.progs.gut_egress_sip_signal.as_fd().as_raw_fd() as u32;
+                s.maps
+                    .tc_progs
+                    .update(&0u32.to_ne_bytes(), &fd.to_ne_bytes(), MapFlags::ANY)?;
+            }
+            _ => {} // GUT/Syslog modes don't use tail calls
+        }
+        Ok(())
+    }
+
     fn lookup_stats(
         &self,
         key: &[u8],
     ) -> std::result::Result<Option<Vec<Vec<u8>>>, libbpf_rs::Error> {
         match self {
+            Self::QuicV4(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
+            Self::QuicV6(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
             Self::V4(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
             Self::V6(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
-            Self::GostV4(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
-            Self::GostV6(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
             Self::SyslogV4(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
             Self::SyslogV6(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
             Self::SipV4(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
             Self::SipV6(s) => s.maps.stats_map.lookup_percpu(key, MapFlags::ANY),
         }
+    }
+}
+
+/// Per-NIC XDP dispatcher: routes packets by UDP dst_port to the
+/// correct peer's XDP ingress program via tail-call.
+/// One dispatcher per physical NIC, shared by all peers on that NIC.
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+pub struct XdpDispatcher {
+    _skel: xdp_dispatcher::XdpDispatcherSkel<'static>,
+    _xdp_link: libbpf_rs::Link,
+    next_peer_idx: u32,
+}
+
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+impl XdpDispatcher {
+    /// Load dispatcher and attach XDP to the given NIC.
+    pub fn new(ingress_ifindex: i32) -> crate::Result<Self> {
+        let builder = xdp_dispatcher::XdpDispatcherSkelBuilder::default();
+        let open_obj: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
+            Box::leak(Box::new(MaybeUninit::uninit()));
+        let skel = builder.open(open_obj)?.load()?;
+        let xdp_link = skel.progs.xdp_dispatch.attach_xdp(ingress_ifindex)?;
+        Ok(Self {
+            _skel: skel,
+            _xdp_link: xdp_link,
+            next_peer_idx: 0,
+        })
+    }
+
+    /// Register a peer's XDP ingress program into the dispatcher.
+    /// Inserts prog FD into xdp_peer_progs and all ports into port_map.
+    /// Returns the assigned peer index.
+    pub fn register_peer(&mut self, prog_raw_fd: i32, ports: &[u16]) -> crate::Result<u32> {
+        let peer_idx = self.next_peer_idx;
+        self.next_peer_idx += 1;
+        let fd_val = prog_raw_fd as u32;
+        self._skel.maps.xdp_peer_progs.update(
+            &peer_idx.to_ne_bytes(),
+            &fd_val.to_ne_bytes(),
+            MapFlags::ANY,
+        )?;
+        for &port in ports {
+            self._skel.maps.port_map.update(
+                &port.to_ne_bytes(),
+                &peer_idx.to_ne_bytes(),
+                MapFlags::ANY,
+            )?;
+        }
+        eprintln!("  dispatcher: peer_idx={peer_idx} ports={ports:?}");
+        Ok(peer_idx)
     }
 }
 
@@ -367,7 +458,6 @@ pub struct TcBpfManager {
     egress_skel: EgressSkel,
     _ingress_skel: Box<dyn std::any::Any>,
     _egress_hook: libbpf_rs::TcHook,
-    _xdp_link: libbpf_rs::Link,
     _veth_pass_link: libbpf_rs::Link,
     _veth_xdp_name: String,
 }
@@ -398,9 +488,13 @@ impl TcBpfManager {
     ///
     /// Creates veth pair `<ifname>_xdp` ↔ `<ifname>`.
     /// Selects outer-IPv4 or outer-IPv6 egress BPF based on peer address family.
-    /// Attaches TC egress on `<ifname>` (encap+mask) and XDP on NIC (decap+unmask+devmap redirect).
+    /// Registers XDP ingress into the per-NIC dispatcher (created on first use).
     #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
-    pub fn new(ifname: &str, config: &Config) -> Result<Self> {
+    pub fn new(
+        ifname: &str,
+        config: &Config,
+        dispatchers: &mut std::collections::HashMap<String, XdpDispatcher>,
+    ) -> Result<Self> {
         let ingress_ifname = if let Some(nic) =
             config.peer().nic.clone().filter(|s| !s.trim().is_empty())
         {
@@ -490,6 +584,15 @@ impl TcBpfManager {
 
         let tun_ifindex = Self::get_ifindex(ifname)?;
         let ingress_ifindex = Self::get_ifindex(&ingress_ifname)?;
+
+        // Create or reuse per-NIC XDP dispatcher
+        if !dispatchers.contains_key(&ingress_ifname) {
+            let d = XdpDispatcher::new(ingress_ifindex)?;
+            eprintln!("  XDP dispatcher attached on {ingress_ifname}");
+            dispatchers.insert(ingress_ifname.clone(), d);
+        }
+        let dispatcher = dispatchers.get_mut(&ingress_ifname).unwrap();
+
         let gut_config = Self::build_gut_config(config, ifname, &ingress_ifname)?;
         let obfs_mode = config.peer().obfs;
         // gso_max_size = max total WireGuard packet (IP+UDP+WG_data) through gut0.
@@ -514,17 +617,17 @@ impl TcBpfManager {
 
         // ── Load egress skeleton (mode × AF) ──────────────────────────
         let egress_skel = match (obfs_mode, peer_is_v6) {
-            (crate::config::ObfsMode::Gost, true) => {
-                let b = tc_gut_egress_gost_v6::TcGutEgressSkelBuilder::default();
+            (crate::config::ObfsMode::Gut, true) => {
+                let b = tc_gut_egress_v6::TcGutEgressSkelBuilder::default();
                 let o: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
                     Box::leak(Box::new(MaybeUninit::uninit()));
-                EgressSkel::GostV6(b.open(o)?.load()?)
+                EgressSkel::V6(b.open(o)?.load()?)
             }
-            (crate::config::ObfsMode::Gost, false) => {
-                let b = tc_gut_egress_gost::TcGutEgressSkelBuilder::default();
+            (crate::config::ObfsMode::Gut, false) => {
+                let b = tc_gut_egress::TcGutEgressSkelBuilder::default();
                 let o: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
                     Box::leak(Box::new(MaybeUninit::uninit()));
-                EgressSkel::GostV4(b.open(o)?.load()?)
+                EgressSkel::V4(b.open(o)?.load()?)
             }
             (crate::config::ObfsMode::Syslog, true) => {
                 let b = tc_gut_egress_syslog_v6::TcGutEgressSkelBuilder::default();
@@ -551,16 +654,16 @@ impl TcBpfManager {
                 EgressSkel::SipV4(b.open(o)?.load()?)
             }
             (_, true) => {
-                let b = tc_gut_egress_v6::TcGutEgressSkelBuilder::default();
+                let b = tc_gut_egress_quic_v6::TcGutEgressSkelBuilder::default();
                 let o: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
                     Box::leak(Box::new(MaybeUninit::uninit()));
-                EgressSkel::V6(b.open(o)?.load()?)
+                EgressSkel::QuicV6(b.open(o)?.load()?)
             }
             (_, false) => {
-                let b = tc_gut_egress::TcGutEgressSkelBuilder::default();
+                let b = tc_gut_egress_quic::TcGutEgressSkelBuilder::default();
                 let o: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
                     Box::leak(Box::new(MaybeUninit::uninit()));
-                EgressSkel::V4(b.open(o)?.load()?)
+                EgressSkel::QuicV4(b.open(o)?.load()?)
             }
         };
 
@@ -568,6 +671,9 @@ impl TcBpfManager {
 
         // Initialize seq counter
         egress_skel.update_counters_map(1)?;
+
+        // Populate QUIC tail-call prog_array (no-op for non-QUIC modes)
+        egress_skel.setup_tail_call()?;
 
         // Attach TC egress on veth user-side
         let mut tc_builder_egress = TcHookBuilder::new(egress_skel.gut_egress_fd());
@@ -613,23 +719,57 @@ impl TcBpfManager {
                     &veth_xdp_ifindex.to_ne_bytes(),
                     MapFlags::ANY,
                 )?;
-                let xl = skel.progs.xdp_gut_ingress.attach_xdp(ingress_ifindex)?;
+                use std::os::fd::AsRawFd;
+                let ingress_prog_fd = skel.progs.xdp_gut_ingress.as_fd().as_raw_fd();
                 let vpl = skel.progs.xdp_veth_pass.attach_xdp(tun_ifindex)?;
-                (Box::new(skel) as Box<dyn std::any::Any>, xl, vpl)
+                dispatcher.register_peer(ingress_prog_fd, &config.peer().ports)?;
+                (Box::new(skel) as Box<dyn std::any::Any>, vpl)
             }};
         }
         eprintln!("  devmap[0] = {veth_xdp_name} (ifindex={veth_xdp_ifindex})");
 
-        let (_ingress_skel, xdp_link, veth_pass_link) = match obfs_mode {
-            crate::config::ObfsMode::Gost => load_ingress!(xdp_gut_ingress_gost),
+        let (_ingress_skel, veth_pass_link) = match obfs_mode {
+            crate::config::ObfsMode::Gut => load_ingress!(xdp_gut_ingress),
             crate::config::ObfsMode::Syslog => load_ingress!(xdp_gut_ingress_syslog),
-            crate::config::ObfsMode::Sip => load_ingress!(xdp_gut_ingress_sip),
-            _ => load_ingress!(xdp_gut_ingress),
+            crate::config::ObfsMode::Sip => {
+                // SIP: use load_ingress! then populate xdp_progs tail-call map
+                let (skel_box, vpl) = load_ingress!(xdp_gut_ingress_sip);
+                {
+                    use std::os::fd::AsRawFd;
+                    let skel = skel_box
+                        .downcast_ref::<xdp_gut_ingress_sip::XdpGutIngressSkel<'static>>()
+                        .expect("SIP ingress skel downcast");
+                    let fd = skel.progs.xdp_sip_probe.as_fd().as_raw_fd() as u32;
+                    skel.maps.xdp_progs.update(
+                        &0u32.to_ne_bytes(),
+                        &fd.to_ne_bytes(),
+                        MapFlags::ANY,
+                    )?;
+                }
+                (skel_box, vpl)
+            }
+            _ => {
+                // QUIC: use load_ingress! then populate xdp_progs tail-call map
+                let (skel_box, vpl) = load_ingress!(xdp_gut_ingress_quic);
+                {
+                    use std::os::fd::AsRawFd;
+                    let skel = skel_box
+                        .downcast_ref::<xdp_gut_ingress_quic::XdpGutIngressSkel<'static>>()
+                        .expect("QUIC ingress skel downcast");
+                    let fd = skel.progs.xdp_quic_probe.as_fd().as_raw_fd() as u32;
+                    skel.maps.xdp_progs.update(
+                        &0u32.to_ne_bytes(),
+                        &fd.to_ne_bytes(),
+                        MapFlags::ANY,
+                    )?;
+                }
+                (skel_box, vpl)
+            }
         };
 
         let xdp_mode = Self::detect_xdp_mode(&ingress_ifname);
         let mode_name = match obfs_mode {
-            crate::config::ObfsMode::Gost => "gost",
+            crate::config::ObfsMode::Gut => "gut",
             crate::config::ObfsMode::Syslog => "syslog",
             crate::config::ObfsMode::Sip => "sip",
             _ => "quic",
@@ -643,7 +783,6 @@ impl TcBpfManager {
             egress_skel,
             _ingress_skel,
             _egress_hook: egress_hook,
-            _xdp_link: xdp_link,
             _veth_pass_link: veth_pass_link,
             _veth_xdp_name: veth_xdp_name,
         })
@@ -1475,9 +1614,9 @@ impl TcBpfManager {
 
         // Obfuscation mode
         match config.peer().obfs {
-            crate::config::ObfsMode::Gost => {
-                gut_config.obfs_gost = 1;
-                eprintln!("  Obfuscation mode: gost (BPF per-mode)");
+            crate::config::ObfsMode::Gut => {
+                gut_config.obfs_gut = 1;
+                eprintln!("  Obfuscation mode: gut (BPF per-mode)");
             }
             crate::config::ObfsMode::Quic => {
                 eprintln!("  Obfuscation mode: quic (BPF per-mode)");
@@ -1715,7 +1854,7 @@ mod tests {
         // --- tc_gut_egress v4 ---
         {
             let obj = Box::leak(Box::new(MaybeUninit::uninit()));
-            let open = super::tc_gut_egress::TcGutEgressSkelBuilder::default()
+            let open = super::tc_gut_egress_quic::TcGutEgressSkelBuilder::default()
                 .open(obj)
                 .expect("tc_gut_egress (v4) open failed");
             match open.load() {
@@ -1733,7 +1872,7 @@ mod tests {
         // --- tc_gut_egress v6 ---
         {
             let obj = Box::leak(Box::new(MaybeUninit::uninit()));
-            let open = super::tc_gut_egress_v6::TcGutEgressSkelBuilder::default()
+            let open = super::tc_gut_egress_quic_v6::TcGutEgressSkelBuilder::default()
                 .open(obj)
                 .expect("tc_gut_egress (v6) open failed");
             match open.load() {
@@ -1748,10 +1887,10 @@ mod tests {
             }
         }
 
-        // --- xdp_gut_ingress ---
+        // --- xdp_gut_ingress (quic) ---
         {
             let obj = Box::leak(Box::new(MaybeUninit::uninit()));
-            let open = super::xdp_gut_ingress::XdpGutIngressSkelBuilder::default()
+            let open = super::xdp_gut_ingress_quic::XdpGutIngressSkelBuilder::default()
                 .open(obj)
                 .expect("xdp_gut_ingress open failed");
             match open.load() {

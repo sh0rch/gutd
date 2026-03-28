@@ -404,6 +404,7 @@ fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<(
     #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
     {
         use gutd::tc::TcBpfManager;
+        use gutd::tc::XdpDispatcher;
         use std::sync::atomic::Ordering;
 
         // Build a single-peer Config wrapper so the existing TcBpfManager::new
@@ -414,10 +415,15 @@ fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<(
             peers: vec![peer.clone()],
         };
 
+        // Per-NIC XDP dispatchers: first peer on a NIC creates the dispatcher,
+        // subsequent peers reuse it (their programs are registered via tail-call).
+        let mut dispatchers: std::collections::HashMap<String, XdpDispatcher> =
+            std::collections::HashMap::new();
+
         let mut managers: Vec<TcBpfManager> = Vec::new();
         for peer in &config.peers {
             let single = make_single(&config, peer);
-            let mgr = TcBpfManager::new(&peer.name, &single)?;
+            let mgr = TcBpfManager::new(&peer.name, &single, &mut dispatchers)?;
             managers.push(mgr);
         }
 
