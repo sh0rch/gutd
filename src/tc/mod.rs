@@ -10,4 +10,6 @@ pub mod maps;
 
 pub use loader::drop_policy_safety_overrides;
 pub use loader::TcBpfManager;
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+pub use loader::XdpDispatcher;
 pub use maps::GutConfig;
