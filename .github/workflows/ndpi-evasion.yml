@@ -64,7 +64,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [quic, gost, sip, syslog]
+        mode: [quic, gut, sip, syslog]
 
     steps:
     - uses: actions/checkout@v4
@@ -160,7 +160,7 @@ jobs:
         echo "| Mode | nDPI Classification | Status |" >> $GITHUB_STEP_SUMMARY
         echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
 
-        for mode in quic gost sip syslog; do
+        for mode in quic gut sip syslog; do
           REPORT="/tmp/reports/ndpi_results_${mode}.txt"
           if [ -f "$REPORT" ]; then
             # Extract detected protocol names (top line of protocol stats)
