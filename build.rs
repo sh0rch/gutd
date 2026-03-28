@@ -76,50 +76,50 @@ fn compile_tc_ebpf() {
         .build_and_generate(&ingress_skel)
         .expect("Failed to generate XDP ingress skeleton");
 
-    // ── Gost mode skeletons ─────────────────────────────────────────
+    // ── Gut mode skeletons ─────────────────────────────────────────
 
-    // Generate skeleton for egress Gost mode (outer IPv4)
-    let egress_gost_skel = out_dir.join("tc_gut_egress_gost.skel.rs");
+    // Generate skeleton for egress Gut mode (outer IPv4)
+    let egress_gut_skel = out_dir.join("tc_gut_egress_gut.skel.rs");
     SkeletonBuilder::new()
         .source("src/bpf/tc_gut_egress.bpf.c")
         .clang_args([
             "-I",
             "src/bpf",
             &chacha_define,
-            "-DGUT_MODE_GOST",
+            "-DGUT_MODE_GUT",
             &arch_include,
         ])
-        .build_and_generate(&egress_gost_skel)
-        .expect("Failed to generate TC egress Gost (v4) skeleton");
+        .build_and_generate(&egress_gut_skel)
+        .expect("Failed to generate TC egress Gut (v4) skeleton");
 
-    // Generate skeleton for egress Gost mode (outer IPv6)
-    let egress_gost_v6_skel = out_dir.join("tc_gut_egress_gost_v6.skel.rs");
+    // Generate skeleton for egress Gut mode (outer IPv6)
+    let egress_gut_v6_skel = out_dir.join("tc_gut_egress_gut_v6.skel.rs");
     SkeletonBuilder::new()
         .source("src/bpf/tc_gut_egress.bpf.c")
         .clang_args([
             "-I",
             "src/bpf",
             &chacha_define,
-            "-DGUT_MODE_GOST",
+            "-DGUT_MODE_GUT",
             "-DGUT_OUTER_IPV6",
             &arch_include,
         ])
-        .build_and_generate(&egress_gost_v6_skel)
-        .expect("Failed to generate TC egress Gost (v6) skeleton");
+        .build_and_generate(&egress_gut_v6_skel)
+        .expect("Failed to generate TC egress Gut (v6) skeleton");
 
-    // Generate skeleton for XDP ingress Gost mode
-    let ingress_gost_skel = out_dir.join("xdp_gut_ingress_gost.skel.rs");
+    // Generate skeleton for XDP ingress Gut mode
+    let ingress_gut_skel = out_dir.join("xdp_gut_ingress_gut.skel.rs");
     SkeletonBuilder::new()
         .source("src/bpf/xdp_gut_ingress.bpf.c")
         .clang_args([
             "-I",
             "src/bpf",
             &chacha_define,
-            "-DGUT_MODE_GOST",
+            "-DGUT_MODE_GUT",
             &arch_include,
         ])
-        .build_and_generate(&ingress_gost_skel)
-        .expect("Failed to generate XDP ingress Gost skeleton");
+        .build_and_generate(&ingress_gut_skel)
+        .expect("Failed to generate XDP ingress Gut skeleton");
 
     // ── Syslog mode skeletons ───────────────────────────────────────
 
@@ -211,7 +211,7 @@ fn compile_tc_ebpf() {
         .build_and_generate(&ingress_sip_skel)
         .expect("Failed to generate XDP ingress SIP skeleton");
 
-    println!("cargo:warning=TC eBPF skeletons generated successfully (QUIC + Gost + Syslog + SIP)");
+    println!("cargo:warning=TC eBPF skeletons generated successfully (QUIC + Gut + Syslog + SIP)");
 }
 
 fn get_git_version() -> Option<String> {

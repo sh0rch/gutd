@@ -7,7 +7,7 @@
 | `ci.yml` | Push/PR to main | ~5 min | Unit tests + musl build + config verify |
 | `tc-check.yml` | TC/XDP code changes | ~10 min | Strict clippy, BPF skeleton, unsafe audit |
 | `integration-test.yml` | Manual / release | ~5 min | Netns tunnel test: ping, TCP, iperf3 |
-| `ndpi-evasion.yml` | Manual / release | ~15 min | nDPI evasion test for all obfs modes (quic, gost, sip, syslog) |
+| `ndpi-evasion.yml` | Manual / release | ~15 min | nDPI evasion test for all obfs modes (quic, gut, sip, syslog) |
 | `release.yml` | Tag `v*.*.*` | ~20 min | Full pipeline -> GitHub Release |
 
 ## Quick Reference

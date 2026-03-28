@@ -55,7 +55,7 @@ pub struct GutConfig {
     pub tun_peer_ip6: [u8; 16], // Remote veth peer IPv6 (zero if v4 only)
     pub own_http3: u8,          // Whether to respond to active DPI probes via XDP_TX
     pub dynamic_peer: u8,       // 1 = peer_ip unknown, learn from validated inbound packets
-    pub obfs_gost: u8,          // 1 = gost mode: XOR quic[0..6] with quic[6..12]
+    pub obfs_gut: u8,           // 1 = gut mode: XOR quic[0..6] with quic[6..12]
 
     // ── QUIC crypto: precomputed by loader for BPF AEAD on Long Headers ──
     pub sni_domain: [u8; 32], // SNI domain for ClientHello (null-terminated)
@@ -80,7 +80,7 @@ pub struct PeerEndpoint {
     pub server_ip6: [u8; 16],
     pub server_port: u16,
     pub valid: u8,
-    pub obfs_gost: u8,
+    pub obfs_gut: u8,
 }
 
 impl GutConfig {
@@ -131,7 +131,7 @@ impl GutConfig {
             tun_peer_ip6: [0u8; 16],
             own_http3: 1,
             dynamic_peer: 0,
-            obfs_gost: 0,
+            obfs_gut: 0,
             sni_domain: [0u8; 32],
             sni_domain_len: 0,
             _pad_quic: [0u8; 3],

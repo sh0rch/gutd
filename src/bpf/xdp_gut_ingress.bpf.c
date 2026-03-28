@@ -119,6 +119,19 @@ struct
     __type(value, __u32);
 } tx_devmap SEC(".maps");
 
+#if defined(GUT_MODE_QUIC) || defined(GUT_MODE_SIP)
+/* PROG_ARRAY for XDP tail calls: index 0 = xdp_quic_probe / xdp_sip_probe.
+ * Keeps the anti-probe handler out of the main program's verifier budget
+ * (kernel ≤6.2 compat). */
+struct
+{
+    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} xdp_progs SEC(".maps");
+#endif
+
 static __always_inline __u32 wg_nonce32(const __u8 *wg)
 {
     __u32 n0 = (__u32)wg[16] | ((__u32)wg[17] << 8) | ((__u32)wg[18] << 16) | ((__u32)wg[19] << 24);
@@ -205,16 +218,16 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     if (wg_len < WG_MIN_PACKET || wg + WG_MIN_PACKET > (__u8 *)data_end || wg + wg_len > (__u8 *)data_end)
         return -1;
 
-    /* Auto-detect gost vs plain QUIC per client.
+    /* Auto-detect gut vs plain QUIC per client.
      * Try plain QUIC first (check first byte for 0x40/0xC0/0xF0).
-     * If that fails, apply gost unmask and check again. */
+     * If that fails, apply gut unmask and check again. */
     if (wg + 12 > (__u8 *)data_end)
         return -1;
 
-#if defined(GUT_MODE_GOST)
-    __u32 outer_hdr_len = GUT_GOST_HEADER_SIZE;
+#if defined(GUT_MODE_GUT)
+    __u32 outer_hdr_len = GUT_HEADER_SIZE;
 #elif defined(GUT_MODE_SYSLOG)
-    /* Syslog base64 → GOST conversion: load, decode (noinline), store, trim.
+    /* Syslog base64 → GUT conversion: load, decode (noinline), store, trim.
      * Scan for " - - -  " marker to find where b64 data starts — the service
      * name length varies per peer, so we cannot use a fixed header size. */
     if (wg[0] != 0x3C) /* '<' */
@@ -252,30 +265,30 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         if (b64_bounded < 16 || b64_bounded > GUT_B64_MAX_OUT || (b64_bounded & 3))
             return -1;
         __u32 decoded_len = b64_decode(scratch, B64_ENC_OFF, b64_bounded, B64_INNER_OFF);
-        if (decoded_len < GUT_GOST_HEADER_SIZE + WG_MIN_PACKET ||
+        if (decoded_len < GUT_HEADER_SIZE + WG_MIN_PACKET ||
             decoded_len > GUT_B64_MAX_INNER)
             return -1;
 
-        /* Strip ballast from decoded GOST inner so we only write net data
+        /* Strip ballast from decoded GUT inner so we only write net data
          * to the packet and need a single bpf_xdp_adjust_tail. */
         __u32 pad_off = (B64_INNER_OFF + 9) & (SCRATCH_SIZE - 1);
         __u8 pad_byte_s = scratch[pad_off];
         __u32 ballast_s = (pad_byte_s & 0x40) ? ((__u32)(pad_byte_s & 0x3F) + 1) : 0;
-        if (ballast_s >= decoded_len - GUT_GOST_HEADER_SIZE)
+        if (ballast_s >= decoded_len - GUT_HEADER_SIZE)
             return -1;
         decoded_len -= ballast_s;
 
         decoded_len &= 0x3FF;
-        if (decoded_len < GUT_GOST_HEADER_SIZE + WG_MIN_PACKET || decoded_len > 1023)
+        if (decoded_len < GUT_HEADER_SIZE + WG_MIN_PACKET || decoded_len > 1023)
             return -1;
-        scratch[pad_off] = 0x00; /* clear ballast flag for shared GOST code */
+        scratch[pad_off] = 0x00; /* clear ballast flag for shared GUT code */
 
         /* Force compiler to resolve bounds strictly before call */
         __u32 slen = decoded_len & 0x3FF;
         if (slen == 0)
             return -1;
 
-        /* Write decoded GOST inner (without ballast) back to packet */
+        /* Write decoded GUT inner (without ballast) back to packet */
         if (bpf_xdp_store_bytes(ctx, wg_off,
                                 scratch + B64_INNER_OFF, slen) < 0)
             return -1;
@@ -299,35 +312,35 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             return -1;
         wg = (__u8 *)data + wg_off;
         wg_len = decoded_len;
-        if (wg + GUT_GOST_HEADER_SIZE + WG_MIN_PACKET > (__u8 *)data_end)
+        if (wg + GUT_HEADER_SIZE + WG_MIN_PACKET > (__u8 *)data_end)
             return -1;
         if (wg + wg_len > (__u8 *)data_end)
             return -1;
         udp_len = 8 + (__u16)decoded_len;
     }
-    /* Packet is now in GOST format — fall through to GOST processing */
-    __u32 outer_hdr_len = GUT_GOST_HEADER_SIZE;
+    /* Packet is now in GUT format — fall through to GUT processing */
+    __u32 outer_hdr_len = GUT_HEADER_SIZE;
 #elif defined(GUT_MODE_SIP)
     /* ── SIP mode: detect RTP (data) vs SIP signaling (b64) ── */
-    if (wg_len < 22) /* min: RTP(12) + GOST(10) */
+    if (wg_len < 22) /* min: RTP(12) + GUT(10) */
         return -1;
 
     if ((wg[0] & 0xC0) == 0x80 && (wg[1] & 0x7F) == 0x60)
     {
-        /* ── RTP data path: strip 12-byte RTP header → GOST ── */
-        __u32 gost_data_len = wg_len - GUT_RTP_HEADER_SIZE;
-        gost_data_len &= 0xFFF;
-        if (gost_data_len < GUT_GOST_HEADER_SIZE + WG_MIN_PACKET ||
-            gost_data_len > 1500)
+        /* ── RTP data path: strip 12-byte RTP header → GUT ── */
+        __u32 gut_data_len = wg_len - GUT_RTP_HEADER_SIZE;
+        gut_data_len &= 0xFFF;
+        if (gut_data_len < GUT_HEADER_SIZE + WG_MIN_PACKET ||
+            gut_data_len > 1500)
             return -1;
 
         /* Re-bound for verifier: spill across branches loses umin tracking */
         asm volatile("%[v] &= 2047\n\t"
                      "if %[v] < 42 goto +0"
-                     : [v] "+r"(gost_data_len)
+                     : [v] "+r"(gut_data_len)
                      :
                      :);
-        if (gost_data_len < 42 || gost_data_len > 1500)
+        if (gut_data_len < 42 || gut_data_len > 1500)
             return -1;
 
         /* Strip RTP header directly from packet.
@@ -367,17 +380,17 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         eth = data;
         udph = (void *)((__u8 *)data + udp_off);
         wg = (__u8 *)data + wg_off;
-        wg_len = gost_data_len;
-        if (wg + GUT_GOST_HEADER_SIZE + WG_MIN_PACKET > (__u8 *)data_end)
+        wg_len = gut_data_len;
+        if (wg + GUT_HEADER_SIZE + WG_MIN_PACKET > (__u8 *)data_end)
             return -1;
-        udp_len = 8 + (__u16)gost_data_len;
+        udp_len = 8 + (__u16)gut_data_len;
     }
     else if (wg[0] == 'M' || wg[0] == 'R' || wg[0] == 'O' ||
              wg[0] == 'S' || wg[0] == 'I' || wg[0] == 'B' ||
              wg[0] == 'A' || wg[0] == 'V' || wg[0] == 'N' || wg[0] == 'P' ||
              (wg[0] == 'G' && wg[1] == 'E' && wg[2] == 'T'))
     {
-        /* ── SIP signaling: scan for "a=fmtp:0 " marker, b64 decode → GOST ── */
+        /* ── SIP signaling: scan for "a=fmtp:0 " marker, b64 decode → GUT ── */
         __u32 scan_len = wg_len;
         if (scan_len > 1024)
             scan_len = 1024;
@@ -446,19 +459,19 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         if (b64_bounded < 16 || b64_bounded > GUT_B64_MAX_OUT || (b64_bounded & 3))
             return -1;
         __u32 decoded_len = b64_decode(scratch, B64_ENC_OFF, b64_bounded, B64_INNER_OFF);
-        if (decoded_len < GUT_GOST_HEADER_SIZE + WG_MIN_PACKET ||
+        if (decoded_len < GUT_HEADER_SIZE + WG_MIN_PACKET ||
             decoded_len > GUT_B64_MAX_INNER)
             return -1;
 
-        /* Strip ballast from decoded GOST inner */
+        /* Strip ballast from decoded GUT inner */
         __u32 pad_off = (B64_INNER_OFF + 9) & (SCRATCH_SIZE - 1);
         __u8 pad_byte_s = scratch[pad_off];
         __u32 ballast_s = (pad_byte_s & 0x40) ? ((__u32)(pad_byte_s & 0x3F) + 1) : 0;
-        if (ballast_s >= decoded_len - GUT_GOST_HEADER_SIZE)
+        if (ballast_s >= decoded_len - GUT_HEADER_SIZE)
             return -1;
         decoded_len -= ballast_s;
         decoded_len &= 0x3FF;
-        if (decoded_len < GUT_GOST_HEADER_SIZE + WG_MIN_PACKET || decoded_len > 1023)
+        if (decoded_len < GUT_HEADER_SIZE + WG_MIN_PACKET || decoded_len > 1023)
             return -1;
         scratch[pad_off] = 0x00;
 
@@ -471,12 +484,12 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
                          : [out] "=r"(dl_bounded)
                          : [in] "r"(decoded_len)
                          :);
-            if (dl_bounded < GUT_GOST_HEADER_SIZE + WG_MIN_PACKET)
+            if (dl_bounded < GUT_HEADER_SIZE + WG_MIN_PACKET)
                 return -1;
             decoded_len = dl_bounded;
         }
 
-        /* Write decoded GOST inner back to packet */
+        /* Write decoded GUT inner back to packet */
         if (bpf_xdp_store_bytes(ctx, wg_off,
                                 scratch + B64_INNER_OFF, decoded_len) < 0)
             return -1;
@@ -500,7 +513,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             return -1;
         wg = (__u8 *)data + wg_off;
         wg_len = decoded_len;
-        if (wg + GUT_GOST_HEADER_SIZE + WG_MIN_PACKET > (__u8 *)data_end)
+        if (wg + GUT_HEADER_SIZE + WG_MIN_PACKET > (__u8 *)data_end)
             return -1;
         if (wg + wg_len > (__u8 *)data_end)
             return -1;
@@ -510,8 +523,8 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     {
         return -1; /* not RTP and not SIP — reject */
     }
-    /* Packet is now in GOST format — fall through to GOST processing */
-    __u32 outer_hdr_len = GUT_GOST_HEADER_SIZE;
+    /* Packet is now in GUT format — fall through to GUT processing */
+    __u32 outer_hdr_len = GUT_HEADER_SIZE;
 #else /* GUT_MODE_QUIC */
     __u32 outer_hdr_len = 0;
     if (wg[0] == 0x40)
@@ -563,7 +576,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
 
     __u8 *quic = wg - outer_hdr_len;
 
-#if defined(GUT_MODE_GOST) || defined(GUT_MODE_B64)
+#if defined(GUT_MODE_GUT) || defined(GUT_MODE_B64)
     {
         __u32 pkt_ppn = 0;
         __builtin_memcpy(&pkt_ppn, quic + 0, 4);
@@ -659,7 +672,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             ep.port = bpf_ntohs(udph->source);
             ep.server_port = bpf_ntohs(udph->dest);
             ep.valid = 1;
-            ep.obfs_gost = 0;
+            ep.obfs_gut = 0;
             bpf_map_update_elem(&client_map, &client_idx, &ep, BPF_ANY);
             bpf_debug("XDP: client_map[%u] updated wg_type=%u port=%u", client_idx, wg_type, ep.port);
         }
@@ -673,7 +686,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
      * On bpf_xdp_load_bytes failure enc_ports stays 0 and ports_ok=0 prevents restore. */
     __u32 enc_ports = 0;
     int ports_ok = 1;
-#if defined(GUT_MODE_GOST) || defined(GUT_MODE_B64)
+#if defined(GUT_MODE_GUT) || defined(GUT_MODE_B64)
     __builtin_memcpy(&enc_ports, quic + 4, 4);
 #else /* GUT_MODE_QUIC */
     if (outer_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
@@ -690,7 +703,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     __be16 inner_dport_ne = ports_ok ? bpf_htons((__u16)(plain_ports & 0xFFFF)) : 0;
 
     /* mac2 XOR — symmetric with userspace obfs_decap.
-     * B64 modes: mac2 was XOR'd on egress (in GOST inner before b64 encode).
+     * B64 modes: mac2 was XOR'd on egress (in GUT inner before b64 encode).
      * Non-B64 modes: mac2 was XOR'd directly on packet by TC egress.
      * Both need the reverse XOR here. */
 #if defined(GUT_MODE_B64)
@@ -1282,19 +1295,15 @@ int xdp_gut_ingress(struct xdp_md *ctx)
     if (rc != 0)
     {
 #if defined(GUT_MODE_QUIC)
-        /* QUIC mode: respond to DPI probes with Version Negotiation */
+        /* QUIC mode: tail-call to probe handler to stay within verifier
+         * budget on kernel ≤6.2.  On tail-call failure, fall through. */
         if (cfg->own_http3 == 1)
-        {
-            if (handle_quic_probe(ctx) == XDP_TX)
-                return XDP_TX;
-        }
+            bpf_tail_call(ctx, &xdp_progs, 0);
 #elif defined(GUT_MODE_SIP)
-        /* SIP mode: respond to DPI probes with 401/403 */
+        /* SIP mode: tail-call to probe handler to stay within verifier
+         * budget on kernel ≤6.2.  On tail-call failure, fall through. */
         if (cfg->own_http3 == 1)
-        {
-            if (handle_sip_probe(ctx) == XDP_TX)
-                return XDP_TX;
-        }
+            bpf_tail_call(ctx, &xdp_progs, 0);
 #endif
         if (cfg->default_xdp_action == 1)
             return XDP_DROP;
@@ -1303,6 +1312,54 @@ int xdp_gut_ingress(struct xdp_md *ctx)
 
     return bpf_redirect_map(&tx_devmap, zero, 0);
 }
+
+#if defined(GUT_MODE_QUIC)
+/* ── Tail-call target: QUIC Version Negotiation anti-probe response ──
+ * Called from xdp_gut_ingress() when gut_xdp_core() rejects a packet
+ * and own_http3 is enabled.  Self-contained: re-parses the packet,
+ * builds a VN response, and returns XDP_TX.  This keeps AES/checksum
+ * complexity out of the main program's verifier budget. */
+SEC("xdp")
+int xdp_quic_probe(struct xdp_md *ctx)
+{
+    __u32 zero = 0;
+    struct gut_config *cfg = bpf_map_lookup_elem(&config_map, &zero);
+    if (!cfg || cfg->own_http3 != 1)
+        return XDP_PASS;
+
+    int rc = handle_quic_probe(ctx);
+    if (rc == XDP_TX)
+        return XDP_TX;
+
+    if (cfg->default_xdp_action == 1)
+        return XDP_DROP;
+    return XDP_PASS;
+}
+#endif /* GUT_MODE_QUIC */
+
+#if defined(GUT_MODE_SIP)
+/* ── Tail-call target: SIP 401/403 anti-probe response ──────────────
+ * Called from xdp_gut_ingress() when gut_xdp_core() rejects a packet
+ * and own_http3 is enabled.  Self-contained: re-parses the packet,
+ * builds a SIP 401/403 response, and returns XDP_TX.  This keeps
+ * SIP probe complexity out of the main program's verifier budget. */
+SEC("xdp")
+int xdp_sip_probe(struct xdp_md *ctx)
+{
+    __u32 zero = 0;
+    struct gut_config *cfg = bpf_map_lookup_elem(&config_map, &zero);
+    if (!cfg || cfg->own_http3 != 1)
+        return XDP_PASS;
+
+    int rc = handle_sip_probe(ctx);
+    if (rc == XDP_TX)
+        return XDP_TX;
+
+    if (cfg->default_xdp_action == 1)
+        return XDP_DROP;
+    return XDP_PASS;
+}
+#endif /* GUT_MODE_SIP */
 
 SEC("xdp")
 int xdp_veth_pass(struct xdp_md *ctx)

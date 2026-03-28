@@ -12,12 +12,12 @@ GUTD_OBFS="${GUTD_OBFS:-quic}"
 
 # Per-mode default ports (override via GUT_PORTS_CSV):
 #   quic   — any UDP port(s)
-#   gost   — single random-looking UDP port
+#   gut   — single random-looking UDP port
 #   sip    — ports[0]=SIP signaling, ports[1+]=RTP media (≥2 required)
 #   syslog — standard syslog UDP
 if [[ -z "${GUT_PORTS_CSV:-}" ]]; then
     case "$GUTD_OBFS" in
-        gost)   GUT_PORTS_CSV="2046" ;;
+        gut)   GUT_PORTS_CSV="2046" ;;
         sip)    GUT_PORTS_CSV="5060,10000,10001" ;;
         syslog) GUT_PORTS_CSV="514" ;;
         b64)    GUT_PORTS_CSV="8080" ;;
@@ -29,22 +29,22 @@ fi
 #   quic   — TLS SNI domain in QUIC ClientHello
 #   sip    — SIP domain in Via/To/From headers
 #   syslog — syslog hostname / service name
-#   gost   — unused
+#   gut   — unused
 if [[ -z "${GUTD_SNI:-}" ]]; then
     case "$GUTD_OBFS" in
         syslog) GUTD_SNI="asterisk" ;;
         sip)    GUTD_SNI="sip.example.com" ;;
-        gost)   GUTD_SNI="" ;;
+        gut)   GUTD_SNI="" ;;
         *)      GUTD_SNI="example.com" ;;  # quic / unknown
     esac
 fi
 
 # Per-mode WG MTU (affects both the WireGuard interface MTU and the gutd peer mtu):
 #   syslog — base64 expands payload; WG_MTU=800 → wg_len≈832 ≤ GUT_B64_WG_MTU_MAX(886) ✓
-#   sip    — RTP(12)+GOST(10)=22 bytes added by BPF; WG_MTU=1400 verified working;
+#   sip    — RTP(12)+GUT(10)=22 bytes added by BPF; WG_MTU=1400 verified working;
 #            WG_MTU=1408+ causes oversized frames on veth (empirically confirmed)
 #   quic   — QUIC short header adds 16 bytes; keeps outer packet ≤ 1500, use 1420
-#   gost   — GOST adds 10 bytes; keeps outer packet ≤ 1500, use 1420
+#   gut   — GUT adds 10 bytes; keeps outer packet ≤ 1500, use 1420
 case "$GUTD_OBFS" in
     syslog) WG_MTU="${WG_MTU:-800}"  ;;
     sip)    WG_MTU="${WG_MTU:-1400}" ;;
