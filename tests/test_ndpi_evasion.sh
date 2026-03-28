@@ -221,7 +221,6 @@ log "Configuring WireGuard..."
 
 log "Starting packet capture..."
 rm -f $PCAP_FILE
-# Capture only UDP on ports 5060 (SIP) and 10000-11000 (RTP) + ICMP for debugging
 ip netns exec ndpi_client tcpdump -i veth_c -w $PCAP_FILE -s 0 -n > /dev/null 2>&1 &
 TCPDUMP_PID=$!
 sleep 1
@@ -272,9 +271,27 @@ case "$OBFS_MODE" in
     quic)   EXPECT="QUIC" ;;
     sip)    EXPECT="SIP" ;;
     syslog) EXPECT="Syslog" ;;
-    gut)   EXPECT="" ;;  # random UDP, no specific protocol expected
+    gut)    EXPECT="" ;;  # random UDP, no specific protocol expected
 esac
 
 if [ -n "$EXPECT" ]; then
     grep -qi "$EXPECT" "$RESULTS_FILE" || err "nDPI did not classify traffic as $EXPECT"
 fi
+
+# Extract the GUT flow port used for this mode
+GUT_PORT="${GUTD_PORTS%%,*}"  # first port
+GUT_PORT="${GUT_PORT// /}"    # trim spaces
+
+# Check that the GUT flow itself has no risk flags.
+# Other flows (ICMP, ICMPv6) are normal OS traffic passed transparently —
+# only the obfuscated flow matters.
+GUT_FLOW=$(grep "UDP.*:${GUT_PORT} " "$RESULTS_FILE" || true)
+if [ -z "$GUT_FLOW" ]; then
+    err "GUT flow on port $GUT_PORT not found in nDPI output"
+fi
+if echo "$GUT_FLOW" | grep -qi "Risk:"; then
+    echo -e "${RED}[!]${NC} GUT flow has nDPI risks:"
+    echo "$GUT_FLOW" | grep -oi '\[Risk: [^]]*\]'
+    err "GUT flow on port $GUT_PORT flagged with risks by nDPI"
+fi
+log "GUT flow (port $GUT_PORT) — clean, no risks"
