@@ -13,7 +13,7 @@
 <sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. [See test logic and full logs](https://github.com/sh0rch/gutd/actions/runs/23644686799). Last updated: 2026-03-27 11:47</i></sub>
 <!-- INTEGRATION_TEST_RESULTS_END -->
 
-**gutd v2** transparently obfuscates WireGuard UDP traffic using a Linux TC/XDP eBPF datapath. On egress the TC BPF program wraps each WireGuard packet in a chosen obfuscation envelope, masks the payload with a ChaCha keystream and optionally pads it. On ingress the XDP program validates, strips the envelope and restores the original packet before WireGuard sees it. WireGuard is completely unaware of gutd. A **pure userspace mode** (wire-compatible with the eBPF path) is available for older kernels, unprivileged containers, MikroTik RouterOS, and **Windows**.
+**gutd v3** transparently obfuscates WireGuard UDP traffic using a Linux TC/XDP eBPF datapath. On egress the TC BPF program wraps each WireGuard packet in a chosen obfuscation envelope, masks the payload with a ChaCha keystream and optionally pads it. On ingress the XDP program validates, strips the envelope and restores the original packet before WireGuard sees it. WireGuard is completely unaware of gutd. A **pure userspace mode** (wire-compatible with the eBPF path) is available for older kernels, unprivileged containers, MikroTik RouterOS, and **Windows**.
 
 ## Obfuscation Modes
 
