@@ -28,6 +28,7 @@ fn compile_tc_ebpf() {
     println!("cargo:rerun-if-changed=src/bpf/");
     println!("cargo:rerun-if-changed=src/bpf/tc_gut_egress.bpf.c");
     println!("cargo:rerun-if-changed=src/bpf/xdp_gut_ingress.bpf.c");
+    println!("cargo:rerun-if-changed=src/bpf/xdp_dispatcher.bpf.c");
     println!("cargo:rerun-if-changed=src/bpf/gut_common.h");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
@@ -215,6 +216,14 @@ fn compile_tc_ebpf() {
         .expect("Failed to generate XDP ingress SIP skeleton");
 
     println!("cargo:warning=TC eBPF skeletons generated successfully (GUT + QUIC + Syslog + SIP)");
+
+    // ── XDP Dispatcher (multi-peer port router) ─────────────────────
+    let dispatcher_skel = out_dir.join("xdp_dispatcher.skel.rs");
+    SkeletonBuilder::new()
+        .source("src/bpf/xdp_dispatcher.bpf.c")
+        .clang_args(["-I", "src/bpf", &arch_include])
+        .build_and_generate(&dispatcher_skel)
+        .expect("Failed to generate XDP dispatcher skeleton");
 }
 
 fn get_git_version() -> Option<String> {
