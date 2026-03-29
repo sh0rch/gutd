@@ -1,5 +1,6 @@
 pub mod config;
 pub mod crypto;
+#[cfg(not(target_os = "android"))]
 pub mod installer;
 #[cfg(target_os = "linux")]
 pub mod netlink;
