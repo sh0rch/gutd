@@ -88,6 +88,7 @@ fn compile_tc_ebpf() {
             "src/bpf",
             &chacha_define,
             "-DGUT_MODE_GUT",
+            "-mcpu=v3",
             &arch_include,
         ])
         .build_and_generate(&ingress_skel)
@@ -121,7 +122,7 @@ fn compile_tc_ebpf() {
     let ingress_quic_skel = out_dir.join("xdp_gut_ingress_quic.skel.rs");
     SkeletonBuilder::new()
         .source("src/bpf/xdp_gut_ingress.bpf.c")
-        .clang_args(["-I", "src/bpf", &chacha_define, &arch_include])
+        .clang_args(["-I", "src/bpf", &chacha_define, "-mcpu=v3", &arch_include])
         .build_and_generate(&ingress_quic_skel)
         .expect("Failed to generate XDP ingress QUIC skeleton");
 
@@ -165,6 +166,7 @@ fn compile_tc_ebpf() {
             "src/bpf",
             &chacha_define,
             "-DGUT_MODE_SYSLOG",
+            "-mcpu=v3",
             &arch_include,
         ])
         .build_and_generate(&ingress_syslog_skel)
@@ -210,6 +212,7 @@ fn compile_tc_ebpf() {
             "src/bpf",
             &chacha_define,
             "-DGUT_MODE_SIP",
+            "-mcpu=v3",
             &arch_include,
         ])
         .build_and_generate(&ingress_sip_skel)

@@ -283,10 +283,13 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             return -1;
         scratch[pad_off] = 0x00; /* clear ballast flag for shared GUT code */
 
-        /* Force compiler to resolve bounds strictly before call */
-        __u32 slen = decoded_len & 0x3FF;
-        if (slen == 0)
-            return -1;
+        /* Verifier-safe clamp (same pattern as SIP path for 6.1 compat) */
+        __u32 slen = decoded_len;
+        asm volatile("" : "+r"(slen));
+        if (slen < 42)
+            slen = 42;
+        if (slen > 1023)
+            slen = 1023;
 
         /* Write decoded GUT inner (without ballast) back to packet */
         if (bpf_xdp_store_bytes(ctx, wg_off,
@@ -334,12 +337,9 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             gut_data_len > 1500)
             return -1;
 
-        /* Re-bound for verifier: spill across branches loses umin tracking */
-        asm volatile("%[v] &= 2047\n\t"
-                     "if %[v] < 42 goto +0"
-                     : [v] "+r"(gut_data_len)
-                     :
-                     :);
+        /* Re-bound for verifier: spill across branches loses umin tracking.
+         * asm goto+0 is a nop on kernel 6.1 — use plain mask + branch. */
+        asm volatile("%[v] &= 2047" : [v] "+r"(gut_data_len) : :);
         if (gut_data_len < 42 || gut_data_len > 1500)
             return -1;
 
@@ -397,6 +397,14 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         if (scan_len < 64)
             return -1;
 
+        /* Kernel 6.1: verifier loses umax through spill/reload.
+         * Re-establish [64,1024] after compiler barrier. */
+        asm volatile("" : "+r"(scan_len));
+        if (scan_len < 64)
+            scan_len = 64;
+        if (scan_len > 1024)
+            scan_len = 1024;
+
         /* Load first up to 1024 bytes for marker scanning */
         if (bpf_xdp_load_bytes(ctx, wg_off,
                                scratch + SIP_SCAN_OFF, scan_len) < 0)
@@ -435,19 +443,17 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         if (b64_data_len < 16 || b64_data_len > GUT_B64_MAX_OUT)
             return -1;
 
-        /* Re-bound b64_data_len for verifier */
-        {
-            __u32 blen_bounded;
-            asm volatile("%[out] = %[in]\n\t"
-                         "%[out] &= 2047\n\t"
-                         "if %[out] < 16 goto +0"
-                         : [out] "=r"(blen_bounded)
-                         : [in] "r"(b64_data_len)
-                         :);
-            if (blen_bounded < 16 || blen_bounded > GUT_B64_MAX_OUT)
-                return -1;
-            b64_data_len = blen_bounded;
-        }
+        /* Kernel 6.1 verifier loses umin through spill/reload — the
+         * compiler spills b64_data_len before the range check and
+         * reloads the stale [0,2047] slot for the helper arg.
+         * Fix: asm volatile barrier prevents dead-code elimination of
+         * the clamp below; conditional moves re-establish [16,1200]
+         * on every path the verifier can see, even after reload. */
+        asm volatile("" : "+r"(b64_data_len));
+        if (b64_data_len < 16)
+            b64_data_len = 16;
+        if (b64_data_len > GUT_B64_MAX_OUT)
+            b64_data_len = GUT_B64_MAX_OUT;
 
         /* Load base64 payload from packet */
         if (bpf_xdp_load_bytes(ctx, (wg_off + (sip_hdr_len & 0x7FF)) & 0xFFFF,
@@ -475,19 +481,12 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             return -1;
         scratch[pad_off] = 0x00;
 
-        /* Re-bound decoded_len: verifier loses range through bpf_loop spills */
-        {
-            __u32 dl_bounded;
-            asm volatile("%[out] = %[in]\n\t"
-                         "%[out] &= 1023\n\t"
-                         "if %[out] < 42 goto +0"
-                         : [out] "=r"(dl_bounded)
-                         : [in] "r"(decoded_len)
-                         :);
-            if (dl_bounded < GUT_HEADER_SIZE + WG_MIN_PACKET)
-                return -1;
-            decoded_len = dl_bounded;
-        }
+        /* Same clamp pattern for decoded_len before bpf_xdp_store_bytes */
+        asm volatile("" : "+r"(decoded_len));
+        if (decoded_len < 42)
+            decoded_len = 42;
+        if (decoded_len > 1023)
+            decoded_len = 1023;
 
         /* Write decoded GUT inner back to packet */
         if (bpf_xdp_store_bytes(ctx, wg_off,
@@ -994,59 +993,64 @@ static __always_inline int handle_quic_probe(struct xdp_md *ctx)
     __u32 new_udp_len = 8 + new_quic_len;
     __u32 new_pkt_len = udp_off + new_udp_len;
 
-    /* Build the QUIC Version Negotiation response in a stack buffer.
-     * Zero-init ensures ALL 64 slots are "readable" for the verifier, so
-     * bpf_xdp_store_bytes can read them even with variable len.
-     * Variable-index writes on a stack array ARE permitted by the BPF verifier
-     * (unlike variable-offset writes directly to packet memory, which are not). */
-    __u8 response[64] = {};
-    response[0] = orig_q0 | 0x80; /* Long Header, Version Negotiation */
-    /* [1..4] = version 0x00000000 — already zero */
-    response[5] = scid_len;
-
-    int roff = 6;
-
-    for (int i = 0; i < 20; i++)
-    {
-        if (i < scid_len)
-        {
-            response[roff & 0x3F] = orig_scid[i];
-            roff++;
-        }
-    }
-    response[roff & 0x3F] = dcid_len;
-    roff++;
-
-    for (int i = 0; i < 20; i++)
-    {
-        if (i < dcid_len)
-        {
-            response[roff & 0x3F] = orig_dcid[i];
-            roff++;
-        }
-    }
-    response[(roff++) & 0x3F] = 0x6b; /* QUIC v2 = 0x6b3343cf (RFC 9369)  */
-    response[(roff++) & 0x3F] = 0x33;
-    response[(roff++) & 0x3F] = 0x43;
-    response[(roff++) & 0x3F] = 0xcf;
-    response[(roff++) & 0x3F] = 0x00; /* QUIC v1 = 0x00000001 (RFC 9000)  */
-    response[(roff++) & 0x3F] = 0x00; /* real servers always list v1;      */
-    response[(roff++) & 0x3F] = 0x00; /* v2-only VN never triggers a valid */
-    response[(roff++) & 0x3F] = 0x01; /* client retry → looks fake to DPI  */
-
     /* Resize the packet to the exact response length */
     int delta = new_pkt_len - (__u32)((__u8 *)data_end - (__u8 *)data);
     if (bpf_xdp_adjust_tail(ctx, delta))
         return XDP_PASS;
 
-    /* Write QUIC bytes: bpf_xdp_store_bytes handles the variable packet
-     * offset (quic_off) safely inside the helper.
-     * new_quic_len = 1+4+1+scid_len+1+dcid_len+4+4, range [15, 59].
-     * Explicit range pair (not bitmask) preserves umin for the verifier. */
-    new_quic_len &= 0x3F;
-    if (new_quic_len < 15 || new_quic_len > 60)
+    /* Build QUIC Version Negotiation in scratch map buffer (offset 320).
+     * Writing variable-length DCID/SCID into a map value avoids the verifier
+     * state explosion from variable-offset stack writes (kernel ≤6.2), and
+     * avoids zero-sized bpf_xdp_store_bytes calls that kernel 6.1 rejects. */
+    __u32 szero = 0;
+    __u8 *scratch = bpf_map_lookup_elem(&scratch_map, &szero);
+    if (!scratch)
         return XDP_PASS;
-    if (bpf_xdp_store_bytes(ctx, quic_off, response, new_quic_len))
+
+    /* Use scratch[320..383] as 64-byte VN build area */
+    __u32 roff = 320;
+    scratch[roff] = orig_q0 | 0x80; /* Long Header, Version Negotiation */
+    scratch[roff + 1] = 0;          /* Version[0] = 0x00000000 */
+    scratch[roff + 2] = 0;
+    scratch[roff + 3] = 0;
+    scratch[roff + 4] = 0;
+    scratch[roff + 5] = scid_len; /* DCID_Len (VN DCID = probe SCID) */
+    roff += 6;
+
+    /* Copy probe's SCID → VN DCID */
+    for (int i = 0; i < 20; i++)
+    {
+        if (i < scid_len)
+            scratch[(roff + i) & (SCRATCH_SIZE - 1)] = orig_scid[i];
+    }
+    roff += (__u32)scid_len;
+
+    /* SCID_Len + probe's DCID → VN SCID */
+    scratch[roff & (SCRATCH_SIZE - 1)] = dcid_len;
+    roff++;
+    for (int i = 0; i < 20; i++)
+    {
+        if (i < dcid_len)
+            scratch[(roff + i) & (SCRATCH_SIZE - 1)] = orig_dcid[i];
+    }
+    roff += (__u32)dcid_len;
+
+    /* Supported Versions: v2 (0x6b3343cf) + v1 (0x00000001) */
+    scratch[(roff + 0) & (SCRATCH_SIZE - 1)] = 0x6b;
+    scratch[(roff + 1) & (SCRATCH_SIZE - 1)] = 0x33;
+    scratch[(roff + 2) & (SCRATCH_SIZE - 1)] = 0x43;
+    scratch[(roff + 3) & (SCRATCH_SIZE - 1)] = 0xcf;
+    scratch[(roff + 4) & (SCRATCH_SIZE - 1)] = 0x00;
+    scratch[(roff + 5) & (SCRATCH_SIZE - 1)] = 0x00;
+    scratch[(roff + 6) & (SCRATCH_SIZE - 1)] = 0x00;
+    scratch[(roff + 7) & (SCRATCH_SIZE - 1)] = 0x01;
+
+    /* Write entire VN response from scratch to packet in one call.
+     * new_quic_len range [15,59]; clamp for verifier. */
+    new_quic_len &= 0x3F;
+    if (new_quic_len < 15 || new_quic_len > 59)
+        return XDP_PASS;
+    if (bpf_xdp_store_bytes(ctx, quic_off, scratch + 320, new_quic_len))
         return XDP_PASS;
 
     /* Recompute all packet pointers — required after both adjust_tail and

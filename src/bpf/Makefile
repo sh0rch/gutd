@@ -53,7 +53,7 @@ tc_gut_egress.o: tc_gut_egress.bpf.c gut_common.h
 	$(LLVM_STRIP) -g $@
 
 xdp_gut_ingress.o: xdp_gut_ingress.bpf.c gut_common.h
-	$(CLANG) $(BPF_CFLAGS) -DGUT_MODE_GUT -c $< -o $@
+	$(CLANG) $(BPF_CFLAGS) -mcpu=v3 -DGUT_MODE_GUT -c $< -o $@
 	$(LLVM_STRIP) -g $@
 
 # ── QUIC mode ──
@@ -62,7 +62,7 @@ tc_gut_egress_quic.o: tc_gut_egress.bpf.c gut_common.h
 	$(LLVM_STRIP) -g $@
 
 xdp_gut_ingress_quic.o: xdp_gut_ingress.bpf.c gut_common.h
-	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
+	$(CLANG) $(BPF_CFLAGS) -mcpu=v3 -c $< -o $@
 	$(LLVM_STRIP) -g $@
 
 # ── Syslog mode ──
@@ -71,7 +71,7 @@ tc_gut_egress_syslog.o: tc_gut_egress.bpf.c gut_common.h
 	$(LLVM_STRIP) -g $@
 
 xdp_gut_ingress_syslog.o: xdp_gut_ingress.bpf.c gut_common.h
-	$(CLANG) $(BPF_CFLAGS) -DGUT_MODE_SYSLOG -c $< -o $@
+	$(CLANG) $(BPF_CFLAGS) -mcpu=v3 -DGUT_MODE_SYSLOG -c $< -o $@
 	$(LLVM_STRIP) -g $@
 
 # ── SIP mode ──
@@ -80,7 +80,7 @@ tc_gut_egress_sip.o: tc_gut_egress.bpf.c gut_common.h
 	$(LLVM_STRIP) -g $@
 
 xdp_gut_ingress_sip.o: xdp_gut_ingress.bpf.c gut_common.h
-	$(CLANG) $(BPF_CFLAGS) -DGUT_MODE_SIP -c $< -o $@
+	$(CLANG) $(BPF_CFLAGS) -mcpu=v3 -DGUT_MODE_SIP -c $< -o $@
 	$(LLVM_STRIP) -g $@
 
 # ── XDP dispatcher (multi-peer port router) ──

@@ -131,9 +131,7 @@ kernel versions due to verifier improvements in state pruning and precision trac
 
 | Kernel | QUIC | GUT | Syslog | SIP | Notes |
 |---|---|---|---|---|---|
-| **≥ 6.6** | ✅ | ✅ | ✅ | ✅ | Full `mark_precise` for callbacks; recommended |
-| **6.3 – 6.5** | ✅ | ✅ | ✅ | ✅ | `parent track_live` state merge |
-| **6.1 – 6.2** | ⚠️ | ✅ | ✅ | ⚠️ | QUIC/SIP egress may exceed 1M insn limit |
+| **≥ 6.1** | ✅ | ✅ | ✅ | ✅ | Fully tested; 6.1 uses `-mcpu=v3` + verifier-safe clamps |
 | **5.17 – 6.0** | ⚠️ | ✅ | ⚠️ | ⚠️ | Only GUT mode is reliable |
 | **< 5.17** | ❌ | ❌ | ❌ | ❌ | No `bpf_loop`; use userspace mode |
 
