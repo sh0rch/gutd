@@ -401,28 +401,71 @@ impl EgressSkel {
     }
 }
 
+/// XDP attachment: bpf_link (preferred) or legacy netlink with explicit mode.
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+#[allow(dead_code)] // Link held for Drop (auto-detach)
+enum XdpAttachment {
+    Link(libbpf_rs::Link),
+    Legacy { ifindex: i32, flags: u32 },
+}
+
+#[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+impl Drop for XdpAttachment {
+    fn drop(&mut self) {
+        if let XdpAttachment::Legacy { ifindex, flags } = self {
+            unsafe {
+                libbpf_sys::bpf_xdp_detach(*ifindex, *flags, std::ptr::null());
+            }
+        }
+    }
+}
+
 /// Per-NIC XDP dispatcher: routes packets by UDP dst_port to the
 /// correct peer's XDP ingress program via tail-call.
 /// One dispatcher per physical NIC, shared by all peers on that NIC.
 #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
 pub struct XdpDispatcher {
     _skel: xdp_dispatcher::XdpDispatcherSkel<'static>,
-    _xdp_link: libbpf_rs::Link,
+    _xdp_attach: XdpAttachment,
     next_peer_idx: u32,
 }
 
 #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
 impl XdpDispatcher {
     /// Load dispatcher and attach XDP to the given NIC.
+    /// Tries bpf_link (auto native/generic), falls back to legacy SKB mode.
     pub fn new(ingress_ifindex: i32) -> crate::Result<Self> {
         let builder = xdp_dispatcher::XdpDispatcherSkelBuilder::default();
         let open_obj: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
             Box::leak(Box::new(MaybeUninit::uninit()));
         let skel = builder.open(open_obj)?.load()?;
-        let xdp_link = skel.progs.xdp_dispatch.attach_xdp(ingress_ifindex)?;
+        let xdp_attach = match skel.progs.xdp_dispatch.attach_xdp(ingress_ifindex) {
+            Ok(link) => XdpAttachment::Link(link),
+            Err(link_err) => {
+                eprintln!("    dispatcher: bpf_link XDP failed: {link_err}, trying legacy SKB");
+                use std::os::fd::AsRawFd;
+                let prog_fd = skel.progs.xdp_dispatch.as_fd().as_raw_fd();
+                let flags = libbpf_sys::XDP_FLAGS_SKB_MODE;
+                let ret = unsafe {
+                    libbpf_sys::bpf_xdp_attach(ingress_ifindex, prog_fd, flags, std::ptr::null())
+                };
+                if ret < 0 {
+                    return Err(format!(
+                        "XDP dispatcher attach failed — bpf_link: {link_err}; SKB: errno {}",
+                        -ret
+                    )
+                    .into());
+                }
+                eprintln!("    dispatcher: attached via legacy SKB mode");
+                XdpAttachment::Legacy {
+                    ifindex: ingress_ifindex,
+                    flags,
+                }
+            }
+        };
         Ok(Self {
             _skel: skel,
-            _xdp_link: xdp_link,
+            _xdp_attach: xdp_attach,
             next_peer_idx: 0,
         })
     }
@@ -458,7 +501,7 @@ pub struct TcBpfManager {
     egress_skel: EgressSkel,
     _ingress_skel: Box<dyn std::any::Any>,
     _egress_hook: libbpf_rs::TcHook,
-    _veth_pass_link: libbpf_rs::Link,
+    _veth_pass_attach: XdpAttachment,
     _veth_xdp_name: String,
 }
 
@@ -721,7 +764,31 @@ impl TcBpfManager {
                 )?;
                 use std::os::fd::AsRawFd;
                 let ingress_prog_fd = skel.progs.xdp_gut_ingress.as_fd().as_raw_fd();
-                let vpl = skel.progs.xdp_veth_pass.attach_xdp(tun_ifindex)?;
+                let vpl = match skel.progs.xdp_veth_pass.attach_xdp(tun_ifindex) {
+                    Ok(link) => XdpAttachment::Link(link),
+                    Err(link_err) => {
+                        eprintln!(
+                            "    veth_pass: bpf_link XDP failed: {link_err}, trying legacy SKB"
+                        );
+                        let vp_fd = skel.progs.xdp_veth_pass.as_fd().as_raw_fd();
+                        let flags = libbpf_sys::XDP_FLAGS_SKB_MODE;
+                        let ret = unsafe {
+                            libbpf_sys::bpf_xdp_attach(tun_ifindex, vp_fd, flags, std::ptr::null())
+                        };
+                        if ret < 0 {
+                            return Err(format!(
+                                "veth_pass XDP failed — bpf_link: {link_err}; SKB: errno {}",
+                                -ret
+                            )
+                            .into());
+                        }
+                        eprintln!("    veth_pass: attached via legacy SKB mode");
+                        XdpAttachment::Legacy {
+                            ifindex: tun_ifindex,
+                            flags,
+                        }
+                    }
+                };
                 dispatcher.register_peer(ingress_prog_fd, &config.peer().ports)?;
                 (Box::new(skel) as Box<dyn std::any::Any>, vpl)
             }};
@@ -783,7 +850,7 @@ impl TcBpfManager {
             egress_skel,
             _ingress_skel,
             _egress_hook: egress_hook,
-            _veth_pass_link: veth_pass_link,
+            _veth_pass_attach: veth_pass_link,
             _veth_xdp_name: veth_xdp_name,
         })
     }
