@@ -171,11 +171,22 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     if ((void *)(eth + 1) > data_end)
         return -1;
 
-    __u32 ip_off = 14;
+    __u16 eth_proto = eth->h_proto;
+    __u32 ip_off = sizeof(*eth);
+
+    /* VLAN (802.1Q) */
+    if (eth_proto == bpf_htons(ETH_P_8021Q))
+    {
+        if ((__u8 *)data + ip_off + 4 > (__u8 *)data_end)
+            return -1;
+        eth_proto = *(__be16 *)((__u8 *)data + ip_off + 2);
+        ip_off += 4;
+    }
+
     __u32 udp_off;
     __u8 ipver;
 
-    if (eth->h_proto == bpf_htons(ETH_P_IP))
+    if (eth_proto == bpf_htons(ETH_P_IP))
     {
         struct iphdr *iph = (void *)((__u8 *)data + ip_off);
         if ((void *)(iph + 1) > data_end)
@@ -185,7 +196,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         udp_off = ip_off + 20;
         ipver = 4;
     }
-    else if (eth->h_proto == bpf_htons(ETH_P_IPV6))
+    else if (eth_proto == bpf_htons(ETH_P_IPV6))
     {
         struct ipv6hdr *ip6h = (void *)((__u8 *)data + ip_off);
         if ((void *)(ip6h + 1) > data_end)
@@ -678,13 +689,9 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     }
 #endif /* !GUT_MODE_B64 */
 
-    /* Read XOR-encrypted ports from the QUIC header (4 bytes, stored by TC egress).
-     * Short header (GUT_QUIC_SHORT_HEADER_SIZE=16): enc_ports at bytes [10-13].
-     * Long header  (GUT_QUIC_LONG_HEADER_SIZE=1200): enc_ports at bytes [24-27] (token field).
-     * Decrypt: enc_ports ^ ks47[11] -> (sport<<16)|dport host-order.
-     * On bpf_xdp_load_bytes failure enc_ports stays 0 and ports_ok=0 prevents restore. */
+    /* Read XOR-encrypted ports from the outer header (4 bytes, stored by TC egress).
+     * Decrypt: enc_ports ^ ks47[11] -> (sport<<16)|dport host-order. */
     __u32 enc_ports = 0;
-    int ports_ok = 1;
 #if defined(GUT_MODE_GUT) || defined(GUT_MODE_B64)
     __builtin_memcpy(&enc_ports, quic + 4, 4);
 #else /* GUT_MODE_QUIC */
@@ -698,8 +705,8 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     }
 #endif
     __u32 plain_ports = enc_ports ^ ks47[11];
-    __be16 inner_sport_ne = ports_ok ? bpf_htons((__u16)(plain_ports >> 16)) : 0;
-    __be16 inner_dport_ne = ports_ok ? bpf_htons((__u16)(plain_ports & 0xFFFF)) : 0;
+    __be16 inner_sport_ne = bpf_htons((__u16)(plain_ports >> 16));
+    __be16 inner_dport_ne = bpf_htons((__u16)(plain_ports & 0xFFFF));
 
     /* mac2 XOR — symmetric with userspace obfs_decap.
      * B64 modes: mac2 was XOR'd on egress (in GUT inner before b64 encode).
@@ -784,36 +791,34 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     }
 
     __u32 shift_len_head = udp_off + 8;
-    if (shift_len_head <= 62)
+    if (shift_len_head < 14 || shift_len_head > 62)
+        return -1;
+
+    /* Verifier-safe clamp for bpf_xdp_load/store_bytes size arg */
+    asm volatile("" : "+r"(shift_len_head));
+    if (shift_len_head < 14)
+        shift_len_head = 14;
+    if (shift_len_head > 62)
+        shift_len_head = 62;
+
+    /* Save original Eth+IP+UDP headers into scratch before adjust_head.
+     * Use bpf_xdp_load/store_bytes to avoid pragma-unroll failures when
+     * shift_len_head is not compile-time constant (VLAN shifts ip_off). */
+    if (bpf_xdp_load_bytes(ctx, 0, scratch + 256, shift_len_head) < 0)
+        return -1;
+
+    if (bpf_xdp_adjust_head(ctx, outer_hdr_len) == 0)
     {
-        if ((__u8 *)data + shift_len_head <= (__u8 *)data_end)
+        if (bpf_xdp_store_bytes(ctx, 0, scratch + 256, shift_len_head) < 0)
         {
-            _Pragma("unroll") for (int i = 0; i < 62; i++)
-            {
-                if (i >= shift_len_head)
-                    break;
-                scratch[256 + i] = ((__u8 *)data)[i];
-            }
-            if (bpf_xdp_adjust_head(ctx, outer_hdr_len) == 0)
-            {
-                data = (void *)(__u64)ctx->data;
-                data_end = (void *)(__u64)ctx->data_end;
-                if ((__u8 *)data + shift_len_head <= (__u8 *)data_end)
-                {
-                    _Pragma("unroll") for (int i = 0; i < 62; i++)
-                    {
-                        if (i >= shift_len_head)
-                            break;
-                        ((__u8 *)data)[i] = scratch[256 + i];
-                    }
-                }
-            }
-            else
-            {
-                stats->packets_dropped++;
-                return -1;
-            }
+            stats->packets_dropped++;
+            return -1;
         }
+    }
+    else
+    {
+        stats->packets_dropped++;
+        return -1;
     }
     data = (void *)(__u64)ctx->data;
     data_end = (void *)(__u64)ctx->data_end;
@@ -857,14 +862,8 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         iph->check = csum_fold(ip_csum);
 
         udp->check = 0;
-        /* Restore WG UDP ports decrypted from the QUIC header.
-         * enc_ports ^ ks47[11] -> original sport:dport.
-         * ports_ok=0 when load failed — leave tunnel ports as-is rather than corrupt. */
-        if (ports_ok)
-        {
-            udp->source = inner_sport_ne;
-            udp->dest = inner_dport_ne;
-        }
+        udp->source = inner_sport_ne;
+        udp->dest = inner_dport_ne;
     }
     else
     {
@@ -873,12 +872,15 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         if ((void *)(ip6h + 1) > data_end || (void *)(udp + 1) > data_end)
             return -1;
 
+        udp->source = inner_sport_ne;
+        udp->dest = inner_dport_ne;
+
+        /* IPv6 UDP checksum is mandatory per RFC 8200, but we deliver via
+         * bpf_redirect_map → local veth which sets CHECKSUM_UNNECESSARY on
+         * the skb — the stack will not validate it.  Full recomputation via
+         * calc_payload_csum is too expensive here (register pressure causes
+         * pragma unroll failures with the 62-iteration header-copy loops). */
         udp->check = 0;
-        if (ports_ok)
-        {
-            udp->source = inner_sport_ne;
-            udp->dest = inner_dport_ne;
-        }
     }
 
     __builtin_memcpy(eth->h_dest, cfg->tun_mac, 6);
@@ -903,11 +905,21 @@ static __always_inline int handle_quic_probe(struct xdp_md *ctx)
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
 
-    __u32 ip_off = 14;
+    __u16 eth_proto = eth->h_proto;
+    __u32 ip_off = sizeof(*eth);
+
+    if (eth_proto == bpf_htons(ETH_P_8021Q))
+    {
+        if ((__u8 *)data + ip_off + 4 > (__u8 *)data_end)
+            return XDP_PASS;
+        eth_proto = *(__be16 *)((__u8 *)data + ip_off + 2);
+        ip_off += 4;
+    }
+
     __u32 udp_off;
     __u8 ipver = 0;
 
-    if (eth->h_proto == bpf_htons(ETH_P_IP))
+    if (eth_proto == bpf_htons(ETH_P_IP))
     {
         struct iphdr *iph_v4 = (void *)((__u8 *)data + ip_off);
         if ((void *)(iph_v4 + 1) > data_end)
@@ -917,7 +929,7 @@ static __always_inline int handle_quic_probe(struct xdp_md *ctx)
         udp_off = ip_off + 20;
         ipver = 4;
     }
-    else if (eth->h_proto == bpf_htons(ETH_P_IPV6))
+    else if (eth_proto == bpf_htons(ETH_P_IPV6))
     {
         struct ipv6hdr *iph_v6 = (void *)((__u8 *)data + ip_off);
         if ((void *)(iph_v6 + 1) > data_end)
@@ -1138,11 +1150,21 @@ static __always_inline int handle_sip_probe(struct xdp_md *ctx)
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
 
-    __u32 ip_off = 14;
+    __u16 eth_proto = eth->h_proto;
+    __u32 ip_off = sizeof(*eth);
+
+    if (eth_proto == bpf_htons(ETH_P_8021Q))
+    {
+        if ((__u8 *)data + ip_off + 4 > (__u8 *)data_end)
+            return XDP_PASS;
+        eth_proto = *(__be16 *)((__u8 *)data + ip_off + 2);
+        ip_off += 4;
+    }
+
     __u32 udp_off;
     __u8 ipver = 0;
 
-    if (eth->h_proto == bpf_htons(ETH_P_IP))
+    if (eth_proto == bpf_htons(ETH_P_IP))
     {
         struct iphdr *iph = (void *)((__u8 *)data + ip_off);
         if ((void *)(iph + 1) > data_end)
@@ -1152,7 +1174,7 @@ static __always_inline int handle_sip_probe(struct xdp_md *ctx)
         udp_off = ip_off + 20;
         ipver = 4;
     }
-    else if (eth->h_proto == bpf_htons(ETH_P_IPV6))
+    else if (eth_proto == bpf_htons(ETH_P_IPV6))
     {
         struct ipv6hdr *ip6h = (void *)((__u8 *)data + ip_off);
         if ((void *)(ip6h + 1) > data_end)
@@ -1314,7 +1336,9 @@ int xdp_gut_ingress(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
-    return bpf_redirect_map(&tx_devmap, zero, 0);
+    /* XDP_PASS as fallback: if devmap lookup fails or target is down,
+     * pass the packet to the kernel stack instead of XDP_ABORTED (0). */
+    return bpf_redirect_map(&tx_devmap, zero, XDP_PASS);
 }
 
 #if defined(GUT_MODE_QUIC)

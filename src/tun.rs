@@ -179,6 +179,11 @@ pub fn create_veth_pair(
         link_set_noarp(xdp_name);
     }
 
+    // Disable reverse-path filtering on veth pair — XDP redirect delivers
+    // packets with external source IPs which would fail rp_filter checks.
+    disable_rp_filter(peer_name);
+    disable_rp_filter(xdp_name);
+
     // Bring both interfaces up
     link_set_up(xdp_name);
     link_set_up(peer_name);
@@ -189,4 +194,14 @@ pub fn create_veth_pair(
 /// Destroy a veth pair by deleting one end (kernel removes the other automatically).
 pub fn destroy_veth(xdp_name: &str) {
     link_delete(xdp_name);
+}
+
+/// Disable reverse-path filtering for an interface via /proc/sys.
+/// XDP redirect delivers packets with external source IPs to the local veth,
+/// which would be dropped by rp_filter (source IP is routed via NIC, not veth).
+fn disable_rp_filter(ifname: &str) {
+    let path = format!("/proc/sys/net/ipv4/conf/{ifname}/rp_filter");
+    if std::fs::write(&path, "0").is_err() {
+        eprintln!("  warning: could not set rp_filter=0 for {ifname}");
+    }
 }
