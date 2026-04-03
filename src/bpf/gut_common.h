@@ -324,8 +324,13 @@ struct
  * Working state is kept entirely in ks[] (the caller-provided buffer, which
  * lives in the scratch per-CPU map) so that chacha_block itself has zero
  * u32 local variables on the BPF 512-byte stack.  The initial state is
- * re-read from the chacha_init pointer for the final addition. */
-static __attribute__((noinline)) void chacha_block(__u32 ks[16],
+ * re-read from the chacha_init pointer for the final addition.
+ *
+ * __always_inline is required on kernel 6.17+ where the BPF verifier
+ * rejects noinline helpers that receive map-value pointers as arguments
+ * (ks[] points into scratch_map).  Since chacha_block has zero stack
+ * locals of its own the inlining cost is just code size, not stack. */
+static __always_inline void chacha_block(__u32 ks[16],
                                                    const __u32 chacha_init[12],
                                                    __u32 counter, __u32 nonce)
 {
