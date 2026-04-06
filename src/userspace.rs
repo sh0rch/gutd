@@ -11,7 +11,93 @@ use crate::proto::mask_balanced::{chacha_block_fast, chacha_init};
 const GUT_QUIC_SHORT_HEADER_SIZE: usize = 16;
 const GUT_HEADER_SIZE: usize = 10;
 const GUT_QUIC_LONG_HEADER_SIZE: usize = 1200;
-const SOCKET_BUF_SIZE: usize = 4 * 1024 * 1024; // 4 MiB send/recv buffer
+/// Adaptive socket buffer size based on available system RAM.
+/// Returns a value between 256 KiB (for ≤32 MB RAM) and 16 MiB (for ≥4 GB RAM).
+fn adaptive_socket_buf_size() -> usize {
+    let total_mb = total_ram_mb();
+    let size = if total_mb <= 32 {
+        256 * 1024 // 256 KiB
+    } else if total_mb <= 64 {
+        512 * 1024 // 512 KiB
+    } else if total_mb <= 128 {
+        1024 * 1024 // 1 MiB
+    } else if total_mb <= 512 {
+        2 * 1024 * 1024 // 2 MiB
+    } else if total_mb <= 2048 {
+        4 * 1024 * 1024 // 4 MiB
+    } else if total_mb <= 4096 {
+        8 * 1024 * 1024 // 8 MiB
+    } else {
+        16 * 1024 * 1024 // 16 MiB
+    };
+    eprintln!(
+        "gutd: RAM ~{} MB → socket buffer {} KiB",
+        total_mb,
+        size / 1024
+    );
+    size
+}
+
+#[cfg(target_os = "linux")]
+fn total_ram_mb() -> u64 {
+    // Fast path: read MemTotal from /proc/meminfo
+    if let Ok(data) = std::fs::read_to_string("/proc/meminfo") {
+        for line in data.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let kb: u64 = rest
+                    .trim()
+                    .trim_end_matches(" kB")
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
+                if kb > 0 {
+                    return kb / 1024;
+                }
+            }
+        }
+    }
+    256 // fallback
+}
+
+#[cfg(target_os = "windows")]
+fn total_ram_mb() -> u64 {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+    extern "system" {
+        fn GlobalMemoryStatusEx(buf: *mut MemoryStatusEx) -> i32;
+    }
+    let mut ms = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    if unsafe { GlobalMemoryStatusEx(&mut ms) } != 0 {
+        ms.total_phys / (1024 * 1024)
+    } else {
+        256
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn total_ram_mb() -> u64 {
+    256
+}
 
 /// Lock-free shared SocketAddr (IPv4 + IPv6) using AtomicU32.
 /// Works on 32-bit targets (MIPS) where AtomicU64 is unavailable.
@@ -127,13 +213,13 @@ impl SharedAddr {
 }
 
 /// Best-effort SO_SNDBUF + SO_RCVBUF increase.
-fn tune_udp_buffers(_sock: &UdpSocket) {
+fn tune_udp_buffers(_sock: &UdpSocket, _buf_size: usize) {
     #[cfg(target_family = "unix")]
     {
         use std::os::unix::io::AsRawFd;
         let fd = _sock.as_raw_fd();
         unsafe {
-            let size = SOCKET_BUF_SIZE as libc::c_int;
+            let size = _buf_size as libc::c_int;
             libc::setsockopt(
                 fd,
                 libc::SOL_SOCKET,
@@ -166,7 +252,7 @@ fn tune_udp_buffers(_sock: &UdpSocket) {
             ) -> i32;
         }
         let fd = _sock.as_raw_socket() as usize;
-        let size = SOCKET_BUF_SIZE as i32;
+        let size = _buf_size as i32;
         unsafe {
             setsockopt(
                 fd,
@@ -890,6 +976,123 @@ fn generate_quic_version_negotiation(buf: &[u8], size: usize, out: &mut [u8; 64]
     Some(pos)
 }
 
+/// Batched UDP receive via recvmmsg (Linux).
+/// Amortizes syscall overhead by receiving up to `batch` packets per call.
+/// MSG_WAITFORONE: block for the first packet, then return all immediately available.
+#[cfg(target_os = "linux")]
+struct BatchRecv {
+    mem: Vec<u8>,
+    pkt_buf: usize,
+    batch: usize,
+    addrs: Vec<libc::sockaddr_storage>,
+    iovecs: Vec<libc::iovec>,
+    msgs: Vec<libc::mmsghdr>,
+    count: usize,
+    current: usize,
+    fd: libc::c_int,
+}
+
+#[cfg(target_os = "linux")]
+impl BatchRecv {
+    fn new(sock: &UdpSocket, outer_mtu: u16) -> Self {
+        use std::os::unix::io::AsRawFd;
+        let pkt_buf = std::cmp::max(outer_mtu as usize + 548, 2048);
+        let batch = std::cmp::min(16, 65536 / pkt_buf);
+        let mem = vec![0u8; pkt_buf * batch];
+        let addrs = vec![unsafe { std::mem::zeroed() }; batch];
+        let iovecs = vec![
+            libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0
+            };
+            batch
+        ];
+        let msgs = vec![unsafe { std::mem::zeroed() }; batch];
+        eprintln!(
+            "gutd: recvmmsg pkt_buf={} batch={} total={}KB",
+            pkt_buf,
+            batch,
+            pkt_buf * batch / 1024
+        );
+        BatchRecv {
+            mem,
+            pkt_buf,
+            batch,
+            addrs,
+            iovecs,
+            msgs,
+            count: 0,
+            current: 0,
+            fd: sock.as_raw_fd(),
+        }
+    }
+
+    fn recv(&mut self) -> std::io::Result<(&mut [u8], usize, SocketAddr)> {
+        if self.current >= self.count {
+            // Set up iovecs and mmsghdr pointers for recvmmsg
+            for i in 0..self.batch {
+                self.iovecs[i].iov_base =
+                    unsafe { self.mem.as_mut_ptr().add(i * self.pkt_buf) as *mut libc::c_void };
+                self.iovecs[i].iov_len = self.pkt_buf;
+                self.msgs[i].msg_hdr.msg_iov = &mut self.iovecs[i];
+                self.msgs[i].msg_hdr.msg_iovlen = 1;
+                self.msgs[i].msg_hdr.msg_name = &mut self.addrs[i] as *mut _ as *mut libc::c_void;
+                self.msgs[i].msg_hdr.msg_namelen =
+                    std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            }
+
+            let n = unsafe {
+                libc::recvmmsg(
+                    self.fd,
+                    self.msgs.as_mut_ptr(),
+                    self.batch as libc::c_uint,
+                    libc::MSG_WAITFORONE,
+                    std::ptr::null_mut(),
+                )
+            };
+
+            if n <= 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            self.count = n as usize;
+            self.current = 0;
+        }
+
+        let i = self.current;
+        self.current += 1;
+        let size = self.msgs[i].msg_len as usize;
+        let src = mmsg_sockaddr(&self.addrs[i])
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad sockaddr"))?;
+
+        let start = i * self.pkt_buf;
+        let end = start + self.pkt_buf;
+        Ok((&mut self.mem[start..end], size, src))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn mmsg_sockaddr(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            let sa = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
+            Some(SocketAddr::new(
+                Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr)).into(),
+                u16::from_be(sa.sin_port),
+            ))
+        }
+        libc::AF_INET6 => {
+            let sa = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
+            Some(SocketAddr::new(
+                Ipv6Addr::from(sa.sin6_addr.s6_addr).into(),
+                u16::from_be(sa.sin6_port),
+            ))
+        }
+        _ => None,
+    }
+}
+
 pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     if config.peers.is_empty() {
         return Err("No peers configured in gutd.conf".into());
@@ -932,12 +1135,14 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         Some(format!("{}:{}", peer_ip_str, peer_port).parse()?)
     };
 
+    let sock_buf_size = adaptive_socket_buf_size();
+
     // ext_sockets: GUT traffic to/from remote peer (bound to all configured ports).
     let mut ext_sockets = Vec::new();
     for &port in &peer.ports {
         let ext_addr = SocketAddr::new(peer.bind_ip, port);
         let ext_socket = Arc::new(UdpSocket::bind(ext_addr)?);
-        tune_udp_buffers(&ext_socket);
+        tune_udp_buffers(&ext_socket, sock_buf_size);
         disable_df(&ext_socket);
         println!("Listening (ext) on {}", ext_addr);
         ext_sockets.push(ext_socket);
@@ -952,7 +1157,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         SocketAddr::new(peer.bind_ip, peer.bind_port)
     };
     let local_socket = Arc::new(UdpSocket::bind(local_bind)?);
-    tune_udp_buffers(&local_socket);
+    tune_udp_buffers(&local_socket, sock_buf_size);
     disable_df(&local_socket);
     println!("Local WG-facing socket on {}", local_bind);
 
@@ -978,7 +1183,6 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         .name("gutd-egress".into())
         .spawn(move || {
             let peer = &egress_peer;
-            let mut buf = [0u8; 65536];
             let mut out_buf = [0u8; 65536];
             let mut sip_buf = [0u8; crate::proto::sip::MAX_SIP_HEADER_LEN];
 
@@ -995,14 +1199,19 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                 p
             };
 
+            #[cfg(target_os = "linux")]
+            let mut batch_recv = BatchRecv::new(&egress_local, peer.outer_mtu);
+            #[cfg(not(target_os = "linux"))]
+            let mut recv_buf = [0u8; 65536];
+
             loop {
-                let (size, src) = match egress_local.recv_from(&mut buf) {
+                #[cfg(target_os = "linux")]
+                let (buf, size, src) = match batch_recv.recv() {
                     Ok(r) => r,
                     Err(ref e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             || e.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        // Idle timeout → send NAT keepalive
                         if !is_server {
                             if let Some(dest) = remote_peer_addr {
                                 let _ = egress_exts[0].send_to(&ka_pkt, dest);
@@ -1012,6 +1221,24 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     }
                     Err(_) => continue,
                 };
+                #[cfg(not(target_os = "linux"))]
+                let (size, src) = match egress_local.recv_from(&mut recv_buf) {
+                    Ok(r) => r,
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        if !is_server {
+                            if let Some(dest) = remote_peer_addr {
+                                let _ = egress_exts[0].send_to(&ka_pkt, dest);
+                            }
+                        }
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
+                #[cfg(not(target_os = "linux"))]
+                let buf: &mut [u8] = &mut recv_buf[..];
 
                 // Client: always track WG peer address (handles port changes, NAT rebind)
                 if !is_server {
@@ -1059,7 +1286,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
 
                     let sip_domain = peer.sip_domain.as_str();
                     if let Some((new_size, dcid)) = obfs_encap(
-                        &mut buf,
+                        buf,
                         size,
                         &key_init,
                         rounds,
@@ -1174,15 +1401,27 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         let ingress_handle = std::thread::Builder::new()
             .name(format!("gutd-ingress-{}", port_idx))
             .spawn(move || {
-                let mut buf = [0u8; 65536];
                 let mut out_buf = [0u8; 65536];
                 let mut sip_resp = [0u8; crate::proto::sip::MAX_SIP_HEADER_LEN];
 
+                #[cfg(target_os = "linux")]
+                let mut batch_recv = BatchRecv::new(&ingress_ext, ingress_peer.outer_mtu);
+                #[cfg(not(target_os = "linux"))]
+                let mut recv_buf = [0u8; 65536];
+
                 loop {
-                    let (mut size, src) = match ingress_ext.recv_from(&mut buf) {
+                    #[cfg(target_os = "linux")]
+                    let (buf, mut size, src) = match batch_recv.recv() {
                         Ok(r) => r,
                         Err(_) => continue,
                     };
+                    #[cfg(not(target_os = "linux"))]
+                    let (mut size, src) = match ingress_ext.recv_from(&mut recv_buf) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    #[cfg(not(target_os = "linux"))]
+                    let buf: &mut [u8] = &mut recv_buf[..];
 
                     // Decode Prepend+Base64 before any QUIC detection
                     let mut detected_prepend = None;
@@ -1267,7 +1506,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         // Try plain QUIC first
                         if ((buf[0] & 0x40) == 0x40 || (buf[0] & 0x80) == 0x80)
                             && obfs_verify(
-                                &buf,
+                                buf,
                                 size,
                                 &key_init,
                                 rounds,
@@ -1279,7 +1518,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                             // Restore and try GUT/Sip/Syslog (they all use gut_mask)
                             buf[..6].copy_from_slice(&original_start);
                             if obfs_verify(
-                                &buf,
+                                buf,
                                 size,
                                 &key_init,
                                 rounds,
@@ -1296,7 +1535,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     } else if obfs != crate::config::ObfsMode::Quic {
                         let ok = size >= GUT_QUIC_SHORT_HEADER_SIZE + 16
                             && obfs_verify(
-                                &buf,
+                                buf,
                                 size,
                                 &key_init,
                                 rounds,
@@ -1307,7 +1546,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         let fb = buf[0];
                         let ok = ((fb & 0x80) == 0x80 || (fb & 0x40) == 0x40)
                             && obfs_verify(
-                                &buf,
+                                buf,
                                 size,
                                 &key_init,
                                 rounds,
@@ -1345,7 +1584,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                             } else if obfs == crate::config::ObfsMode::Quic {
                                 let mut vn_buf = [0u8; 64];
                                 if let Some(vn_len) =
-                                    generate_quic_version_negotiation(&buf, size, &mut vn_buf)
+                                    generate_quic_version_negotiation(buf, size, &mut vn_buf)
                                 {
                                     let _ = ingress_ext.send_to(&vn_buf[..vn_len], src);
                                 }
@@ -1363,7 +1602,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     }
 
                     if let Some((new_size, _wg_sport, _wg_dport)) =
-                        obfs_decap(&mut buf, size, &key_init, rounds, detected_obfs)
+                        obfs_decap(buf, size, &key_init, rounds, detected_obfs)
                     {
                         if dynamic_peer && new_size >= 8 {
                             let wg_type = buf[0] & 0x1F;
