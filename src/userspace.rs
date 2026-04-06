@@ -1046,7 +1046,7 @@ impl BatchRecv {
                     self.fd,
                     self.msgs.as_mut_ptr(),
                     self.batch as libc::c_uint,
-                    libc::MSG_WAITFORONE,
+                    libc::MSG_WAITFORONE as _,
                     std::ptr::null_mut(),
                 )
             };
