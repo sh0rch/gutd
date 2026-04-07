@@ -308,7 +308,7 @@ sysctl -w net.ipv4.ip_forward=1
 
 # DNAT: redirect incoming WireGuard connections into the gut tunnel
 iptables -t nat -A PREROUTING -p udp --dport 51820 \
-    -j DNAT --to-destination 10.254.0.2:51820
+    -j DNAT --to-destination 10.254.0.1:51820
 
 # Masquerade so the server can route replies back through the tunnel
 iptables -t nat -A POSTROUTING -o gut0 -j MASQUERADE
@@ -324,7 +324,7 @@ nftables equivalent:
 table inet gut_relay {
     chain prerouting {
         type nat hook prerouting priority -100; policy accept;
-        udp dport 51820 counter dnat to 10.254.0.2:51820
+        udp dport 51820 counter dnat to 10.254.0.1:51820
     }
     chain postrouting {
         type nat hook postrouting priority 100; policy accept;
