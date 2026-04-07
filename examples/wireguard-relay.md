@@ -12,7 +12,7 @@ Example setup for proxying WireGuard traffic through a GUT tunnel for obfuscatio
 
 ```
 WG client ---> Relay (198.51.100.1) ---(GUT UDP 6000-6003)---> Server (203.0.113.1)
-   :51820         gut0 10.254.0.1/30          obfuscated            gut0 10.254.0.2/30
+   :51820         gut0 10.254.0.2/30          obfuscated            gut0 10.254.0.1/30
                   DNAT :51820 -> gut0                               forward to WG :51820
 ```
 
@@ -38,7 +38,7 @@ stats_interval = 0
 name = gut0
 nic = eth0                  # NIC facing the internet
 mtu = 1420
-address = 10.254.0.1/30
+address = 10.254.0.2/30
 bind_ip = 0.0.0.0
 peer_ip = 203.0.113.1       # server public IP
 ports = 6000,6001,6002,6003
@@ -54,7 +54,7 @@ sysctl -w net.ipv4.ip_forward=1
 
 # WireGuard clients -> gut0 (to server via GUT tunnel)
 iptables -t nat -A PREROUTING -p udp --dport 51820 \
-    -j DNAT --to-destination 10.254.0.2
+    -j DNAT --to-destination 10.254.0.1
 
 # Masquerade outbound GUT traffic
 iptables -t nat -A POSTROUTING -o gut0 -j MASQUERADE
@@ -70,7 +70,7 @@ iptables -A FORWARD -i gut0 -o eth0 -j ACCEPT
 table inet gut_relay {
     chain prerouting {
         type nat hook prerouting priority -100; policy accept;
-        udp dport 51820 counter dnat to 10.254.0.2
+        udp dport 51820 counter dnat to 10.254.0.1
     }
     chain postrouting {
         type nat hook postrouting priority 100; policy accept;
@@ -97,7 +97,7 @@ stats_interval = 0
 name = gut0
 nic = eth0                  # NIC facing the internet
 mtu = 1420
-address = 10.254.0.2/30
+address = 10.254.0.1/30
 bind_ip = 0.0.0.0
 peer_ip = 198.51.100.1      # relay public IP
 ports = 6000,6001,6002,6003
@@ -171,10 +171,10 @@ gutd -c /etc/gutd/gutd.conf
 
 # Check veth pair is up
 ip addr show gut0
-# expected: inet 10.254.0.1/30
+# expected: inet 10.254.0.2/30
 
 # Ping across GUT tunnel
-ping -c 3 10.254.0.2
+ping -c 3 10.254.0.1
 ```
 
 ### On server
@@ -183,9 +183,9 @@ ping -c 3 10.254.0.2
 gutd -c /etc/gutd/gutd.conf
 
 ip addr show gut0
-# expected: inet 10.254.0.2/30
+# expected: inet 10.254.0.1/30
 
-ping -c 3 10.254.0.1
+ping -c 3 10.254.0.2
 ```
 
 ### WireGuard client config
