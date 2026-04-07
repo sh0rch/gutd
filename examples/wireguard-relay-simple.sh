@@ -46,7 +46,7 @@ stats_interval = 0
 [peer]
 name = gut0
 mtu = 1420
-address = 10.254.0.1/30
+address = 10.254.0.2/30
 bind_ip = 0.0.0.0
 peer_ip = SERVER_PUBLIC_IP_HERE
 ports = 6000,6001,6002,6003
@@ -59,8 +59,8 @@ EOF
     echo "3. Configure iptables..."
 
     # WireGuard -> GUT tunnel
-    iptables -t nat -C PREROUTING -p udp --dport 5050 -j DNAT --to-destination 10.254.0.2 2>/dev/null || \
-        iptables -t nat -A PREROUTING -p udp --dport 5050 -j DNAT --to-destination 10.254.0.2
+    iptables -t nat -C PREROUTING -p udp --dport 5050 -j DNAT --to-destination 10.254.0.1 2>/dev/null || \
+        iptables -t nat -A PREROUTING -p udp --dport 5050 -j DNAT --to-destination 10.254.0.1
     
     # Masquerade
     iptables -t nat -C POSTROUTING -o gut0 -j MASQUERADE 2>/dev/null || \
@@ -86,7 +86,7 @@ EOF
     echo "1. Set peer_ip and key in /etc/gutd/gutd.conf  (gutd genkey)"
     echo "2. Start: gutd -c /etc/gutd/gutd.conf"
     echo "3. Check: ip addr show gut0"
-    echo "4. Check: ping -c 3 10.254.0.2"
+    echo "4. Check: ping -c 3 10.254.0.1"
     echo ""
     echo "WireGuard clients should connect to: $(hostname -I | awk '{print $1}'):51820"
 
@@ -105,7 +105,7 @@ stats_interval = 0
 [peer]
 name = gut0
 mtu = 1420
-address = 10.254.0.2/30
+address = 10.254.0.1/30
 bind_ip = 0.0.0.0
 peer_ip = RELAY_PUBLIC_IP_HERE
 ports = 6000,6001,6002,6003
@@ -142,7 +142,7 @@ EOF
     echo "2. Ensure WireGuard listens on 0.0.0.0:51820 or 127.0.0.1:51820"
     echo "3. Start: gutd -c /etc/gutd/gutd.conf"
     echo "4. Check: ip addr show gut0"
-    echo "5. Check: ping -c 3 10.254.0.1"
+    echo "5. Check: ping -c 3 10.254.0.2"
 fi
 
 echo ""
