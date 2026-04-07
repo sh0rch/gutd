@@ -59,8 +59,8 @@ EOF
     echo "3. Configure iptables..."
 
     # WireGuard -> GUT tunnel
-    iptables -t nat -C PREROUTING -p udp --dport 5050 -j DNAT --to-destination 10.254.0.1 2>/dev/null || \
-        iptables -t nat -A PREROUTING -p udp --dport 5050 -j DNAT --to-destination 10.254.0.1
+    iptables -t nat -C PREROUTING -p udp --dport 5050 -j DNAT --to-destination 10.254.0.1:51820 2>/dev/null || \
+        iptables -t nat -A PREROUTING -p udp --dport 5050 -j DNAT --to-destination 10.254.0.1:51820
     
     # Masquerade
     iptables -t nat -C POSTROUTING -o gut0 -j MASQUERADE 2>/dev/null || \
