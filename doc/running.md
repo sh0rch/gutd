@@ -301,7 +301,7 @@ See [examples/wireguard-relay.md](../examples/wireguard-relay.md) for the full
 topology. The relevant rules for each machine follow.
 
 **Relay** (e.g. `198.51.100.1`) — forwards client WireGuard traffic into the
-gut tunnel toward the server's gut0 peer address (`10.254.0.2`):
+gut tunnel toward the server's gut0 peer address (`10.254.0.1`):
 
 ```bash
 sysctl -w net.ipv4.ip_forward=1
