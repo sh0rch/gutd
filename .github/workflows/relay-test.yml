@@ -1,0 +1,156 @@
+name: Relay eBPF + nDPI Test (Docker)
+
+on:
+  workflow_dispatch:
+    inputs:
+      obfs:
+        description: 'Obfuscation mode'
+        required: true
+        type: choice
+        options:
+          - quic
+          - gut
+          - sip
+          - syslog
+          - all
+        default: 'quic'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build gutd (x86_64)
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache Rust toolchain
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: relay-build-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+    - name: Build gutd Docker image
+      run: |
+        docker build -t gutd-build -f docker/Dockerfile.x86_64 .
+        mkdir -p dist
+        CID=$(docker create gutd-build)
+        docker cp "$CID:/gutd" dist/gutd-amd64
+        docker rm "$CID"
+        chmod +x dist/gutd-amd64
+        dist/gutd-amd64 --version
+
+    - name: Build runtime image
+      run: |
+        docker build \
+          --build-arg TARGETARCH=amd64 \
+          --platform linux/amd64 \
+          -t gutd:relay-test \
+          -f docker/Dockerfile.run .
+        docker save gutd:relay-test | gzip > /tmp/gutd-relay-test.tar.gz
+
+    - name: Upload image artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: gutd-relay-image
+        path: /tmp/gutd-relay-test.tar.gz
+        retention-days: 1
+
+  ndpi-build:
+    name: Build nDPI
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Cache nDPI build
+      id: cache-ndpi
+      uses: actions/cache@v4
+      with:
+        path: /tmp/nDPI
+        key: ndpi-${{ runner.os }}-relay-v1
+
+    - name: Build nDPI from source
+      if: steps.cache-ndpi.outputs.cache-hit != 'true'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libnuma-dev librrd-dev libpcap-dev libtool-bin autoconf automake make gcc pkg-config git
+        git clone --depth 1 https://github.com/ntop/nDPI.git /tmp/nDPI
+        cd /tmp/nDPI
+        ./autogen.sh
+        ./configure
+        make -j$(nproc)
+
+    - name: Verify ndpiReader
+      run: /tmp/nDPI/example/ndpiReader 2>&1 | grep -m1 "Welcome to nDPI"
+
+    - name: Upload ndpiReader
+      uses: actions/upload-artifact@v4
+      with:
+        name: ndpiReader-relay
+        path: /tmp/nDPI/example/ndpiReader
+        retention-days: 1
+
+  relay-test:
+    name: "relay-${{ matrix.mode }}"
+    needs: [build, ndpi-build]
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: ${{ fromJSON(
+          inputs.obfs == 'all'
+            && '["quic","gut","sip","syslog"]'
+            || format('["{0}"]', inputs.obfs)
+          ) }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y wireguard-tools xxd iperf3 iptables libpcap-dev
+        sudo modprobe wireguard || true
+        sudo mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
+
+    - name: Download image
+      uses: actions/download-artifact@v4
+      with:
+        name: gutd-relay-image
+        path: /tmp
+
+    - name: Download ndpiReader
+      uses: actions/download-artifact@v4
+      with:
+        name: ndpiReader-relay
+        path: /tmp/ndpi-bin
+
+    - name: Prepare tools
+      run: |
+        docker load < /tmp/gutd-relay-test.tar.gz
+        chmod +x /tmp/ndpi-bin/ndpiReader
+
+    - name: Run relay test (${{ matrix.mode }})
+      run: sudo bash tests/docker-relay-test.sh --obfs ${{ matrix.mode }} --ci
+
+    - name: Upload gutd logs
+      if: always()
+      run: |
+        mkdir -p /tmp/relay-logs
+        docker logs gutd_relay    > /tmp/relay-logs/gutd_relay.log    2>&1 || true
+        docker logs gutd_server   > /tmp/relay-logs/gutd_server.log   2>&1 || true
+        docker logs ndpi_router   > /tmp/relay-logs/ndpi_router.log   2>&1 || true
+        docker logs wg_client     > /tmp/relay-logs/wg_client.log     2>&1 || true
+        docker logs wg_server     > /tmp/relay-logs/wg_server.log     2>&1 || true
+        cp /tmp/ndpi_relay.pcap      /tmp/relay-logs/ 2>/dev/null || true
+        cp /tmp/ndpi-relay-report.txt /tmp/relay-logs/ 2>/dev/null || true
+
+    - name: Upload logs artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: relay-logs-${{ matrix.mode }}
+        path: /tmp/relay-logs/
+        retention-days: 3
