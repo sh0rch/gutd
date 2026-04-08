@@ -193,6 +193,13 @@ setup_namespaces() {
     # Enable forwarding
     ip netns exec server_ns sysctl -w net.ipv4.ip_forward=1 > /dev/null
     sysctl -w net.ipv4.ip_forward=1 > /dev/null
+
+    # Block direct WG traffic bypass through server_ns:
+    # Without this, relay_ns could reach host WG port directly via server_ns forwarding,
+    # making the gutd tunnel unnecessary.  Drop forwarded WG (port 51821) on the transit
+    # path so only gut-encapsulated traffic reaches the WG server.
+    ip netns exec server_ns iptables -A FORWARD \
+        -i veth_server -o veth_srv -p udp --dport 51821 -j DROP
     
     log "Network namespaces configured"
 }
@@ -346,7 +353,7 @@ $userspace_line
 name = gut0
 nic = veth_srv
 mtu = $WG_MTU
-address = 10.254.0.1/30
+address = 10.254.0.2/30
 bind_ip = 10.100.2.2
 peer_ip = 10.100.2.1
 ports = $GUT_PORTS_CSV
@@ -369,7 +376,7 @@ $userspace_line
 name = gut1
 nic = veth_host
 mtu = $WG_MTU
-address = 10.254.0.2/30
+address = 10.254.0.1/30
 bind_ip = 10.100.2.1
 peer_ip = 10.100.2.2
 ports = $GUT_PORTS_CSV
@@ -459,7 +466,7 @@ EOF
     head -10 /tmp/gutd-test-relay.log >&2
     
     # relay_ns needs only the WG endpoint via relay namespace gateway
-    ip netns exec relay_ns ip route add 10.254.0.2/32 via 10.100.1.2
+    ip netns exec relay_ns ip route add 10.254.0.1/32 via 10.100.1.2
     
     log "gutd interfaces and routes configured"
     
@@ -477,18 +484,18 @@ EOF
     local l3_ping_check="${GUTD_L3_PING_CHECK:-0}"
     if [ "$l3_ping_check" = "1" ]; then
         log "Testing gutd L3 ICMP connectivity (GUTD_L3_PING_CHECK=1)..."
-        if ip netns exec server_ns ping -c 3 -W 2 10.254.0.2 > /dev/null 2>&1; then
+        if ip netns exec server_ns ping -c 3 -W 2 10.254.0.1 > /dev/null 2>&1; then
             log "[ok] gutd tunnel: server_ns -> host WORKING"
         else
             warn "ICMP check failed: server_ns -> host (continuing; WG checks will validate datapath)"
-            ip netns exec server_ns ping -c 3 10.254.0.2 >&2 || true
+            ip netns exec server_ns ping -c 3 10.254.0.1 >&2 || true
         fi
 
-        if ping -c 3 -W 2 10.254.0.1 > /dev/null 2>&1; then
+        if ping -c 3 -W 2 10.254.0.2 > /dev/null 2>&1; then
             log "[ok] gutd tunnel: host -> server_ns WORKING"
         else
             warn "ICMP check failed: host -> server_ns (continuing; WG checks will validate datapath)"
-            ping -c 3 10.254.0.1 >&2 || true
+            ping -c 3 10.254.0.2 >&2 || true
         fi
     else
         log "Skipping L3 ICMP checks for payload-only mode (set GUTD_L3_PING_CHECK=1 to enable)"
@@ -589,7 +596,7 @@ ListenPort = 51820
 
 [Peer]
 PublicKey = $SERVER_PUBLIC_KEY
-Endpoint = 10.254.0.2:51821
+Endpoint = 10.254.0.1:51821
 AllowedIPs = 10.200.0.0/24
 PersistentKeepalive = 25
 EOF
@@ -628,7 +635,7 @@ EOF
     # POSTROUTING: SNAT to make it look like it's coming from gutd
     ip netns exec server_ns iptables -t nat -A POSTROUTING \
         -o gut0 -p udp --dport 51821 \
-        -j SNAT --to-source 10.254.0.1
+        -j SNAT --to-source 10.254.0.2
     
     # Enable forwarding in server_ns
     ip netns exec server_ns sysctl -w net.ipv4.ip_forward=1 > /dev/null

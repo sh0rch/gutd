@@ -7,15 +7,15 @@ set -e
 #   relay_ns (WG client, wg0)
 #       veth_relay 10.100.1.1/24
 #           |
-#   server_ns (gutd relay, gut0 10.254.0.1/30)
+#   server_ns (gutd relay, gut0 10.254.0.2/30)
 #       veth_server 10.100.1.2/24        ← "eth0" (client-facing)
 #       veth_srv    10.100.2.2/24        ← "eth1" (server-facing)
 #           |
-#   host (gutd server, gut1 10.254.0.2/30, WG server wg_srv)
+#   host (gutd server, gut1 10.254.0.1/30, WG server wg_srv)
 #       veth_host   10.100.2.1/24
 #
 # NAT on server_ns (matches production):
-#   PREROUTING:  -i veth_server -p udp --dport 5050 -j DNAT --to-destination 10.254.0.2
+#   PREROUTING:  -i veth_server -p udp --dport 5050 -j DNAT --to-destination 10.254.0.1
 #   POSTROUTING: -o veth_server -j MASQUERADE  (reply to client)
 #   POSTROUTING: -o veth_srv    -j MASQUERADE  (traffic to GUT server)
 #   POSTROUTING: -o gut0        -j MASQUERADE  (traffic into GUT tunnel)
@@ -108,6 +108,10 @@ ip route replace 10.100.1.0/24 via 10.100.2.2
 ip netns exec server_ns sysctl -w net.ipv4.ip_forward=1 > /dev/null
 sysctl -w net.ipv4.ip_forward=1 > /dev/null
 
+# Block direct WG traffic bypass: only gut-encapsulated traffic should reach the WG server.
+ip netns exec server_ns iptables -A FORWARD \
+    -i veth_server -o veth_srv -p udp --dport "$WG_PORT" -j DROP
+
 log "Namespaces ready"
 
 # ── gutd ──────────────────────────────────────────────────────────
@@ -122,7 +126,7 @@ stats_interval = 0
 name = gut0
 nic = veth_srv
 mtu = 1420
-address = 10.254.0.1/30
+address = 10.254.0.2/30
 bind_ip = 10.100.2.2
 peer_ip = 10.100.2.1
 ports = $GUT_PORTS_CSV
@@ -139,7 +143,7 @@ stats_interval = 0
 name = gut1
 nic = veth_host
 mtu = 1420
-address = 10.254.0.2/30
+address = 10.254.0.1/30
 bind_ip = 10.100.2.1
 peer_ip = 10.100.2.2
 ports = $GUT_PORTS_CSV
@@ -164,10 +168,10 @@ echo "=== relay log ===" >&2;  head -20 /tmp/gutd-dnat-relay.log >&2
 # ── iptables — production-like DNAT + MASQUERADE ──────────────────
 log "Setting up iptables (DNAT + MASQUERADE)..."
 
-# DNAT: relay_ns sends WG to server_ns:5050 → forward to gut0 peer (10.254.0.2)
+# DNAT: relay_ns sends WG to server_ns:5050 → forward to gut1 (10.254.0.1)
 ip netns exec server_ns iptables -t nat -A PREROUTING \
     -i veth_server -p udp --dport "$WG_PORT" \
-    -j DNAT --to-destination 10.254.0.2
+    -j DNAT --to-destination 10.254.0.1
 
 # MASQUERADE on all egress interfaces (exactly like production)
 ip netns exec server_ns iptables -t nat -A POSTROUTING -o veth_server -j MASQUERADE
@@ -206,7 +210,7 @@ EOF
 ip netns exec relay_ns wg setconf wg0 /tmp/wg-client-dnat.conf
 ip netns exec relay_ns ip link set wg0 up
 
-# WG server: listens on WG_PORT on gut1 (10.254.0.2)
+# WG server: listens on WG_PORT on gut1 (10.254.0.1)
 ip link add wg_srv type wireguard
 ip addr add 10.200.0.2/24 dev wg_srv
 ip link set wg_srv mtu "$WG_MTU"

@@ -44,27 +44,35 @@ maps without detaching hooks or recreating the veth pair.
 
 ## P2P Mode (Two Machines)
 
-**Machine A** (responder / server):
+**Machine A** (responder / server — odd address `.1`):
+
 ```ini
 [peer]
 responder = true
+address = 10.47.0.1/30
 peer_ip = 10.0.0.2
 ports = 41000,41001,41002,41003
 key = <shared key>
 ```
 
-**Machine B** (initiator / client):
+**Machine B** (initiator / client — even address `.2`):
+
 ```ini
 [peer]
+address = 10.47.0.2/30
 peer_ip = 10.0.0.1
 ports = 41000,41001,41002,41003
 key = <shared key>
 ```
 
+Convention: server (responder) gets an **odd** tunnel address, client gets **even**.
+If `address` is omitted, it is auto-assigned following this rule.
+
 Only `peer_ip`, `ports`, and `key` are required. `bind_ip` defaults to `0.0.0.0`
 (auto-detect source IP from routing table).
 
 Start on both machines:
+
 ```bash
 # Linux
 sudo ./gutd gutd.conf
@@ -180,6 +188,7 @@ Pass all settings as env vars directly in the container definition. When `GUTD_P
 **4. Create and Start the Container**
 
 #### With config file (Option A)
+
 ```routeros
 /system/device-mode/update container=yes
 
@@ -195,6 +204,7 @@ Pass all settings as env vars directly in the container definition. When `GUTD_P
 ```
 
 #### With environment variables (Option B)
+
 ```routeros
 /system/device-mode/update container=yes
 
@@ -242,6 +252,7 @@ obfuscate them. Set the WG peer endpoint to the container's veth IP and WG port:
 > In eBPF mode, port striping is handled at the BPF level across all listed ports.
 
 **Traffic flow (userspace):**
+
 ```
 Outbound: WG(router) → 172.16.1.2:51820 (gutd local) → obfuscate → remote:41000 (gutd ext)
 Inbound:  remote → router:41000 → DNAT → 172.16.1.2 (gutd ext) → deobfuscate → 172.16.1.1:51820 (WG)
@@ -254,6 +265,7 @@ can learn the peer endpoint automatically from the first cryptographically
 validated inbound packet.
 
 **Server** config (`/etc/gutd/gutd.conf`):
+
 ```ini
 [peer]
 peer_ip = dynamic             # learn endpoint from first valid packet
@@ -264,6 +276,7 @@ key     = <shared key>
 `peer_ip = dynamic` automatically sets `responder = true`. No other fields required.
 
 **Client** config (normal static peer_ip pointing to the server):
+
 ```ini
 [peer]
 peer_ip = 203.0.113.1        # server's public IP
@@ -272,6 +285,7 @@ key     = <shared key>
 ```
 
 Using environment variables on the server:
+
 ```bash
 export GUTD_PEER_IP=dynamic
 export GUTD_PORTS=41000
@@ -280,6 +294,7 @@ sudo ./gutd
 ```
 
 Notes:
+
 - In eBPF mode, `nic` is auto-detected from the default route when `peer_ip = dynamic`.
 - In userspace mode, packets that fail DCID/PPN verification are silently dropped
   (anti-probing).
