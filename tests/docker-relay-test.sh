@@ -531,10 +531,10 @@ fi
 step "Waiting for WireGuard handshake"
 # Start a short tcpdump on relay gut0 to capture the first seconds of WG traffic
 docker exec -d gutd_relay sh -c \
-    'tcpdump -i gut0 -n -c 20 -w /tmp/gut0_relay.pcap 2>/tmp/gut0_tcpdump.log; echo done > /tmp/gut0_done' 2>/dev/null || true
+    'tcpdump -i gut0 -n -c 20 -w /tmp/gut0_relay.pcap 2>/tmp/gut0_tcpdump.log' 2>/dev/null || true
 # Also capture on relay eth0 for comparison
 docker exec -d gutd_relay sh -c \
-    'tcpdump -i eth0 -n -c 40 -w /tmp/eth0_relay.pcap 2>/tmp/eth0_tcpdump.log; echo done > /tmp/eth0_done' 2>/dev/null || true
+    'tcpdump -i eth0 -n -c 40 -w /tmp/eth0_relay.pcap 2>/tmp/eth0_tcpdump.log' 2>/dev/null || true
 
 WG_READY=0
 for i in $(seq 1 30); do

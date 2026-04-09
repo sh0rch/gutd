@@ -12,7 +12,8 @@ RUN apk add --no-cache \
     iproute2 \
     iptables \
     iputils \
-    busybox-extras
+    busybox-extras \
+    tcpdump
 
 ARG TARGETARCH=amd64
 COPY dist/gutd-${TARGETARCH} /gutd
