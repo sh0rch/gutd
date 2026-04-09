@@ -299,6 +299,7 @@ log "Server config : nic=eth0, bind=${SERVER_IP}, peer=${RELAY_IP}"
 step "Starting ndpi_router (${NDPI_CLIENT_IP} ↔ ${NDPI_SERVER_IP})"
 docker run -d --name ndpi_router \
     --network "$NET_CLIENT" --ip "$NDPI_CLIENT_IP" \
+    --sysctl net.ipv4.ip_forward=1 \
     --cap-add NET_ADMIN --cap-add NET_RAW \
     --entrypoint sh alpine \
     -c "
@@ -308,8 +309,6 @@ docker run -d --name ndpi_router \
             ip link show eth1 >/dev/null 2>&1 && break
             sleep 0.2
         done
-        # Enable routing
-        echo 1 > /proc/sys/net/ipv4/ip_forward
         # Start pcap capture on the server-facing interface (sees GUT traffic)
         tcpdump -i eth1 -w /tmp/ndpi_relay.pcap -s 0 -n 2>/dev/null &
         echo 'ndpi_router: forwarding + capturing'
@@ -351,11 +350,11 @@ docker run -d --name gutd_relay \
         # DNAT: incoming WG on eth0:51820 → gut0 peer (server tunnel IP)
         iptables -t nat -A PREROUTING -i eth0 -p udp --dport ${WG_PORT} \
             -j DNAT --to-destination ${GUT_SERVER_TUN_IP}:${WG_PORT}
-        # MASQUERADE on gut0 (return traffic to client)
-        iptables -t nat -A POSTROUTING -o gut0 -j MASQUERADE
-        # FORWARD rules
-        iptables -A FORWARD -i eth0 -o gut0 -p udp --dport ${WG_PORT} -j ACCEPT
-        iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        # MASQUERADE outbound on eth0 (GUT-encapped traffic to server)
+        iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+        # FORWARD rules — bidirectional
+        iptables -A FORWARD -i eth0 -o gut0 -j ACCEPT
+        iptables -A FORWARD -i gut0 -o eth0 -j ACCEPT
         # Start gutd
         exec /gutd --config /etc/gutd.conf
     "
