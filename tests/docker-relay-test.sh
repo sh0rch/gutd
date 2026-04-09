@@ -546,10 +546,16 @@ if [[ $WG_READY -eq 0 ]]; then
     docker exec wg_client wg show 2>&1 | sed 's/^/  /'
     log "=== wg_server wg show ==="
     docker exec wg_server wg show 2>&1 | sed 's/^/  /'
-    log "=== relay iptables ==="
+    log "=== relay nat iptables (with counters) ==="
     docker exec gutd_relay iptables -t nat -L -n -v 2>&1 | sed 's/^/  /'
+    log "=== relay filter iptables FORWARD (with counters) ==="
+    docker exec gutd_relay iptables -t filter -L FORWARD -n -v 2>&1 | sed 's/^/  /'
+    log "=== relay conntrack table ==="
+    docker exec gutd_relay sh -c 'cat /proc/net/nf_conntrack 2>/dev/null | grep -E "udp|UDP" | head -30 || echo "(conntrack not available)"' 2>&1 | sed 's/^/  /'
     log "=== relay routes ==="
     docker exec gutd_relay ip route 2>&1 | sed 's/^/  /'
+    log "=== relay interface stats ==="
+    docker exec gutd_relay ip -s link show 2>&1 | sed 's/^/  /'
     log "=== gutd_relay logs ==="
     docker logs gutd_relay 2>&1 | tail -30 | sed 's/^/  /'
     log "=== gutd_server logs ==="
