@@ -349,18 +349,15 @@ docker run -d --name gutd_relay \
     "$IMAGE" -c "
         # Route to server network via ndpi_router
         ip route add ${NET_SERVER_SUBNET} via ${NDPI_CLIENT_IP}
-        # FORWARD direction: client WG → gut0 peer (server tunnel IP)
-        iptables -t nat -A PREROUTING -i eth0 -p udp --dport ${WG_PORT} \\
+        # DNAT: client WG UDP on eth0:51820 → gut0 peer IP (server tunnel endpoint)
+        iptables -t nat -A PREROUTING -i eth0 -p udp --dport ${WG_PORT} \
             -j DNAT --to-destination ${GUT_SERVER_TUN_IP}:${WG_PORT}
-        # REVERSE direction: GUT decap delivers to gut0 with dst=gut0 IP;
-        # re-DNAT to the original WG client so the kernel forwards it back.
-        iptables -t nat -A PREROUTING -i gut0 -p udp \\
-            -d ${GUT_RELAY_TUN_IP} \\
-            -j DNAT --to-destination ${CLIENT_IP}
-        # SNAT return packets to look like they came from relay:51820
-        # (client's configured WireGuard endpoint)
-        iptables -t nat -A POSTROUTING -o eth0 -d ${CLIENT_IP} -p udp \\
-            -j SNAT --to-source ${RELAY_IP}:${WG_PORT}
+        # MASQUERADE on gut0: relay's src becomes gut0 IP (10.254.0.2) so the
+        # server's GUT reply comes back addressed to 10.254.0.2, which XDP
+        # delivers to gut0; conntrack then de-NATs and routes back to client.
+        iptables -t nat -A POSTROUTING -o gut0 -j MASQUERADE
+        # MASQUERADE on eth0: GUT-encapped egress to server looks like RELAY_IP
+        iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
         # FORWARD rules — bidirectional
         iptables -A FORWARD -i eth0 -o gut0 -j ACCEPT
         iptables -A FORWARD -i gut0 -o eth0 -j ACCEPT
