@@ -82,7 +82,7 @@ done
 # ── Per-mode settings ────────────────────────────────────────────
 case "$OBFS_MODE" in
     quic)
-        GUT_PORTS="41000,41001"
+        GUT_PORTS="443"
         WG_MTU=1420
         GUTD_SNI="example.com"
         NDPI_EXPECT="QUIC"
@@ -94,7 +94,7 @@ case "$OBFS_MODE" in
         NDPI_EXPECT=""
         ;;
     sip)
-        GUT_PORTS="5060,10000,10001"
+        GUT_PORTS="5060,10000,10001,10002,10003,10004,10005"
         WG_MTU=1400
         GUTD_SNI="sip.example.com"
         NDPI_EXPECT="SIP"
@@ -195,12 +195,12 @@ build_image() {
         log "Binary extracted to dist/gutd-amd64"
     fi
 
-    log "Stage 2: building runtime image ..."
+    log "Stage 2: building test runtime image ..."
     docker build \
         --build-arg TARGETARCH=amd64 \
         --platform linux/amd64 \
         -t "$IMAGE" \
-        -f "$ROOT/docker/Dockerfile.run" \
+        -f "$ROOT/docker/Dockerfile.relay-test" \
         "$ROOT"
     log "Image $IMAGE ready"
 }
@@ -208,7 +208,14 @@ build_image() {
 if [[ $REBUILD -eq 1 ]] || ! docker image inspect "$IMAGE" &>/dev/null; then
     build_image
 else
-    log "Using existing image $IMAGE  (pass --rebuild to force)"
+    # Verify the cached image has a shell (scratch-based images don't).
+    # If it lacks sh, it was built from the old Dockerfile.run and must be rebuilt.
+    if ! docker run --rm --entrypoint sh "$IMAGE" -c true &>/dev/null 2>&1; then
+        warn "Cached image $IMAGE has no shell (old scratch-based build) — rebuilding"
+        build_image
+    else
+        log "Using existing image $IMAGE  (pass --rebuild to force)"
+    fi
 fi
 
 # ── Generate keys ─────────────────────────────────────────────────
@@ -304,7 +311,7 @@ docker run -d --name ndpi_router \
         # Enable routing
         echo 1 > /proc/sys/net/ipv4/ip_forward
         # Start pcap capture on the server-facing interface (sees GUT traffic)
-        tcpdump -i eth1 -w /tmp/ndpi_relay.pcap -s 0 -n udp 2>/dev/null &
+        tcpdump -i eth1 -w /tmp/ndpi_relay.pcap -s 0 -n 2>/dev/null &
         echo 'ndpi_router: forwarding + capturing'
         tail -f /dev/null
     "
@@ -564,29 +571,57 @@ else
 fi
 
 # ── iperf3 TCP ────────────────────────────────────────────────────
-IPERF_TCP="N/A"
+IPERF_TCP_UP="N/A"
+IPERF_TCP_DN="N/A"
+IPERF_TCP_UP_RETR="N/A"
+IPERF_TCP_DN_RETR="N/A"
 if [[ $PING_OK -eq 1 ]]; then
-    step "iperf3 TCP (5s, through GUT relay, obfs=${OBFS_MODE})"
+    # Upload: client → server (512 MB)
+    step "iperf3 TCP upload 512M (client→server, obfs=${OBFS_MODE})"
     docker exec -d wg_server iperf3 -s -1 -p 5201 2>/dev/null || true
     sleep 0.5
-    IPERF_OUT=$(docker exec wg_client iperf3 -c "$WG_SERVER_IP" -p 5201 -P 4 -t 5 2>&1) || true
+    IPERF_OUT=$(docker exec wg_client iperf3 -c "$WG_SERVER_IP" -p 5201 -P 4 -n 512M 2>&1) || true
     echo "$IPERF_OUT" | tail -5 | sed 's/^/  /'
-    IPERF_TCP=$(echo "$IPERF_OUT" | grep -oP '[\d.]+\s+[GM]bits/sec' | tail -1) || true
-    [[ -n "$IPERF_TCP" ]] && ok "TCP: $IPERF_TCP" || warn "TCP: could not parse result"
+    IPERF_TCP_UP=$(echo "$IPERF_OUT" | grep -oP '[\d.]+\s+[GM]bits/sec' | tail -1) || true
+    IPERF_TCP_UP_RETR=$(echo "$IPERF_OUT" | grep '\[SUM\].*sender' | grep -oP '[\d.]+\s+[GM]bits/sec\s+\K\d+') || true
+    [[ -n "$IPERF_TCP_UP" ]] && ok "TCP upload: $IPERF_TCP_UP  retr: ${IPERF_TCP_UP_RETR:-?}" || warn "TCP upload: could not parse result"
+
+    # Download: server → client (512 MB, reverse)
+    step "iperf3 TCP download 512M (server→client, obfs=${OBFS_MODE})"
+    docker exec -d wg_server iperf3 -s -1 -p 5201 2>/dev/null || true
+    sleep 0.5
+    IPERF_OUT=$(docker exec wg_client iperf3 -c "$WG_SERVER_IP" -p 5201 -P 4 -n 512M -R 2>&1) || true
+    echo "$IPERF_OUT" | tail -5 | sed 's/^/  /'
+    IPERF_TCP_DN=$(echo "$IPERF_OUT" | grep -oP '[\d.]+\s+[GM]bits/sec' | tail -1) || true
+    IPERF_TCP_DN_RETR=$(echo "$IPERF_OUT" | grep '\[SUM\].*sender' | grep -oP '[\d.]+\s+[GM]bits/sec\s+\K\d+') || true
+    [[ -n "$IPERF_TCP_DN" ]] && ok "TCP download: $IPERF_TCP_DN  retr: ${IPERF_TCP_DN_RETR:-?}" || warn "TCP download: could not parse result"
 fi
 
 # ── iperf3 UDP ────────────────────────────────────────────────────
-IPERF_UDP="N/A"
-IPERF_UDP_LOSS="N/A"
+IPERF_UDP_UP="N/A"
+IPERF_UDP_DN="N/A"
+IPERF_UDP_LOSS_UP="N/A"
+IPERF_UDP_LOSS_DN="N/A"
 if [[ $PING_OK -eq 1 ]]; then
-    step "iperf3 UDP (5s, through GUT relay, obfs=${OBFS_MODE})"
+    # Upload: client → server (512 MB)
+    step "iperf3 UDP upload 512M (client→server, obfs=${OBFS_MODE})"
     docker exec -d wg_server iperf3 -s -1 -p 5202 2>/dev/null || true
     sleep 0.5
-    IPERF_OUT=$(docker exec wg_client iperf3 -c "$WG_SERVER_IP" -p 5202 -u -b 500M -t 5 2>&1) || true
+    IPERF_OUT=$(docker exec wg_client iperf3 -c "$WG_SERVER_IP" -p 5202 -u -b 1G -n 512M 2>&1) || true
     echo "$IPERF_OUT" | tail -5 | sed 's/^/  /'
-    IPERF_UDP=$(echo "$IPERF_OUT" | grep "sender" | grep -oP '[\d.]+\s+[GM]bits/sec') || true
-    IPERF_UDP_LOSS=$(echo "$IPERF_OUT" | grep "sender" | grep -oP '\([\d.]+%\)' | tr -d '()') || true
-    [[ -n "$IPERF_UDP" ]] && ok "UDP: $IPERF_UDP  loss: ${IPERF_UDP_LOSS:-?}" || warn "UDP: could not parse"
+    IPERF_UDP_UP=$(echo "$IPERF_OUT" | grep "sender" | grep -oP '[\d.]+\s+[GM]bits/sec') || true
+    IPERF_UDP_LOSS_UP=$(echo "$IPERF_OUT" | grep "sender" | grep -oP '\([\d.]+%\)' | tr -d '()') || true
+    [[ -n "$IPERF_UDP_UP" ]] && ok "UDP upload: $IPERF_UDP_UP  loss: ${IPERF_UDP_LOSS_UP:-?}" || warn "UDP upload: could not parse"
+
+    # Download: server → client (512 MB, reverse)
+    step "iperf3 UDP download 512M (server→client, obfs=${OBFS_MODE})"
+    docker exec -d wg_server iperf3 -s -1 -p 5202 2>/dev/null || true
+    sleep 0.5
+    IPERF_OUT=$(docker exec wg_client iperf3 -c "$WG_SERVER_IP" -p 5202 -u -b 1G -n 512M -R 2>&1) || true
+    echo "$IPERF_OUT" | tail -5 | sed 's/^/  /'
+    IPERF_UDP_DN=$(echo "$IPERF_OUT" | grep "sender" | grep -oP '[\d.]+\s+[GM]bits/sec') || true
+    IPERF_UDP_LOSS_DN=$(echo "$IPERF_OUT" | grep "sender" | grep -oP '\([\d.]+%\)' | tr -d '()') || true
+    [[ -n "$IPERF_UDP_DN" ]] && ok "UDP download: $IPERF_UDP_DN  loss: ${IPERF_UDP_LOSS_DN:-?}" || warn "UDP download: could not parse"
 fi
 
 # ── BPF stats (SIGUSR1) ──────────────────────────────────────────
@@ -699,8 +734,10 @@ done
 
 echo ""
 [[ $PING_OK -eq 1 ]] && ok "WG ping through relay: PASS" || fail "WG ping through relay: FAIL"
-echo "  TCP throughput    : ${IPERF_TCP:-N/A}"
-echo "  UDP throughput    : ${IPERF_UDP:-N/A}  loss: ${IPERF_UDP_LOSS:-N/A}"
+echo "  TCP upload        : ${IPERF_TCP_UP:-N/A}  retr: ${IPERF_TCP_UP_RETR:-N/A}"
+echo "  TCP download      : ${IPERF_TCP_DN:-N/A}  retr: ${IPERF_TCP_DN_RETR:-N/A}"
+echo "  UDP upload        : ${IPERF_UDP_UP:-N/A}  loss: ${IPERF_UDP_LOSS_UP:-N/A}"
+echo "  UDP download      : ${IPERF_UDP_DN:-N/A}  loss: ${IPERF_UDP_LOSS_DN:-N/A}"
 echo "  nDPI protocol     : ${NDPI_RESULT} (expect: ${NDPI_EXPECT:-any})"
 echo "  nDPI risk flags   : ${NDPI_RISK}"
 echo ""
@@ -714,9 +751,12 @@ if [[ $CI_MODE -eq 1 ]]; then
             echo "| Metric | Result |"
             echo "|--------|--------|"
             echo "| WG Ping | $([ $PING_OK -eq 1 ] && echo 'PASS' || echo 'FAIL') |"
-            echo "| TCP throughput | ${IPERF_TCP:-N/A} |"
-            echo "| UDP throughput | ${IPERF_UDP:-N/A} |"
-            echo "| UDP loss | ${IPERF_UDP_LOSS:-N/A} |"
+            echo "| TCP upload (client→server) | ${IPERF_TCP_UP:-N/A} retr=${IPERF_TCP_UP_RETR:-N/A} |"
+            echo "| TCP download (server→client) | ${IPERF_TCP_DN:-N/A} retr=${IPERF_TCP_DN_RETR:-N/A} |"
+            echo "| UDP upload | ${IPERF_UDP_UP:-N/A} |"
+            echo "| UDP upload loss | ${IPERF_UDP_LOSS_UP:-N/A} |"
+            echo "| UDP download | ${IPERF_UDP_DN:-N/A} |"
+            echo "| UDP download loss | ${IPERF_UDP_LOSS_DN:-N/A} |"
             echo "| nDPI protocol (expect: ${NDPI_EXPECT:-any}) | ${NDPI_RESULT} |"
             echo "| nDPI risk flags | ${NDPI_RISK} |"
             echo "| Obfs mode | ${OBFS_MODE} |"
