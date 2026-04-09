@@ -325,6 +325,7 @@ ok "ndpi_router: eth0=${NDPI_CLIENT_IP} (client-side), eth1=${NDPI_SERVER_IP} (s
 step "Starting gutd_server (${SERVER_IP}, gut0=${GUT_SERVER_ADDR})"
 docker run -d --name gutd_server \
     --network "$NET_SERVER" --ip "$SERVER_IP" \
+    --sysctl net.ipv4.ip_forward=1 \
     "${CAPS[@]}" "${BPF_MOUNT[@]}" \
     -v /tmp/gutd-relay-server.conf:/etc/gutd.conf:ro \
     "$IMAGE" --config /etc/gutd.conf
@@ -338,12 +339,13 @@ docker exec gutd_server ip route add "$NET_CLIENT_SUBNET" via "$NDPI_SERVER_IP" 
 step "Starting gutd_relay (${RELAY_IP}, ONE NIC, gut0=${GUT_RELAY_ADDR})"
 docker run -d --name gutd_relay \
     --network "$NET_CLIENT" --ip "$RELAY_IP" \
+    --sysctl net.ipv4.ip_forward=1 \
+    --sysctl net.ipv4.conf.all.rp_filter=0 \
+    --sysctl net.ipv4.conf.default.rp_filter=0 \
     "${CAPS[@]}" "${BPF_MOUNT[@]}" \
     -v /tmp/gutd-relay-ebpf.conf:/etc/gutd.conf:ro \
     --entrypoint sh \
     "$IMAGE" -c "
-        # Enable IP forwarding for DNAT/MASQUERADE
-        echo 1 > /proc/sys/net/ipv4/ip_forward
         # Route to server network via ndpi_router
         ip route add ${NET_SERVER_SUBNET} via ${NDPI_CLIENT_IP}
         # DNAT: incoming WG on eth0:51820 → gut0 peer (server tunnel IP)
