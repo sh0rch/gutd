@@ -702,7 +702,7 @@ if [[ $PCAP_SIZE -gt 100 ]]; then
     if [[ -n "$NDPI_BIN" ]]; then
         log "Analyzing with: $NDPI_BIN"
         NDPI_OUTPUT=$("$NDPI_BIN" -i /tmp/ndpi_relay.pcap -v2 2>&1) || true
-        echo "$NDPI_OUTPUT" | head -40 | sed 's/^/  /'
+        echo "$NDPI_OUTPUT" | sed 's/^/  /'
 
         # Save full report
         echo "$NDPI_OUTPUT" > /tmp/ndpi-relay-report.txt
