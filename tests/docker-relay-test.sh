@@ -419,7 +419,7 @@ done
 # ── Verify relay (single NIC) ────────────────────────────────────
 step "Verifying relay (single NIC)"
 log "Relay interfaces:"
-docker exec gutd_relay ip -br addr 2>&1 | sed 's/^/  /'
+docker exec gutd_relay ip addr show 2>&1 | sed 's/^/  /'
 ETH_COUNT=$(docker exec gutd_relay ls /sys/class/net/ 2>/dev/null | grep -c '^eth')
 if [[ $ETH_COUNT -eq 1 ]]; then
     ok "Relay has exactly 1 ethernet interface (eth0)"
@@ -434,7 +434,7 @@ docker exec gutd_relay iptables -t nat -L -n 2>&1 | sed 's/^/  /'
 # ── Verify ndpi routing ──────────────────────────────────────────
 step "Verifying ndpi_router forwarding"
 log "ndpi interfaces:"
-docker exec ndpi_router ip -br addr 2>&1 | sed 's/^/  /'
+docker exec ndpi_router ip addr show 2>&1 | sed 's/^/  /'
 # Relay must reach server through ndpi
 if docker exec gutd_relay ping -c 1 -W 2 "$SERVER_IP" &>/dev/null; then
     ok "Relay can reach server (${SERVER_IP}) via ndpi"
