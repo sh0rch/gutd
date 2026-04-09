@@ -529,6 +529,13 @@ fi
 
 # ── Wait for WireGuard handshake ──────────────────────────────────
 step "Waiting for WireGuard handshake"
+# Start a short tcpdump on relay gut0 to capture the first seconds of WG traffic
+docker exec -d gutd_relay sh -c \
+    'tcpdump -i gut0 -n -c 20 -w /tmp/gut0_relay.pcap 2>/tmp/gut0_tcpdump.log; echo done > /tmp/gut0_done' 2>/dev/null || true
+# Also capture on relay eth0 for comparison
+docker exec -d gutd_relay sh -c \
+    'tcpdump -i eth0 -n -c 40 -w /tmp/eth0_relay.pcap 2>/tmp/eth0_tcpdump.log; echo done > /tmp/eth0_done' 2>/dev/null || true
+
 WG_READY=0
 for i in $(seq 1 30); do
     docker exec wg_client ping -c 1 -W 1 "$WG_SERVER_IP" &>/dev/null || true
@@ -546,6 +553,10 @@ if [[ $WG_READY -eq 0 ]]; then
     docker exec wg_client wg show 2>&1 | sed 's/^/  /'
     log "=== wg_server wg show ==="
     docker exec wg_server wg show 2>&1 | sed 's/^/  /'
+    log "=== relay gut0 tcpdump (first 20 pkts) ==="
+    docker exec gutd_relay sh -c 'cat /tmp/gut0_tcpdump.log 2>/dev/null; tcpdump -r /tmp/gut0_relay.pcap -n 2>/dev/null | head -30 || echo "(no gut0 pcap)"' 2>&1 | sed 's/^/  /'
+    log "=== relay eth0 tcpdump (first 40 pkts) ==="
+    docker exec gutd_relay sh -c 'cat /tmp/eth0_tcpdump.log 2>/dev/null; tcpdump -r /tmp/eth0_relay.pcap -n 2>/dev/null | head -40 || echo "(no eth0 pcap)"' 2>&1 | sed 's/^/  /'
     log "=== relay nat iptables (with counters) ==="
     docker exec gutd_relay iptables -t nat -L -n -v 2>&1 | sed 's/^/  /'
     log "=== relay filter iptables FORWARD (with counters) ==="
