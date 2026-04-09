@@ -323,17 +323,21 @@ docker network connect --ip "$NDPI_SERVER_IP" "$NET_SERVER" ndpi_router
 ok "ndpi_router: eth0=${NDPI_CLIENT_IP} (client-side), eth1=${NDPI_SERVER_IP} (server-side)"
 
 # ── gutd_server ───────────────────────────────────────────────────
+# Route to net_client MUST be added BEFORE gutd starts so it can resolve
+# the peer MAC (10.100.1.2) via the correct next-hop (ndpi eth1 = NDPI_SERVER_IP).
+# Without this, gutd resolves MAC via the default Docker gateway and the
+# BPF-encaped GUT response goes host-bridge → blocked by DOCKER-ISOLATION.
 step "Starting gutd_server (${SERVER_IP}, gut0=${GUT_SERVER_ADDR})"
 docker run -d --name gutd_server \
     --network "$NET_SERVER" --ip "$SERVER_IP" \
     --sysctl net.ipv4.ip_forward=1 \
     "${CAPS[@]}" "${BPF_MOUNT[@]}" \
     -v /tmp/gutd-relay-server.conf:/etc/gutd.conf:ro \
-    "$IMAGE" --config /etc/gutd.conf
-
-# Server needs a route to reach relay (10.100.1.0/29) via ndpi
-sleep 0.5
-docker exec gutd_server ip route add "$NET_CLIENT_SUBNET" via "$NDPI_SERVER_IP" 2>/dev/null || true
+    --entrypoint sh \
+    "$IMAGE" -c "
+        ip route add ${NET_CLIENT_SUBNET} via ${NDPI_SERVER_IP}
+        exec /gutd --config /etc/gutd.conf
+    "
 
 # ── gutd_relay ────────────────────────────────────────────────────
 # ONE NIC (eth0 on net_client). GUT traffic to server routed via ndpi.
