@@ -1,0 +1,21 @@
+# Test image for gutd relay/integration tests.
+#
+# Unlike Dockerfile.run (FROM scratch, minimal), this image is based on Alpine
+# so that the test harness can exec shell commands inside containers (ip, iptables,
+# ping, kill, traceroute, etc.) without needing nsenter on the host.
+#
+# Used by: tests/docker-relay-test.sh
+# NOT for production deployment — use Dockerfile.run instead.
+FROM alpine:3.21
+
+RUN apk add --no-cache \
+    iproute2 \
+    iptables \
+    iputils \
+    busybox-extras
+
+ARG TARGETARCH=amd64
+COPY dist/gutd-${TARGETARCH} /gutd
+RUN chmod +x /gutd
+
+ENTRYPOINT ["/gutd"]
