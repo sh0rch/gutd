@@ -451,6 +451,16 @@ else
     exit 1
 fi
 
+# Verify the GUT tunnel is working: ping across gut0 → gut0_peer (server)
+step "Verifying GUT tunnel (relay gut0 → server gut0)"
+if docker exec gutd_relay ping -c 3 -W 3 "$GUT_SERVER_TUN_IP" &>/dev/null; then
+    ok "GUT tunnel: relay (${GUT_RELAY_TUN_IP}) → server (${GUT_SERVER_TUN_IP}) ✓"
+else
+    warn "GUT tunnel ping failed — ICMP may be blocked; continuing (WG will test connectivity)"
+    log "=== gut tunnel ping attempt ==="
+    docker exec gutd_relay ping -c 3 -W 2 "$GUT_SERVER_TUN_IP" 2>&1 | sed 's/^/  /' || true
+fi
+
 # ── WireGuard configs ─────────────────────────────────────────────
 step "Configuring WireGuard"
 
