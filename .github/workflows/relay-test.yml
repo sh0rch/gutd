@@ -50,7 +50,7 @@ jobs:
           --build-arg TARGETARCH=amd64 \
           --platform linux/amd64 \
           -t gutd:relay-test \
-          -f docker/Dockerfile.run .
+          -f docker/Dockerfile.relay-test .
         docker save gutd:relay-test | gzip > /tmp/gutd-relay-test.tar.gz
 
     - name: Upload image artifact
