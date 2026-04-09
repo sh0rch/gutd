@@ -128,6 +128,7 @@ SERVER_IP="10.100.2.3"
 # GUT tunnel /30 (inside the tunnel)
 # Convention: odd = responder/server, even = initiator/client
 GUT_RELAY_ADDR="10.254.0.2/30"
+GUT_RELAY_TUN_IP="10.254.0.2"
 GUT_SERVER_ADDR="10.254.0.1/30"
 GUT_SERVER_TUN_IP="10.254.0.1"
 
@@ -300,6 +301,7 @@ step "Starting ndpi_router (${NDPI_CLIENT_IP} ↔ ${NDPI_SERVER_IP})"
 docker run -d --name ndpi_router \
     --network "$NET_CLIENT" --ip "$NDPI_CLIENT_IP" \
     --sysctl net.ipv4.ip_forward=1 \
+    --sysctl net.ipv4.ip_forward=1 \
     --cap-add NET_ADMIN --cap-add NET_RAW \
     --entrypoint sh alpine \
     -c "
@@ -347,11 +349,18 @@ docker run -d --name gutd_relay \
     "$IMAGE" -c "
         # Route to server network via ndpi_router
         ip route add ${NET_SERVER_SUBNET} via ${NDPI_CLIENT_IP}
-        # DNAT: incoming WG on eth0:51820 → gut0 peer (server tunnel IP)
-        iptables -t nat -A PREROUTING -i eth0 -p udp --dport ${WG_PORT} \
+        # FORWARD direction: client WG → gut0 peer (server tunnel IP)
+        iptables -t nat -A PREROUTING -i eth0 -p udp --dport ${WG_PORT} \\
             -j DNAT --to-destination ${GUT_SERVER_TUN_IP}:${WG_PORT}
-        # MASQUERADE outbound on eth0 (GUT-encapped traffic to server)
-        iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+        # REVERSE direction: GUT decap delivers to gut0 with dst=gut0 IP;
+        # re-DNAT to the original WG client so the kernel forwards it back.
+        iptables -t nat -A PREROUTING -i gut0 -p udp \\
+            -d ${GUT_RELAY_TUN_IP} \\
+            -j DNAT --to-destination ${CLIENT_IP}
+        # SNAT return packets to look like they came from relay:51820
+        # (client's configured WireGuard endpoint)
+        iptables -t nat -A POSTROUTING -o eth0 -d ${CLIENT_IP} -p udp \\
+            -j SNAT --to-source ${RELAY_IP}:${WG_PORT}
         # FORWARD rules — bidirectional
         iptables -A FORWARD -i eth0 -o gut0 -j ACCEPT
         iptables -A FORWARD -i gut0 -o eth0 -j ACCEPT
