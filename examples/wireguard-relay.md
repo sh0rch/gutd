@@ -52,12 +52,15 @@ key = <output of: gutd genkey>   # shared with server
 # Enable IP forwarding
 sysctl -w net.ipv4.ip_forward=1
 
-# WireGuard clients -> gut0 (to server via GUT tunnel)
-iptables -t nat -A PREROUTING -p udp --dport 51820 \
+# DNAT: WireGuard clients arriving on eth0:51820 → server gut0 peer address
+iptables -t nat -A PREROUTING -i eth0 -p udp --dport 51820 \
     -j DNAT --to-destination 10.254.0.1
 
-# Masquerade outbound GUT traffic
+# Masquerade traffic going INTO the GUT tunnel (so server routes replies back)
 iptables -t nat -A POSTROUTING -o gut0 -j MASQUERADE
+# Masquerade replies going OUT to WireGuard clients (source is gut0 addr,
+# not relay public IP — clients would not know how to return it otherwise)
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 
 # Forwarding
 iptables -A FORWARD -i eth0 -o gut0 -j ACCEPT
@@ -70,11 +73,12 @@ iptables -A FORWARD -i gut0 -o eth0 -j ACCEPT
 table inet gut_relay {
     chain prerouting {
         type nat hook prerouting priority -100; policy accept;
-        udp dport 51820 counter dnat to 10.254.0.1
+        iifname "eth0" udp dport 51820 counter dnat to 10.254.0.1
     }
     chain postrouting {
         type nat hook postrouting priority 100; policy accept;
         oifname "gut0" counter masquerade
+        oifname "eth0" counter masquerade
     }
     chain forward {
         type filter hook forward priority 0; policy accept;
@@ -108,25 +112,15 @@ key = <same key as relay>
 ### iptables
 
 ```bash
-# GUT tunnel -> local WireGuard
-iptables -t nat -A PREROUTING -i gut0 -p udp \
-    -j DNAT --to-destination 127.0.0.1:51820
-
-# Masquerade return traffic
+# Masquerade WireGuard replies going back into the GUT tunnel toward the relay
+# (reply src is the WG server's gut0 address; relay conntrack un-NATs it for the client)
 iptables -t nat -A POSTROUTING -o gut0 -j MASQUERADE
-
-# Allow loopback WireGuard
-iptables -A INPUT -i lo -p udp --dport 51820 -j ACCEPT
 ```
 
 ### nftables
 
 ```nftables
 table inet gut_server {
-    chain prerouting {
-        type nat hook prerouting priority -100; policy accept;
-        iifname "gut0" udp dport 51820 counter dnat to 127.0.0.1:51820
-    }
     chain postrouting {
         type nat hook postrouting priority 100; policy accept;
         oifname "gut0" counter masquerade
@@ -134,7 +128,8 @@ table inet gut_server {
 }
 ```
 
-WireGuard on the server must listen on `0.0.0.0:51820` or `127.0.0.1:51820`.
+WireGuard on the server listens on `0.0.0.0:51820`. gutd decapsulates GUT packets and
+delivers them directly to `gut0`; WireGuard receives them without any additional NAT.
 
 ---
 
@@ -163,6 +158,12 @@ WireGuard keys (for the WireGuard layer) are managed by `wg genkey` separately.
 ---
 
 ## 4. Start and verify
+
+> **Startup order is critical:** gutd resolves the layer-2 next-hop for `peer_ip` via
+> ARP at startup. If the route to `peer_ip` is configured dynamically (e.g. with
+> `ip route add` in a container or script), the route **must be in place before gutd
+> starts**. An incorrect or missing route causes gutd to cache the wrong MAC and
+> tunnel packets will be silently routed to the wrong host.
 
 ### On relay
 

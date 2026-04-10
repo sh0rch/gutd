@@ -297,11 +297,12 @@ docker run -d --name gutd --restart unless-stopped \
 ```
 
 ```bash
-# DNAT: WireGuard clients arriving on :51820 → gut0 peer address on server side
+# DNAT: WireGuard clients arriving on eth0:51820 → server gut0 peer address
 sysctl -w net.ipv4.ip_forward=1
-iptables -t nat -A PREROUTING -p udp --dport 51820 \
+iptables -t nat -A PREROUTING -i eth0 -p udp --dport 51820 \
     -j DNAT --to-destination 10.254.0.2
 iptables -t nat -A POSTROUTING -o gut0 -j MASQUERADE
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 iptables -A FORWARD -i eth0 -o gut0 -j ACCEPT
 iptables -A FORWARD -i gut0 -o eth0 -j ACCEPT
 ```
@@ -321,15 +322,18 @@ docker run -d --name gutd --restart unless-stopped \
 ```
 
 ```bash
-# Forward gut0 traffic to local WireGuard
-iptables -t nat -A PREROUTING -i gut0 -p udp \
-    -j DNAT --to-destination 127.0.0.1:51820
+# WireGuard listens on 0.0.0.0:51820; gutd delivers decapsulated WG packets
+# directly to gut0 — only MASQUERADE is needed so replies return through the tunnel
 iptables -t nat -A POSTROUTING -o gut0 -j MASQUERADE
-iptables -A INPUT -i lo -p udp --dport 51820 -j ACCEPT
 ```
 
 WireGuard on the server listens on `127.0.0.1:51820` or `0.0.0.0:51820` as usual.
 WG clients connect to the relay's public IP on port `51820` — they are unaware of gutd.
+
+> **Startup order:** gutd resolves its peer's layer-2 next-hop via ARP at startup.
+> In multi-subnet or container deployments, ensure any `ip route add` to `peer_ip` is
+> in place **before** starting gutd. An incorrect route at init time causes gutd to
+> cache the wrong destination MAC and tunnel traffic will be silently misdelivered.
 
 See [examples/wireguard-relay.md](../examples/wireguard-relay.md) for the full relay example with nftables.
 

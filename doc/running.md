@@ -322,11 +322,14 @@ gut tunnel toward the server's gut0 peer address (`10.254.0.1`):
 sysctl -w net.ipv4.ip_forward=1
 
 # DNAT: redirect incoming WireGuard connections into the gut tunnel
-iptables -t nat -A PREROUTING -p udp --dport 51820 \
+iptables -t nat -A PREROUTING -i eth0 -p udp --dport 51820 \
     -j DNAT --to-destination 10.254.0.1:51820
 
-# Masquerade so the server can route replies back through the tunnel
+# Masquerade traffic entering the GUT tunnel (server routes replies back to relay)
 iptables -t nat -A POSTROUTING -o gut0 -j MASQUERADE
+# Masquerade replies leaving toward WireGuard clients (src would otherwise be
+# the server's gut0 address, which clients cannot route back to relay)
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 
 # Allow forwarding between the physical NIC and the gut tunnel interface
 iptables -A FORWARD -i eth0 -o gut0 -j ACCEPT
@@ -339,11 +342,12 @@ nftables equivalent:
 table inet gut_relay {
     chain prerouting {
         type nat hook prerouting priority -100; policy accept;
-        udp dport 51820 counter dnat to 10.254.0.1:51820
+        iifname "eth0" udp dport 51820 counter dnat to 10.254.0.1:51820
     }
     chain postrouting {
         type nat hook postrouting priority 100; policy accept;
         oifname "gut0" counter masquerade
+        oifname "eth0" counter masquerade
     }
     chain forward {
         type filter hook forward priority 0; policy accept;
