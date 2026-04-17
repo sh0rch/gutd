@@ -23,6 +23,15 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+#ifdef BPF_DEBUG
+#define bpf_debug(fmt, ...) bpf_printk("DISP: " fmt, ##__VA_ARGS__)
+#else
+#define bpf_debug(fmt, ...) \
+    do                      \
+    {                       \
+    } while (0)
+#endif
+
 char LICENSE[] SEC("license") = "GPL";
 
 #define MAX_PEERS 8
@@ -102,10 +111,15 @@ int xdp_dispatch(struct xdp_md *ctx)
 
     __u32 *peer_idx = bpf_map_lookup_elem(&port_map, &dst_port);
     if (!peer_idx)
+    {
+        bpf_debug("port %u not in port_map", dst_port);
         return XDP_PASS; /* not a GUT port — pass to kernel */
+    }
 
+    bpf_debug("port %u → peer_idx %u, tail-call", dst_port, *peer_idx);
     bpf_tail_call(ctx, &xdp_peer_progs, *peer_idx);
 
     /* Tail-call failed (should not happen) — pass to kernel */
+    bpf_debug("tail-call FAILED for peer_idx %u", *peer_idx);
     return XDP_PASS;
 }
