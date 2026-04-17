@@ -1218,19 +1218,17 @@ unsafe fn parse_neigh_nlmsg_v4(
         let dptr = base.add(off + rta_hdr);
         let dlen = rlen - rta_hdr;
         match rta.rta_type {
-            1 /* NDA_DST */ => {
-                if dlen == 4 {
-                    let mut a = [0u8; 4];
-                    std::ptr::copy_nonoverlapping(dptr, a.as_mut_ptr(), 4);
-                    if &a == target_ip4 { found_ip = true; }
+            1 if dlen == 4 => {
+                let mut a = [0u8; 4];
+                std::ptr::copy_nonoverlapping(dptr, a.as_mut_ptr(), 4);
+                if &a == target_ip4 {
+                    found_ip = true;
                 }
             }
-            2 /* NDA_LLADDR */ => {
-                if dlen == 6 {
-                    let mut m = [0u8; 6];
-                    std::ptr::copy_nonoverlapping(dptr, m.as_mut_ptr(), 6);
-                    mac = Some(m);
-                }
+            2 if dlen == 6 => {
+                let mut m = [0u8; 6];
+                std::ptr::copy_nonoverlapping(dptr, m.as_mut_ptr(), 6);
+                mac = Some(m);
             }
             _ => {}
         }
@@ -1380,19 +1378,17 @@ unsafe fn parse_neigh_nlmsg(
         let dptr = base.add(off + rta_hdr);
         let dlen = rlen - rta_hdr;
         match rta.rta_type {
-            1 /* NDA_DST */ => {
-                if dlen == 16 {
-                    let mut a = [0u8; 16];
-                    std::ptr::copy_nonoverlapping(dptr, a.as_mut_ptr(), 16);
-                    if &a == target_ip6 { found_ip = true; }
+            1 if dlen == 16 => {
+                let mut a = [0u8; 16];
+                std::ptr::copy_nonoverlapping(dptr, a.as_mut_ptr(), 16);
+                if &a == target_ip6 {
+                    found_ip = true;
                 }
             }
-            2 /* NDA_LLADDR */ => {
-                if dlen == 6 {
-                    let mut m = [0u8; 6];
-                    std::ptr::copy_nonoverlapping(dptr, m.as_mut_ptr(), 6);
-                    mac = Some(m);
-                }
+            2 if dlen == 6 => {
+                let mut m = [0u8; 6];
+                std::ptr::copy_nonoverlapping(dptr, m.as_mut_ptr(), 6);
+                mac = Some(m);
             }
             _ => {}
         }
@@ -1549,8 +1545,8 @@ pub fn nl_get_route(
                         .add(attr_offset + std::mem::size_of::<Rtattr>());
                     let dlen = rta_len - std::mem::size_of::<Rtattr>();
                     match rta.rta_type {
-                        4 /* RTA_OIF */ => {
-                            if dlen == 4 {
+                        4
+                            if dlen == 4 => {
                                 let mut ifindex = [0u8; 4];
                                 std::ptr::copy_nonoverlapping(data_ptr, ifindex.as_mut_ptr(), 4);
                                 let idx = i32::from_ne_bytes(ifindex);
@@ -1559,7 +1555,6 @@ pub fn nl_get_route(
                                     dev = Some(std::ffi::CStr::from_ptr(ifname.as_ptr()).to_string_lossy().into_owned());
                                 }
                             }
-                        }
                         5 /* RTA_GATEWAY */ => {
                             if is_v4 && dlen == 4 {
                                 let mut octets = [0u8; 4];
