@@ -131,29 +131,33 @@ fn dump_counters_file(
                 let _ = writeln!(
                     buf,
                     "{peer}_ingress_packets={}",
-                    stats.egress.packets_ingress
+                    stats.ingress.packets_ingress
                 );
                 let _ = writeln!(
                     buf,
                     "{peer}_ingress_dropped={}",
-                    stats.egress.packets_dropped
+                    stats.ingress.packets_dropped
                 );
-                let _ = writeln!(buf, "{peer}_ingress_bytes={}", stats.egress.bytes_processed);
-                let _ = writeln!(buf, "{peer}_ingress_mask_ops={}", stats.egress.mask_count);
+                let _ = writeln!(
+                    buf,
+                    "{peer}_ingress_bytes={}",
+                    stats.ingress.bytes_processed
+                );
+                let _ = writeln!(buf, "{peer}_ingress_mask_ops={}", stats.ingress.mask_count);
                 let _ = writeln!(
                     buf,
                     "{peer}_ingress_fragmented={}",
-                    stats.egress.packets_fragmented
+                    stats.ingress.packets_fragmented
                 );
                 let _ = writeln!(
                     buf,
                     "{peer}_ingress_inner_tcp_seen={}",
-                    stats.egress.inner_tcp_seen
+                    stats.ingress.inner_tcp_seen
                 );
                 let _ = writeln!(
                     buf,
                     "{peer}_ingress_oversized={}",
-                    stats.egress.packets_oversized
+                    stats.ingress.packets_oversized
                 );
             }
             Err(e) => {

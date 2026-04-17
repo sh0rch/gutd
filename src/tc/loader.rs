@@ -439,27 +439,91 @@ impl XdpDispatcher {
         let open_obj: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
             Box::leak(Box::new(MaybeUninit::uninit()));
         let skel = builder.open(open_obj)?.load()?;
-        let xdp_attach = match skel.progs.xdp_dispatch.attach_xdp(ingress_ifindex) {
-            Ok(link) => XdpAttachment::Link(link),
-            Err(link_err) => {
-                eprintln!("    dispatcher: bpf_link XDP failed: {link_err}, trying legacy SKB");
-                use std::os::fd::AsRawFd;
-                let prog_fd = skel.progs.xdp_dispatch.as_fd().as_raw_fd();
-                let flags = libbpf_sys::XDP_FLAGS_SKB_MODE;
-                let ret = unsafe {
-                    libbpf_sys::bpf_xdp_attach(ingress_ifindex, prog_fd, flags, std::ptr::null())
-                };
-                if ret < 0 {
-                    return Err(format!(
-                        "XDP dispatcher attach failed — bpf_link: {link_err}; SKB: errno {}",
-                        -ret
-                    )
-                    .into());
+
+        // Detect NIC driver — some drivers (e.g. Xen vif) claim native XDP
+        // support but their implementation is broken on certain kernels.
+        // Force SKB mode for known-broken drivers.
+        let force_skb = Self::should_force_skb(ingress_ifindex);
+        if force_skb {
+            eprintln!("    dispatcher: NIC driver requires SKB mode (known XDP issue)");
+        }
+
+        // Try bpf_link (auto-native) → legacy DRV → legacy SKB.
+        // Native XDP is strongly preferred: devmap redirect from native XDP
+        // to a veth with native XDP receiver is the only fully reliable path
+        // on kernel 6.1+ (veth_xdp_xmit checks rq->xdp_prog).
+        let xdp_attach = if force_skb {
+            // Skip bpf_link and DRV, go straight to SKB
+            use std::os::fd::AsRawFd;
+            let prog_fd = skel.progs.xdp_dispatch.as_fd().as_raw_fd();
+            let skb_flags = libbpf_sys::XDP_FLAGS_SKB_MODE;
+            let ret_skb = unsafe {
+                libbpf_sys::bpf_xdp_attach(ingress_ifindex, prog_fd, skb_flags, std::ptr::null())
+            };
+            if ret_skb < 0 {
+                return Err(format!("XDP dispatcher SKB attach failed: errno {}", -ret_skb).into());
+            }
+            eprintln!("    dispatcher: attached via legacy SKB mode (forced)");
+            XdpAttachment::Legacy {
+                ifindex: ingress_ifindex,
+                flags: skb_flags,
+            }
+        } else {
+            match skel.progs.xdp_dispatch.attach_xdp(ingress_ifindex) {
+                Ok(link) => {
+                    eprintln!("    dispatcher: attached via bpf_link (native)");
+                    XdpAttachment::Link(link)
                 }
-                eprintln!("    dispatcher: attached via legacy SKB mode");
-                XdpAttachment::Legacy {
-                    ifindex: ingress_ifindex,
-                    flags,
+                Err(link_err) => {
+                    eprintln!("    dispatcher: bpf_link XDP failed: {link_err}, trying legacy DRV");
+                    use std::os::fd::AsRawFd;
+                    let prog_fd = skel.progs.xdp_dispatch.as_fd().as_raw_fd();
+                    let drv_flags = libbpf_sys::XDP_FLAGS_DRV_MODE;
+                    let ret_drv = unsafe {
+                        libbpf_sys::bpf_xdp_attach(
+                            ingress_ifindex,
+                            prog_fd,
+                            drv_flags,
+                            std::ptr::null(),
+                        )
+                    };
+                    if ret_drv >= 0 {
+                        eprintln!("    dispatcher: attached via legacy DRV (native) mode");
+                        XdpAttachment::Legacy {
+                            ifindex: ingress_ifindex,
+                            flags: drv_flags,
+                        }
+                    } else {
+                        eprintln!(
+                            "    dispatcher: legacy DRV failed (errno {}), trying SKB",
+                            -ret_drv
+                        );
+                        let skb_flags = libbpf_sys::XDP_FLAGS_SKB_MODE;
+                        let ret_skb = unsafe {
+                            libbpf_sys::bpf_xdp_attach(
+                                ingress_ifindex,
+                                prog_fd,
+                                skb_flags,
+                                std::ptr::null(),
+                            )
+                        };
+                        if ret_skb < 0 {
+                            return Err(format!(
+                                "XDP dispatcher attach failed — bpf_link: {link_err}; \
+                             DRV: errno {}; SKB: errno {}",
+                                -ret_drv, -ret_skb
+                            )
+                            .into());
+                        }
+                        eprintln!(
+                            "    WARNING: dispatcher in SKB mode — devmap redirect to native \
+                         veth may silently drop packets on kernel 6.1+"
+                        );
+                        XdpAttachment::Legacy {
+                            ifindex: ingress_ifindex,
+                            flags: skb_flags,
+                        }
+                    }
                 }
             }
         };
@@ -492,6 +556,54 @@ impl XdpDispatcher {
         eprintln!("  dispatcher: peer_idx={peer_idx} ports={ports:?}");
         Ok(peer_idx)
     }
+
+    /// Detect NIC drivers with broken native XDP implementations.
+    /// Returns true if SKB mode should be forced.
+    fn should_force_skb(ifindex: i32) -> bool {
+        // Read driver name from sysfs: /sys/class/net/<ifname>/device/driver
+        // or use ethtool-like ioctl. Simpler: read /sys/class/net/<ifname>/device/subsystem
+        let ifname = match Self::ifindex_to_name(ifindex) {
+            Some(name) => name,
+            None => return false,
+        };
+        // Check driver via /sys/class/net/<ifname>/device/driver symlink
+        let driver_path = format!("/sys/class/net/{ifname}/device/driver");
+        if let Ok(target) = std::fs::read_link(&driver_path) {
+            if let Some(driver) = target.file_name().and_then(|f| f.to_str()) {
+                let broken_drivers = ["vif", "xen_netfront", "xen-netfront"];
+                if broken_drivers.iter().any(|d| driver.contains(d)) {
+                    eprintln!("    NIC {ifname}: driver={driver} — known broken native XDP");
+                    return true;
+                }
+            }
+        }
+        // Also check parentbus from /sys/class/net/<ifname>/device/subsystem
+        let subsystem_path = format!("/sys/class/net/{ifname}/device/subsystem");
+        if let Ok(target) = std::fs::read_link(&subsystem_path) {
+            if let Some(subsystem) = target.file_name().and_then(|f| f.to_str()) {
+                if subsystem == "xen" {
+                    eprintln!("    NIC {ifname}: subsystem=xen — forcing SKB mode");
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Convert ifindex to interface name.
+    fn ifindex_to_name(ifindex: i32) -> Option<String> {
+        let entries = std::fs::read_dir("/sys/class/net/").ok()?;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let idx_path = format!("/sys/class/net/{name}/ifindex");
+            if let Ok(content) = std::fs::read_to_string(&idx_path) {
+                if content.trim().parse::<i32>().ok() == Some(ifindex) {
+                    return Some(name);
+                }
+            }
+        }
+        None
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
@@ -503,6 +615,7 @@ pub struct TcBpfManager {
     _egress_hook: libbpf_rs::TcHook,
     _veth_pass_attach: XdpAttachment,
     _veth_xdp_name: String,
+    ingress_stats_fd: i32,
 }
 
 #[cfg(not(all(target_os = "linux", feature = "tc_ebpf")))]
@@ -750,9 +863,7 @@ impl TcBpfManager {
                 if let Some(fd) = egress_skel.get_map_fd("counters_map") {
                     os.maps.counters_map.reuse_fd(fd)?;
                 }
-                if let Some(fd) = egress_skel.get_map_fd("stats_map") {
-                    os.maps.stats_map.reuse_fd(fd)?;
-                }
+                // stats_map is NOT shared — each program tracks its own stats
                 if let Some(fd) = egress_skel.get_map_fd("scratch_map") {
                     os.maps.scratch_map.reuse_fd(fd)?;
                 }
@@ -763,44 +874,92 @@ impl TcBpfManager {
                     MapFlags::ANY,
                 )?;
                 use std::os::fd::AsRawFd;
+                let ingress_stats_fd = skel.maps.stats_map.as_fd().as_raw_fd();
                 let ingress_prog_fd = skel.progs.xdp_gut_ingress.as_fd().as_raw_fd();
+                // xdp_veth_pass MUST run in native (DRV) mode on the veth peer.
+                // veth driver's ndo_xdp_xmit (used by devmap redirect from NIC XDP)
+                // checks rcu_access_pointer(rq->xdp_prog) on the receiving end.
+                // If only SKB-mode XDP is attached, this pointer is NULL and
+                // devmap redirect silently drops ALL packets (kernel 6.1+).
+                //
+                // Attach order: bpf_link (auto-native) → legacy DRV → legacy SKB
+                // (with warning that devmap redirect will fail).
                 let vpl = match skel.progs.xdp_veth_pass.attach_xdp(tun_ifindex) {
-                    Ok(link) => XdpAttachment::Link(link),
+                    Ok(link) => {
+                        eprintln!("    veth_pass: attached via bpf_link (native)");
+                        XdpAttachment::Link(link)
+                    }
                     Err(link_err) => {
                         eprintln!(
-                            "    veth_pass: bpf_link XDP failed: {link_err}, trying legacy SKB"
+                            "    veth_pass: bpf_link XDP failed: {link_err}, trying legacy DRV"
                         );
                         let vp_fd = skel.progs.xdp_veth_pass.as_fd().as_raw_fd();
-                        let flags = libbpf_sys::XDP_FLAGS_SKB_MODE;
-                        let ret = unsafe {
-                            libbpf_sys::bpf_xdp_attach(tun_ifindex, vp_fd, flags, std::ptr::null())
-                        };
-                        if ret < 0 {
-                            return Err(format!(
-                                "veth_pass XDP failed — bpf_link: {link_err}; SKB: errno {}",
-                                -ret
+                        // Try native (DRV) mode first — required for devmap redirect
+                        let drv_flags = libbpf_sys::XDP_FLAGS_DRV_MODE;
+                        let ret_drv = unsafe {
+                            libbpf_sys::bpf_xdp_attach(
+                                tun_ifindex,
+                                vp_fd,
+                                drv_flags,
+                                std::ptr::null(),
                             )
-                            .into());
-                        }
-                        eprintln!("    veth_pass: attached via legacy SKB mode");
-                        XdpAttachment::Legacy {
-                            ifindex: tun_ifindex,
-                            flags,
+                        };
+                        if ret_drv >= 0 {
+                            eprintln!("    veth_pass: attached via legacy DRV (native) mode");
+                            XdpAttachment::Legacy {
+                                ifindex: tun_ifindex,
+                                flags: drv_flags,
+                            }
+                        } else {
+                            eprintln!(
+                                "    veth_pass: legacy DRV failed (errno {}), trying SKB",
+                                -ret_drv
+                            );
+                            let skb_flags = libbpf_sys::XDP_FLAGS_SKB_MODE;
+                            let ret_skb = unsafe {
+                                libbpf_sys::bpf_xdp_attach(
+                                    tun_ifindex,
+                                    vp_fd,
+                                    skb_flags,
+                                    std::ptr::null(),
+                                )
+                            };
+                            if ret_skb < 0 {
+                                return Err(format!(
+                                    "veth_pass XDP failed — bpf_link: {link_err}; \
+                                     DRV: errno {}; SKB: errno {}",
+                                    -ret_drv, -ret_skb
+                                )
+                                .into());
+                            }
+                            eprintln!(
+                                "    WARNING: veth_pass in SKB mode — devmap redirect from \
+                                 native XDP will silently drop packets on kernel 6.1+. \
+                                 This is likely the cause of missing return packets."
+                            );
+                            XdpAttachment::Legacy {
+                                ifindex: tun_ifindex,
+                                flags: skb_flags,
+                            }
                         }
                     }
                 };
                 dispatcher.register_peer(ingress_prog_fd, &config.peer().ports)?;
-                (Box::new(skel) as Box<dyn std::any::Any>, vpl)
+                (
+                    Box::new(skel) as Box<dyn std::any::Any>,
+                    vpl,
+                    ingress_stats_fd,
+                )
             }};
         }
         eprintln!("  devmap[0] = {veth_xdp_name} (ifindex={veth_xdp_ifindex})");
 
-        let (_ingress_skel, veth_pass_link) = match obfs_mode {
+        let (_ingress_skel, veth_pass_link, ingress_stats_fd) = match obfs_mode {
             crate::config::ObfsMode::Gut => load_ingress!(xdp_gut_ingress),
             crate::config::ObfsMode::Syslog => load_ingress!(xdp_gut_ingress_syslog),
             crate::config::ObfsMode::Sip => {
                 // SIP: use load_ingress! then populate xdp_progs tail-call map
-                let (skel_box, vpl) = load_ingress!(xdp_gut_ingress_sip);
+                let (skel_box, vpl, stats_fd) = load_ingress!(xdp_gut_ingress_sip);
                 {
                     use std::os::fd::AsRawFd;
                     let skel = skel_box
@@ -813,11 +972,11 @@ impl TcBpfManager {
                         MapFlags::ANY,
                     )?;
                 }
-                (skel_box, vpl)
+                (skel_box, vpl, stats_fd)
             }
             _ => {
                 // QUIC: use load_ingress! then populate xdp_progs tail-call map
-                let (skel_box, vpl) = load_ingress!(xdp_gut_ingress_quic);
+                let (skel_box, vpl, stats_fd) = load_ingress!(xdp_gut_ingress_quic);
                 {
                     use std::os::fd::AsRawFd;
                     let skel = skel_box
@@ -830,7 +989,7 @@ impl TcBpfManager {
                         MapFlags::ANY,
                     )?;
                 }
-                (skel_box, vpl)
+                (skel_box, vpl, stats_fd)
             }
         };
 
@@ -852,6 +1011,7 @@ impl TcBpfManager {
             _egress_hook: egress_hook,
             _veth_pass_attach: veth_pass_link,
             _veth_xdp_name: veth_xdp_name,
+            ingress_stats_fd,
         })
     }
 
@@ -1799,11 +1959,33 @@ impl TcBpfManager {
             None => GutStats::default(),
         };
 
-        // Ingress stats_map shares FD with egress (reuse_fd at load time),
-        // so both programs' counters are combined in the same percpu map.
-        let ingress = GutStats::default();
+        let ingress = Self::lookup_percpu_raw(self.ingress_stats_fd, &key, value_size)
+            .map(|per_cpu| Self::parse_percpu_stats(&per_cpu, value_size))
+            .unwrap_or_default();
 
         Ok(TcStats { egress, ingress })
+    }
+
+    /// Read a PERCPU_ARRAY map entry by raw FD.
+    #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
+    fn lookup_percpu_raw(map_fd: i32, key: &[u8], value_size: usize) -> Option<Vec<Vec<u8>>> {
+        let num_cpus = unsafe { libbpf_sys::libbpf_num_possible_cpus() } as usize;
+        if num_cpus == 0 {
+            return None;
+        }
+        // Kernel requires values aligned to 8 bytes per CPU.
+        let aligned = (value_size + 7) & !7;
+        let mut buf = vec![0u8; num_cpus * aligned];
+        let ret = unsafe {
+            libbpf_sys::bpf_map_lookup_elem(map_fd, key.as_ptr().cast(), buf.as_mut_ptr().cast())
+        };
+        if ret < 0 {
+            return None;
+        }
+        let per_cpu: Vec<Vec<u8>> = (0..num_cpus)
+            .map(|i| buf[i * aligned..i * aligned + value_size].to_vec())
+            .collect();
+        Some(per_cpu)
     }
 
     /// Parse per-CPU values returned by `lookup_percpu()`. Returns aggregated stats.
