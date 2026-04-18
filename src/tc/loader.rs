@@ -1324,6 +1324,53 @@ impl TcBpfManager {
         Ok(())
     }
 
+    /// Read the first IPv4 address assigned to `ifname` via /proc/net/fib_trie
+    /// or `ip -4 addr show` (fallback). Used when peer_ip is dynamic (0.0.0.0)
+    /// and route lookup would incorrectly return lo.
+    #[cfg(target_os = "linux")]
+    fn get_interface_ipv4(ifname: &str) -> Result<std::net::Ipv4Addr> {
+        let output = std::process::Command::new("ip")
+            .args(["-4", "-o", "addr", "show", "dev", ifname])
+            .output()
+            .map_err(|e| format!("failed to run ip addr show: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            // Format: "2: eth0    inet 172.18.0.2/16 brd ..."
+            if let Some(inet_pos) = line.find("inet ") {
+                let rest = &line[inet_pos + 5..];
+                if let Some(slash) = rest.find('/') {
+                    if let Ok(ip) = rest[..slash].parse::<std::net::Ipv4Addr>() {
+                        if !ip.is_loopback() {
+                            return Ok(ip);
+                        }
+                    }
+                }
+            }
+        }
+        Err(format!("no IPv4 address found on interface {ifname}").into())
+    }
+
+    /// Read the first global-scope IPv6 address on `ifname`.
+    #[cfg(target_os = "linux")]
+    fn get_interface_ipv6(ifname: &str) -> Result<std::net::Ipv6Addr> {
+        let output = std::process::Command::new("ip")
+            .args(["-6", "-o", "addr", "show", "dev", ifname, "scope", "global"])
+            .output()
+            .map_err(|e| format!("failed to run ip -6 addr show: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if let Some(inet_pos) = line.find("inet6 ") {
+                let rest = &line[inet_pos + 6..];
+                if let Some(slash) = rest.find('/') {
+                    if let Ok(ip) = rest[..slash].parse::<std::net::Ipv6Addr>() {
+                        return Ok(ip);
+                    }
+                }
+            }
+        }
+        Err(format!("no global IPv6 address found on interface {ifname}").into())
+    }
+
     #[cfg(target_os = "linux")]
     fn resolve_l2_peer_ip(peer_ip: std::net::IpAddr, ifname: &str) -> Result<std::net::IpAddr> {
         let info = Self::route_get_info(peer_ip)?;
@@ -1672,51 +1719,70 @@ impl TcBpfManager {
         // Set bind address (v4 and/or v6).
         // If wildcard bind is configured (0.0.0.0 / ::), resolve concrete
         // source IP from the route to peer_ip on ingress_ifname.
+        // When peer_ip is unspecified (dynamic mode), route lookup to 0.0.0.0
+        // returns lo — fall back to reading the address directly from the NIC.
+        let peer_ip_for_route = config.peer().peer_ip;
+        let use_iface_addr = peer_ip_for_route.is_unspecified();
+
         match config.peer().bind_ip {
             std::net::IpAddr::V4(ip) => {
                 if ip.is_unspecified() {
-                    let src = Self::resolve_route_src_ip(config.peer().peer_ip, ingress_ifname)?;
-                    match src {
-                        std::net::IpAddr::V4(v4) => {
-                            gut_config.bind_ip = u32::from_ne_bytes(v4.octets());
-                            eprintln!(
-                                "  bind_ip auto-resolved: 0.0.0.0 → {} (route src on {})",
-                                v4, ingress_ifname
-                            );
+                    let src = if use_iface_addr {
+                        Self::get_interface_ipv4(ingress_ifname)?
+                    } else {
+                        match Self::resolve_route_src_ip(peer_ip_for_route, ingress_ifname)? {
+                            std::net::IpAddr::V4(v4) => v4,
+                            std::net::IpAddr::V6(v6) => {
+                                return Err(format!(
+                                    "bind_ip=0.0.0.0 but route source resolved to IPv6 {}. \
+                                     Set explicit bind_ip or peer_ip family consistently.",
+                                    v6
+                                )
+                                .into());
+                            }
                         }
-                        std::net::IpAddr::V6(v6) => {
-                            return Err(format!(
-                                "bind_ip=0.0.0.0 but route source resolved to IPv6 {}. \
-                                 Set explicit bind_ip or peer_ip family consistently.",
-                                v6
-                            )
-                            .into());
+                    };
+                    gut_config.bind_ip = u32::from_ne_bytes(src.octets());
+                    eprintln!(
+                        "  bind_ip auto-resolved: 0.0.0.0 → {} ({})",
+                        src,
+                        if use_iface_addr {
+                            format!("interface addr on {}", ingress_ifname)
+                        } else {
+                            format!("route src on {}", ingress_ifname)
                         }
-                    }
+                    );
                 } else {
                     gut_config.bind_ip = u32::from_ne_bytes(ip.octets());
                 }
             }
             std::net::IpAddr::V6(ip) => {
                 if ip.is_unspecified() {
-                    let src = Self::resolve_route_src_ip(config.peer().peer_ip, ingress_ifname)?;
-                    match src {
-                        std::net::IpAddr::V6(v6) => {
-                            gut_config.bind_ip6 = v6.octets();
-                            eprintln!(
-                                "  bind_ip auto-resolved: :: → {} (route src on {})",
-                                v6, ingress_ifname
-                            );
+                    let src = if use_iface_addr {
+                        Self::get_interface_ipv6(ingress_ifname)?
+                    } else {
+                        match Self::resolve_route_src_ip(peer_ip_for_route, ingress_ifname)? {
+                            std::net::IpAddr::V6(v6) => v6,
+                            std::net::IpAddr::V4(v4) => {
+                                return Err(format!(
+                                    "bind_ip=:: but route source resolved to IPv4 {}. \
+                                     Set explicit bind_ip or peer_ip family consistently.",
+                                    v4
+                                )
+                                .into());
+                            }
                         }
-                        std::net::IpAddr::V4(v4) => {
-                            return Err(format!(
-                                "bind_ip=:: but route source resolved to IPv4 {}. \
-                                 Set explicit bind_ip or peer_ip family consistently.",
-                                v4
-                            )
-                            .into());
+                    };
+                    gut_config.bind_ip6 = src.octets();
+                    eprintln!(
+                        "  bind_ip auto-resolved: :: → {} ({})",
+                        src,
+                        if use_iface_addr {
+                            format!("interface addr on {}", ingress_ifname)
+                        } else {
+                            format!("route src on {}", ingress_ifname)
                         }
-                    }
+                    );
                 } else {
                     gut_config.bind_ip6 = ip.octets();
                 }

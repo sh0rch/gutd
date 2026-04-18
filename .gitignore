@@ -16,6 +16,7 @@ SHA256SUMS
 build.log
 
 # Docker
+/docker/prod
 .dockerignore
 
 # Test artifacts (integration tests write these to /tmp but also possibly cwd)
