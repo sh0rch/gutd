@@ -49,9 +49,9 @@
 #define GUT_RTP_HEADER_SIZE 12 /* RTP header: V(1)+PT(1)+seq(2)+ts(4)+SSRC(4) */
 #define GUT_B64_MAX_INNER 896  /* max inner before b64: GUT_HDR(10) + wg(800) + pad(64) */
 #define GUT_B64_MAX_OUT 1200   /* ceil(896/3)*4 = 1200 */
-#define GUT_B64_WG_MTU_MAX 886 /* max wg_total (wg_len+pad_len) for syslog b64 path;
-                                 * = GUT_B64_MAX_INNER(896) - GUT_HDR(10);
-                                 * WG_MTU=800 → wg_len=832 ≤ 886, output ~ 1196 bytes ≤ 1500 */
+#define GUT_B64_WG_MTU_MAX 886 /* max wg_total (wg_len+pad_len) for syslog b64 path; \
+                                * = GUT_B64_MAX_INNER(896) - GUT_HDR(10);            \
+                                * WG_MTU=800 → wg_len=832 ≤ 886, output ~ 1196 bytes ≤ 1500 */
 #define SIP_SCAN_OFF 2560      /* scratch offset for SIP marker scan on ingress */
 
 /* Combined base64 mode flag for shared syslog/SIP code paths */
@@ -97,6 +97,13 @@
 /* Offload capability flags (set by loader) */
 #define GUT_FLAG_NEED_L4_CSUM (1U << 0) /* finalize inner L4 csum when ip_summed==CHECKSUM_PARTIAL */
 
+/* skb->mark stamp applied by TC egress right before bpf_redirect.
+ * Identifies packets already wrapped by gutd so that netfilter rules
+ * (e.g. masquerade on eth0) can skip them.  Without this, NAT rules
+ * perform incremental checksum updates against the full UDP checksum
+ * already computed by BPF, corrupting the packet on the wire. */
+#define GUT_SKB_MARK 0x47554F42u /* ASCII "GUOB" — GUT OBfuscator */
+
 /* GUT protocol configuration (shared between Rust loader and eBPF) */
 struct gut_config
 {
@@ -129,7 +136,7 @@ struct gut_config
     __u8 tun_peer_ip6[16];       /* Remote veth peer IPv6 (zero if v4 only) */
     __u8 own_http3;              /* Respond to DPI probes via XDP_TX (1=yes) */
     __u8 dynamic_peer;           /* 1 = peer_ip unknown, learn from validated inbound packets */
-    __u8 obfs_gut;              /* 1 = noise mode: XOR quic[0..6] with quic[6..12] to hide QUIC signatures */
+    __u8 obfs_gut;               /* 1 = noise mode: XOR quic[0..6] with quic[6..12] to hide QUIC signatures */
 
     /* ── QUIC crypto: precomputed by loader for BPF AEAD on Long Headers ── */
     __u8 sni_domain[32];   /* SNI domain for ClientHello (null-terminated) */
@@ -155,7 +162,7 @@ struct peer_endpoint
     __u8 server_ip6[16]; /* Last-seen IPv6 dest (server) */
     __u16 server_port;   /* Last-seen UDP dest port (server) */
     __u8 valid;          /* 1 = endpoint learned, 0 = not yet */
-    __u8 obfs_gut;      /* 1 = this client uses noise mode, 0 = plain quic (auto-detected) */
+    __u8 obfs_gut;       /* 1 = this client uses noise mode, 0 = plain quic (auto-detected) */
 };
 
 /* Per-CPU statistics */
@@ -331,8 +338,8 @@ struct
  * (ks[] points into scratch_map).  Since chacha_block has zero stack
  * locals of its own the inlining cost is just code size, not stack. */
 static __always_inline void chacha_block(__u32 ks[16],
-                                                   const __u32 chacha_init[12],
-                                                   __u32 counter, __u32 nonce)
+                                         const __u32 chacha_init[12],
+                                         __u32 counter, __u32 nonce)
 {
     /* Load initial state into ks[] — no s0..s15 locals, no stack pressure. */
     ks[0] = chacha_init[0];
