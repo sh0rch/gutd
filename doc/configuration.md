@@ -102,7 +102,7 @@ When `GUTD_PEER_IP` is set and no config file is passed via CLI, gutd reads all 
 | `GUTD_DEFAULT_POLICY` | no | `allow` | `default_policy` |
 | `GUTD_KEEPALIVE_DROP_PCT` | no | `30` | `keepalive_drop_percent` |
 | `GUTD_OWN_HTTP3` | no | `true` | `own_http3` |
-| `GUTD_OBFS` | no | `quic` | `obfs` (`quic`, `gut`, `sip`, or `syslog`) |
+| `GUTD_OBFS` | no | `gut` | `obfs` (`quic`, `gut`, `sip`, or `syslog`) |
 | `GUTD_USERSPACE_ONLY` | no | `false` | `userspace_only` |
 | `GUTD_STATS_INTERVAL` | no | `5` | `stats_interval` |
 | `GUTD_STAT_FILE` | no | `/run/gutd.stat` | `stat_file` |

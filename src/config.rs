@@ -244,7 +244,7 @@ pub fn load_config_from_env() -> Result<Config> {
         .map(|v| v == "true" || v == "1")
         .unwrap_or(true);
     let obfs = match std::env::var("GUTD_OBFS")
-        .unwrap_or_else(|_| "quic".to_string())
+        .unwrap_or_else(|_| "gut".to_string())
         .as_str()
     {
         "quic" => ObfsMode::Quic,
@@ -351,7 +351,7 @@ impl Default for PeerBuilder {
             keepalive_drop_percent: 30,
             own_http3: true,
             wg_host: None,
-            obfs: ObfsMode::Quic,
+            obfs: ObfsMode::Gut,
             sip_domain: None,
             bind_port: None,
         }
