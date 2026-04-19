@@ -80,3 +80,30 @@ sudo bpftool -d prog load /path/to/tc_gut_egress.o /sys/fs/bpf/test 2>&1 | \
   grep 'processed.*insns'
 sudo rm -f /sys/fs/bpf/test
 ```
+
+## Docker relay: WireGuard handshake never completes (kernel ≥ 6.12)
+
+**Symptom:** gutd relay in a Docker container forwards packets to the server,
+the server replies, but the response never reaches the client. `conntrack -L`
+on the host shows the GUT UDP flow stuck in `UNREPLIED` state.
+
+**Root cause:** gutd TC BPF sets `UDP checksum = 0` on egress, which is valid
+per RFC 768 for IPv4. Starting with kernel 6.12 the conntrack module validates
+UDP checksums on reply packets (`net.netfilter.nf_conntrack_checksum = 1` by
+default). A reply with checksum 0 is treated as invalid — conntrack never
+matches it to the original flow, so the masquerade reverse NAT is never
+applied and the packet is dropped.
+
+**Fix:**
+
+```bash
+sysctl -w net.netfilter.nf_conntrack_checksum=0
+
+# Make persistent
+echo "net.netfilter.nf_conntrack_checksum = 0" >> /etc/sysctl.d/99-docker.conf
+sysctl --system
+```
+
+> **Note:** The automated install script (`debian-docker-install.sh`) already
+> sets this parameter. This section is for manual deployments or hosts upgraded
+> to kernel ≥ 6.12 after initial setup.
