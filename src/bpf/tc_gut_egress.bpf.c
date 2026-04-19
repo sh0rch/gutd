@@ -775,6 +775,18 @@ int gut_egress(struct __sk_buff *skb)
         stats->packets_egress++;
         stats->bytes_processed += (__u64)skb->len;
     }
+
+    /* Force ip_summed = CHECKSUM_NONE.  TC egress computes the full UDP
+     * checksum above, but the original WireGuard skb arrives with
+     * CHECKSUM_PARTIAL.  Without this, the kernel's TX finalization adds
+     * the payload checksum a second time, and masquerade (Docker NAT)
+     * also performs an incremental update — producing a wrong checksum
+     * on the wire. */
+    {
+        __u32 csum_off = (ipver == 4) ? (14 + 20 + 6) : (14 + 40 + 6);
+        bpf_l4_csum_replace(skb, csum_off, 0, 0, BPF_F_MARK_ENFORCE);
+    }
+
     bpf_debug("TC egress: wg_type=%d outer_hdr=%d pad=%d port=%d", wg_type, outer_hdr_len, pad_len, tunnel_port);
     return bpf_redirect(cfg->egress_ifindex, 0);
 }
@@ -1070,6 +1082,12 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
         stats->packets_egress++;
         stats->bytes_processed += (__u64)skb->len;
     }
+
+    {
+        __u32 csum_off = (tctx->ipver == 4) ? (14 + 20 + 6) : (14 + 40 + 6);
+        bpf_l4_csum_replace(skb, csum_off, 0, 0, BPF_F_MARK_ENFORCE);
+    }
+
     bpf_debug("TC egress SIP signal: wg_type=%d port=%d", wg_type, tunnel_port);
     return bpf_redirect(cfg->egress_ifindex, 0);
 }
@@ -1262,6 +1280,12 @@ int gut_egress_quic_long(struct __sk_buff *skb)
         stats->packets_egress++;
         stats->bytes_processed += (__u64)skb->len;
     }
+
+    {
+        __u32 csum_off = (tctx->ipver == 4) ? (14 + 20 + 6) : (14 + 40 + 6);
+        bpf_l4_csum_replace(skb, csum_off, 0, 0, BPF_F_MARK_ENFORCE);
+    }
+
     bpf_debug("TC egress QUIC long: wg_type=%d port=%d", wg_type, tunnel_port);
     return bpf_redirect(cfg->egress_ifindex, 0);
 }
