@@ -773,12 +773,6 @@ int gut_egress(struct __sk_buff *skb)
         stats->bytes_processed += (__u64)skb->len;
     }
 
-    /* Stamp the packet so netfilter can skip masquerade/NAT on the wrapped
-     * GUT frame.  BPF has already computed the final UDP checksum using the
-     * saddr we just wrote; if NAT rules perform an incremental checksum
-     * update the value on the wire becomes wrong. */
-    skb->mark = GUT_SKB_MARK;
-
     bpf_debug("TC egress: wg_type=%d outer_hdr=%d pad=%d port=%d", wg_type, outer_hdr_len, pad_len, tunnel_port);
     return bpf_redirect(cfg->egress_ifindex, 0);
 }
@@ -1067,9 +1061,6 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
         stats->bytes_processed += (__u64)skb->len;
     }
 
-    /* Mark wrapped GUT frame so netfilter masquerade rules can skip it. */
-    skb->mark = GUT_SKB_MARK;
-
     bpf_debug("TC egress SIP signal: wg_type=%d port=%d", wg_type, tunnel_port);
     return bpf_redirect(cfg->egress_ifindex, 0);
 }
@@ -1253,9 +1244,6 @@ int gut_egress_quic_long(struct __sk_buff *skb)
         stats->packets_egress++;
         stats->bytes_processed += (__u64)skb->len;
     }
-
-    /* Mark wrapped GUT frame so netfilter masquerade rules can skip it. */
-    skb->mark = GUT_SKB_MARK;
 
     bpf_debug("TC egress QUIC long: wg_type=%d port=%d", wg_type, tunnel_port);
     return bpf_redirect(cfg->egress_ifindex, 0);

@@ -97,13 +97,6 @@
 /* Offload capability flags (set by loader) */
 #define GUT_FLAG_NEED_L4_CSUM (1U << 0) /* finalize inner L4 csum when ip_summed==CHECKSUM_PARTIAL */
 
-/* skb->mark stamp applied by TC egress right before bpf_redirect.
- * Identifies packets already wrapped by gutd so that netfilter rules
- * (e.g. masquerade on eth0) can skip them.  Without this, NAT rules
- * perform incremental checksum updates against the full UDP checksum
- * already computed by BPF, corrupting the packet on the wire. */
-#define GUT_SKB_MARK 0x47554F42u /* ASCII "GUOB" — GUT OBfuscator */
-
 /* GUT protocol configuration (shared between Rust loader and eBPF) */
 struct gut_config
 {
