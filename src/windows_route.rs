@@ -207,17 +207,36 @@ fn enumerate_viable_uplinks() -> Result<Vec<(u64, String)>, String> {
     }
 
     let mut out = Vec::new();
+    // SAFETY: `GetIfTable2` returned NO_ERROR and a non-null pointer above,
+    // so `table_ptr` points to a valid `MIB_IF_TABLE2` whose lifetime ends
+    // at the matching `FreeMibTable` call below. We use raw-pointer field
+    // access (`addr_of!`) instead of materialising `&MIB_IF_TABLE2`, because
+    // the struct ends in a flexible array (`Table: [MIB_IF_ROW2; ANYSIZE]`)
+    // and creating a reference to it would be unsound. Each row pointer is
+    // bounds-checked against `NumEntries` returned by the OS.
+    //
+    // lgtm[rust/access-invalid-pointer]
+    // codeql[rust/access-invalid-pointer]: GetIfTable2 contract guarantees
+    //   `table_ptr` is valid until FreeMibTable; flexible-array rows are
+    //   accessed via addr_of! and bounded by OS-reported NumEntries.
     unsafe {
-        let num = (*table_ptr).NumEntries as usize;
-        let rows = (*table_ptr).Table.as_ptr();
-        for i in 0..num {
-            let row: &MIB_IF_ROW2 = &*rows.add(i);
-            if !is_viable_uplink(row) {
-                continue;
+        use std::ptr::addr_of;
+        let num = std::ptr::read(addr_of!((*table_ptr).NumEntries)) as usize;
+        let rows: *const MIB_IF_ROW2 = addr_of!((*table_ptr).Table) as *const MIB_IF_ROW2;
+        if !rows.is_null() {
+            for i in 0..num {
+                let row_ptr = rows.add(i);
+                if row_ptr.is_null() {
+                    continue;
+                }
+                let row: &MIB_IF_ROW2 = &*row_ptr;
+                if !is_viable_uplink(row) {
+                    continue;
+                }
+                let alias = utf16_to_string(&row.Alias);
+                let luid = row.InterfaceLuid.Value;
+                out.push((luid, alias));
             }
-            let alias = utf16_to_string(&row.Alias);
-            let luid = row.InterfaceLuid.Value;
-            out.push((luid, alias));
         }
         FreeMibTable(table_ptr as *mut _);
     }
