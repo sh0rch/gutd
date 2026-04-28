@@ -461,8 +461,27 @@ int gut_egress(struct __sk_buff *skb)
     __u32 room = outer_hdr_len;
 #endif
 
-    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, 0) < 0)
+    /* v44 header-offset fix applied: tell bpf_skb_adjust_room() we are
+     * building an outer UDP tunnel header so the kernel refreshes skb
+     * network/transport header metadata for the encapsulated packet. */
+    if (ipver == 4)
+    {
+        if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC,
+                                BPF_F_ADJ_ROOM_ENCAP_L3_IPV4 |
+                                    BPF_F_ADJ_ROOM_ENCAP_L4_UDP) < 0)
+            return TC_ACT_OK;
+    }
+    else if (ipver == 6)
+    {
+        if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC,
+                                BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 |
+                                    BPF_F_ADJ_ROOM_ENCAP_L4_UDP) < 0)
+            return TC_ACT_OK;
+    }
+    else
+    {
         return TC_ACT_OK;
+    }
 
     if (bpf_skb_pull_data(skb, skb->len) < 0)
         return TC_ACT_OK;
@@ -879,8 +898,27 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
     }
 
     /* ── Adjust packet size and shift IP/UDP headers ── */
-    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, 0) < 0)
+    /* v44 header-offset fix applied: tell bpf_skb_adjust_room() we are
+     * building an outer UDP tunnel header so the kernel refreshes skb
+     * network/transport header metadata for the encapsulated packet. */
+    if (ipver == 4)
+    {
+        if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC,
+                                BPF_F_ADJ_ROOM_ENCAP_L3_IPV4 |
+                                    BPF_F_ADJ_ROOM_ENCAP_L4_UDP) < 0)
+            return TC_ACT_OK;
+    }
+    else if (ipver == 6)
+    {
+        if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC,
+                                BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 |
+                                    BPF_F_ADJ_ROOM_ENCAP_L4_UDP) < 0)
+            return TC_ACT_OK;
+    }
+    else
+    {
         return TC_ACT_OK;
+    }
 
     if (bpf_skb_pull_data(skb, skb->len) < 0)
         return TC_ACT_OK;

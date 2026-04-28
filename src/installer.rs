@@ -370,6 +370,7 @@ fn set_mode(path: &Path, mode: u32) {
     }
 }
 
+#[cfg(target_family = "unix")]
 fn remove_file(path: &str) -> bool {
     let p = Path::new(path);
     if !p.exists() {
@@ -528,8 +529,11 @@ pub fn run_uninstall() -> ! {
 
     let mut actions: Vec<String> = Vec::new();
 
-    // 1. Stop and delete service
+    // 1. Stop service and wait until it really is STOPPED (sc.exe stop is async).
     run_cmd_ignore("sc.exe", &["stop", SERVICE_NAME]);
+    wait_service_stopped(SERVICE_NAME, std::time::Duration::from_secs(10));
+
+    // 2. Delete service
     let del_result = Command::new("sc.exe")
         .args(["delete", SERVICE_NAME])
         .status();
@@ -544,12 +548,39 @@ pub fn run_uninstall() -> ! {
         }
     }
 
-    // 2. Remove binary
-    if remove_file(BIN_PATH) {
-        actions.push(format!("removed   → {BIN_PATH}"));
+    // 3. Remove binary. If that's the currently running exe, schedule a
+    //    detached deletion (Windows refuses to unlink a running image).
+    let bin_path = Path::new(BIN_PATH);
+    let self_exe = std::env::current_exe().ok();
+    let is_self = match (&self_exe, bin_path.canonicalize().ok()) {
+        (Some(a), Some(b)) => a == &b,
+        _ => false,
+    };
+
+    if bin_path.exists() {
+        if is_self {
+            schedule_self_delete(BIN_PATH);
+            actions.push(format!(
+                "scheduled → {BIN_PATH} (deleted after this process exits)"
+            ));
+        } else {
+            match fs::remove_file(bin_path) {
+                Ok(()) => actions.push(format!("removed   → {BIN_PATH}")),
+                Err(e) if e.raw_os_error() == Some(5) => {
+                    // ERROR_ACCESS_DENIED — likely file is locked by another process.
+                    schedule_self_delete(BIN_PATH);
+                    actions.push(format!(
+                        "scheduled → {BIN_PATH} (locked, will be removed shortly)"
+                    ));
+                }
+                Err(e) => {
+                    actions.push(format!("failed    → {BIN_PATH} ({e})"));
+                }
+            }
+        }
     }
 
-    // 3. Config is kept intentionally
+    // 4. Config is kept intentionally
     if Path::new(CONFIG_PATH).exists() {
         actions.push(format!(
             "preserved → {CONFIG_PATH} (remove manually if desired)"
@@ -568,4 +599,56 @@ pub fn run_uninstall() -> ! {
     }
     println!();
     std::process::exit(0);
+}
+
+/// Poll `sc query <name>` until STATE is 1 (STOPPED) or until timeout.
+/// Ignores errors; this is best-effort.
+#[cfg(target_family = "windows")]
+fn wait_service_stopped(name: &str, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let out = Command::new("sc.exe").args(["query", name]).output();
+        match out {
+            Ok(o) => {
+                let s = String::from_utf8_lossy(&o.stdout);
+                // Service not found → done.
+                if !o.status.success() {
+                    return;
+                }
+                // Look for "STATE              : 1  STOPPED"
+                if s.lines().any(|l| {
+                    let l = l.trim();
+                    l.starts_with("STATE") && l.contains(" 1 ")
+                }) {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Launch a detached `cmd.exe` that waits ~2 s and then deletes `path`.
+/// Used when the file is the currently running image or is otherwise locked.
+#[cfg(target_family = "windows")]
+fn schedule_self_delete(path: &str) {
+    use std::os::windows::process::CommandExt;
+    // CREATE_NO_WINDOW | DETACHED_PROCESS
+    const FLAGS: u32 = 0x0800_0000 | 0x0000_0008;
+    // ping is a reliable ~2 s delay that exists on every Windows install.
+    let cmdline = format!(
+        "ping 127.0.0.1 -n 3 >NUL & del /F /Q \"{path}\"",
+        path = path
+    );
+    let _ = Command::new("cmd.exe")
+        .args(["/C", &cmdline])
+        .creation_flags(FLAGS)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
