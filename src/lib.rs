@@ -13,3 +13,7 @@ pub mod tun;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub mod userspace;
+#[cfg(target_os = "windows")]
+pub mod windows_route;
+#[cfg(target_os = "windows")]
+pub mod windows_wfp;

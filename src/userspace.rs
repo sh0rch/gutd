@@ -1135,12 +1135,94 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         Some(format!("{}:{}", peer_ip_str, peer_port).parse()?)
     };
 
+    // Windows only: pin a /32 (or /128) host-route to the peer through the
+    // best *physical* uplink so our UDP never leaks into another VPN
+    // (WireGuard/OpenVPN/Tailscale wintun adapters). If the user did not set
+    // `bind_ip` explicitly we also adopt the OS-chosen source address.
+    //
+    // Scope: client mode only (server is Linux-only anyway), static peer only
+    // (dynamic peer is only used by the server side).
+    //
+    // Any failure is non-fatal — we log and continue with system routing.
+    #[cfg(target_os = "windows")]
+    let _pinned_route = if !is_server && !dynamic_peer {
+        if let Some(addr) = remote_peer_addr {
+            // Elevation check first — both the route pin and the WFP
+            // bypass below need Administrator. Exits the process with a
+            // friendly message if we are not elevated.
+            crate::windows_wfp::ensure_admin();
+
+            match crate::windows_route::pin_route_to_peer(addr.ip()) {
+                Ok(pr) => Some(pr),
+                Err(e) => {
+                    eprintln!("gutd: WARN — route pin skipped: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Windows only: install a WFP PERMIT filter scoped to gutd.exe so our
+    // outbound UDP is not dropped by WireGuard-Windows' "block untunneled
+    // traffic" rules when the user's profile has AllowedIPs = 0.0.0.0/0.
+    // This keeps the wg profile untouched.
+    //
+    // Watchdog lives inside `WfpBypass` — if the filter goes missing (wg
+    // re-install, BFE restart) it is re-added automatically. After
+    // MAX_CONSECUTIVE_FAILURES unrecoverable errors the watchdog exits the
+    // process with code 2 so the service manager restarts gutd.
+    //
+    // We hard-fail here (return Err) rather than warn: without the bypass
+    // the obfuscated UDP is guaranteed to be dropped by WFP and the user
+    // would only see "no handshake" with no hint of why.
+    #[cfg(target_os = "windows")]
+    let _wfp_bypass = if !is_server && !dynamic_peer && remote_peer_addr.is_some() {
+        match crate::windows_wfp::install_for_self() {
+            Ok(b) => Some(b),
+            Err(e) => {
+                return Err(format!(
+                    "gutd: WFP bypass install failed: {} \
+                     (is the Base Filtering Engine service running? are we Admin?)",
+                    e
+                )
+                .into());
+            }
+        }
+    } else {
+        None
+    };
+
+    // Effective bind IP: on Windows, if user left it unspecified, use the
+    // source address the OS would pick via the pinned uplink. This also
+    // guarantees strong-host-model consistency with the pinned route.
+    let effective_bind_ip: std::net::IpAddr = {
+        #[cfg(target_os = "windows")]
+        {
+            if peer.bind_ip.is_unspecified() {
+                match _pinned_route.as_ref() {
+                    Some(pr) => pr.source,
+                    None => peer.bind_ip,
+                }
+            } else {
+                peer.bind_ip
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            peer.bind_ip
+        }
+    };
+
     let sock_buf_size = adaptive_socket_buf_size();
 
     // ext_sockets: GUT traffic to/from remote peer (bound to all configured ports).
     let mut ext_sockets = Vec::new();
     for &port in &peer.ports {
-        let ext_addr = SocketAddr::new(peer.bind_ip, port);
+        let ext_addr = SocketAddr::new(effective_bind_ip, port);
         let ext_socket = Arc::new(UdpSocket::bind(ext_addr)?);
         tune_udp_buffers(&ext_socket, sock_buf_size);
         disable_df(&ext_socket);
@@ -1230,15 +1312,24 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     {
                         if !is_server {
                             if let Some(dest) = remote_peer_addr {
-                                let _ = egress_exts[0].send_to(&ka_pkt, dest);
+                                let n = egress_exts[0].send_to(&ka_pkt, dest);
+                                eprintln!("[gutd/egress] idle-KA → {} result={:?}", dest, n);
                             }
                         }
                         continue;
                     }
-                    Err(_) => continue,
+                    Err(e) => {
+                        eprintln!("[gutd/egress] recv_from error: {}", e);
+                        continue;
+                    }
                 };
                 #[cfg(not(target_os = "linux"))]
                 let buf: &mut [u8] = &mut recv_buf[..];
+                #[cfg(not(target_os = "linux"))]
+                eprintln!(
+                    "[gutd/egress] got {} B from WG (src={}) type=0x{:02x}",
+                    size, src, buf[0]
+                );
 
                 // Client: always track WG peer address (handles port changes, NAT rebind)
                 if !is_server {
@@ -1381,7 +1472,14 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                             &buf[..new_size]
                         };
 
-                        let _ = egress_exts[sock_idx].send_to(final_buf, final_dest);
+                        let r = egress_exts[sock_idx].send_to(final_buf, final_dest);
+                        eprintln!(
+                            "[gutd/egress] send {} B → {} via sock[{}] result={:?}",
+                            final_buf.len(),
+                            final_dest,
+                            sock_idx,
+                            r
+                        );
                     }
                 }
             }
