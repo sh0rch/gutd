@@ -467,8 +467,8 @@ pub fn obfs_encap(
         write_quic_short_header(buf, dcid, ppn, enc_ports, pad_len);
     } else {
         write_quic_long_header(
-            buf, wg_type, wg_idx, dcid, ppn, enc_ports, pad_len, orig_len, wg_off, &pad_block,
-            sip_domain,
+            buf, wg_type, wg_idx, ppn, enc_ports, pad_len, orig_len, wg_off, &pad_block,
+            sip_domain, key, rounds,
         );
     }
 
@@ -511,7 +511,6 @@ fn write_quic_long_header(
     buf: &mut [u8],
     wg_type: u8,
     wg_idx: u32,
-    dcid: u32,
     ppn: u32,
     enc_ports: u32,
     pad_len: usize,
@@ -519,16 +518,17 @@ fn write_quic_long_header(
     wg_off: usize,
     pad_block: &[u8; 64],
     sip_domain: &str,
+    key_init: &[u32; 12],
+    rounds: u8,
 ) {
-    // 0xC3 = QUIC Initial (client Type 1) with 4-byte PN, 0xF0 = QUIC Retry (Cookie Reply Type 3)
-    buf[0] = if wg_type == 3 { 0xF0 } else { 0xC3 };
+    // 0xC3 = QUIC Initial (client Type 1) with 4-byte PN, 0xF3 = QUIC Retry (Cookie Reply Type 3)
+    buf[0] = if wg_type == 3 { 0xF3 } else { 0xC3 };
     buf[1] = 0x00;
     buf[2] = 0x00;
     buf[3] = 0x00;
     buf[4] = 0x01; // QUIC v1
 
     // Use the middle/end part of the (already masked) WG payload as entropy for the Long Header.
-    // This avoids double-encryption and looks more random to DPI.
     let mut entropy_source = [0u8; 32];
     if orig_len >= 64 {
         entropy_source.copy_from_slice(&buf[wg_off + 32..wg_off + 64]);
@@ -543,46 +543,46 @@ fn write_quic_long_header(
     let time_gut = t_ns.wrapping_mul(0x9E3779B9u32).rotate_left(13);
     let gut_b = time_gut.to_le_bytes();
 
-    let head = (GUT_QUIC_LONG_HEADER_SIZE / 2).min(200);
-    for i in 1..head {
-        buf[i] = entropy_source[i & 31] ^ gut_b[i & 3];
-    }
-    // Fill the rest with combination of entropy and pad_block
-    for i in head..(GUT_QUIC_LONG_HEADER_SIZE - 1) {
-        buf[i] = pad_block[(i * 13) & 0x3F] ^ entropy_source[i & 31] ^ gut_b[(i >> 2) & 3];
+    // Fill with PRNG (matches BPF behaviour: pad_block ^ gut_bytes)
+    for i in 1..(GUT_QUIC_LONG_HEADER_SIZE - 1) {
+        buf[i] = pad_block[(i * 13) & 0x3F] ^ gut_b[i & 3];
     }
 
+    buf[0] = if wg_type == 3 { 0xF3 } else { 0xC3 };
     buf[1] = 0x00;
     buf[2] = 0x00;
     buf[3] = 0x00;
     buf[4] = 0x01; // QUIC v1
 
-    let dcid2 = (wg_idx ^ 0xDEADBEEF).wrapping_mul(0x9E3779B9u32);
-    let scid = (wg_idx ^ 0xCAFEBABE).wrapping_mul(0x6C62272Eu32);
+    // DCID = fixed key-derived value (ChaCha block 99, nonce 0) — same as cfg->quic_dcid in BPF.
+    // Must match the AEAD key derivation so DPI (nDPI, Wireshark) can decrypt the CRYPTO frame
+    // and see the fake SNI. That is the whole point of using Long Header.
+    let ks99 = crate::proto::mask_balanced::chacha_block_fast(key_init, 99, 0, rounds);
+    let mut fixed_dcid = [0u8; 8];
+    fixed_dcid[0..4].copy_from_slice(&ks99[0].to_le_bytes());
+    fixed_dcid[4..8].copy_from_slice(&ks99[1].to_le_bytes());
+
+    buf[5] = 0x08; // DCID length 8
+    buf[6..14].copy_from_slice(&fixed_dcid);
+
+    // SCID: PPN unmasked in [15..19] for BPF ingress fast-path (quic+15)
+    buf[14] = 0x08; // SCID length 8
+    buf[15..19].copy_from_slice(&ppn.to_le_bytes());
     let scid2 = sip_hash32(
         wg_idx ^ 0x12345678,
         &[0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5],
     );
-
-    let mut actual_dcid = [0u8; 8];
-    actual_dcid[0..4].copy_from_slice(&dcid.to_le_bytes());
-    actual_dcid[4..8].copy_from_slice(&dcid2.to_le_bytes());
-
-    buf[5] = 0x08; // DCID length 8
-    buf[6..14].copy_from_slice(&actual_dcid);
-    buf[14] = 0x08; // SCID length 8
-    buf[15..19].copy_from_slice(&scid.to_le_bytes());
     buf[19..23].copy_from_slice(&scid2.to_le_bytes());
 
-    buf[23] = 0x04; // Token length 4
-    buf[24..28].copy_from_slice(&enc_ports.to_le_bytes()); // Hide enc_ports in Token
+    // Token: enc_ports (readable without AEAD, matches BPF Token field)
+    buf[23] = 0x04;
+    buf[24..28].copy_from_slice(&enc_ports.to_le_bytes());
 
-    // --- Build CRYPTO frame with TLS 1.3 ClientHello containing SNI ---
-    let initial_secret = crate::proto::quic::derive_quic_initial_secret(&actual_dcid);
+    let initial_secret = crate::proto::quic::derive_quic_initial_secret(&fixed_dcid);
     let client_secret = crate::proto::quic::derive_client_initial_secret(&initial_secret);
     let (q_key, q_iv, q_hp) = crate::proto::quic::derive_quic_keys(&client_secret);
 
-    let sni_pos = 34; // Immediately after PPN (pn_offset + 4 = 30 + 4)
+    let sni_pos = 34; // Immediately after PN (pn_offset=30, PN=4 bytes → payload at 34)
     let mut crypto_frame = [0u8; 128];
 
     let domain_bytes = sip_domain.as_bytes();
@@ -618,7 +618,7 @@ fn write_quic_long_header(
     // Legacy version 0x0303
     crypto_frame[8] = 0x03;
     crypto_frame[9] = 0x03;
-    // Random: 32 bytes [10..42]
+    // Random: 32 bytes
     for i in 0..32 {
         crypto_frame[10 + i] = entropy_source[i & 31];
     }
@@ -654,21 +654,21 @@ fn write_quic_long_header(
     }
     // ALPN Extension (type 0x0010) with "h3"
     crypto_frame[ext_off] = 0x00;
-    crypto_frame[ext_off + 1] = 0x10; // ALPN type
+    crypto_frame[ext_off + 1] = 0x10;
     crypto_frame[ext_off + 2] = 0x00;
-    crypto_frame[ext_off + 3] = 0x05; // ext data len: list_len(2) + proto_len(1) + "h3"(2)
+    crypto_frame[ext_off + 3] = 0x05;
     crypto_frame[ext_off + 4] = 0x00;
-    crypto_frame[ext_off + 5] = 0x03; // ALPN list len: proto_len(1) + "h3"(2)
-    crypto_frame[ext_off + 6] = 0x02; // proto string len
+    crypto_frame[ext_off + 5] = 0x03;
+    crypto_frame[ext_off + 6] = 0x02;
     crypto_frame[ext_off + 7] = b'h';
     crypto_frame[ext_off + 8] = b'3';
     ext_off += alpn_ext_total;
     // supported_versions Extension (type 0x002b)
     crypto_frame[ext_off] = 0x00;
-    crypto_frame[ext_off + 1] = 0x2b; // supported_versions type
+    crypto_frame[ext_off + 1] = 0x2b;
     crypto_frame[ext_off + 2] = 0x00;
-    crypto_frame[ext_off + 3] = 0x03; // ext data len: list_len(1) + version(2)
-    crypto_frame[ext_off + 4] = 0x02; // list length
+    crypto_frame[ext_off + 3] = 0x03;
+    crypto_frame[ext_off + 4] = 0x02;
     crypto_frame[ext_off + 5] = 0x03;
     crypto_frame[ext_off + 6] = 0x04; // TLS 1.3 = 0x0304
 
@@ -704,7 +704,8 @@ fn write_quic_long_header(
     );
     buf[sni_pos + crypto_frame_total..sni_pos + crypto_frame_total + 16].copy_from_slice(&gcm_tag);
 
-    // Header Protection (RFC 9001 §5.4)
+    // Header Protection (RFC 9001 §5.4) — cosmetic, for DPI evasion only
+    // BPF ingress does NOT verify HP; PPN is read directly from SCID[0..4] = buf[15..19]
     let hp_rk = crate::crypto::aes128_expand_key(&q_hp);
     let mut hp_mask = [0u8; 16];
     crate::crypto::aes128_encrypt_block(
@@ -713,7 +714,7 @@ fn write_quic_long_header(
         &mut hp_mask,
     );
 
-    // Write PPN in big-endian, then mask with HP
+    // Write PPN in big-endian at [30..34], then mask with HP (cosmetic)
     buf[30..34].copy_from_slice(&ppn_be);
     buf[0] ^= hp_mask[0] & 0x0F;
     for i in 0..4 {
@@ -803,33 +804,16 @@ pub fn obfs_verify(
         let pkt_ppn = u32::from_le_bytes(buf[6..10].try_into().unwrap());
         pkt_dcid == expected_dcid && pkt_ppn == expected_ppn
     } else {
-        let mut actual_dcid = [0u8; 8];
-        actual_dcid.copy_from_slice(&buf[6..14]);
-        let initial_secret = crate::proto::quic::derive_quic_initial_secret(&actual_dcid);
-        let client_secret = crate::proto::quic::derive_client_initial_secret(&initial_secret);
-        let (_q_key, _q_iv, q_hp) = crate::proto::quic::derive_quic_keys(&client_secret);
-
-        let hp_rk = crate::crypto::aes128_expand_key(&q_hp);
-        let mut hp_mask = [0u8; 16];
-        let sni_pos = 34; // Sample starts directly after PPN
-        crate::crypto::aes128_encrypt_block(
-            &hp_rk,
-            &buf[sni_pos..sni_pos + 16].try_into().unwrap(),
-            &mut hp_mask,
-        );
-
-        let fb_unmasked = buf[0] ^ (hp_mask[0] & 0x0F);
-        if (fb_unmasked & 0x80) == 0 {
+        // Long Header: DCID at [6..14] = fixed key-derived (cfg->quic_dcid).
+        // PPN stored unmasked at SCID[0..4] = [15..19] for fast ingress verification.
+        if buf.len() < 20 {
             return false;
         }
-
-        // Use wrapping logic or direct bit logic instead of mutating buf!
-        // PPN is stored in big-endian (RFC 9000 §17.1), so read as BE
-        let pkt_ppn = u32::from_be_bytes(buf[30..34].try_into().unwrap())
-            ^ u32::from_be_bytes(hp_mask[1..5].try_into().unwrap());
+        let ks99 = chacha_block_fast(key, 99, 0, rounds);
+        let expected_fixed_dcid = u32::from_le_bytes(ks99[0].to_le_bytes());
         let pkt_dcid = u32::from_le_bytes(buf[6..10].try_into().unwrap());
-
-        pkt_dcid == expected_dcid && pkt_ppn == expected_ppn
+        let pkt_ppn = u32::from_le_bytes(buf[15..19].try_into().unwrap());
+        pkt_dcid == expected_fixed_dcid && pkt_ppn == expected_ppn
     }
 }
 

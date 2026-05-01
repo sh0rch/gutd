@@ -126,7 +126,7 @@ NDPI_SERVER_IP="10.100.2.2"         # ndpi's server-side interface
 SERVER_IP="10.100.2.3"
 
 # GUT tunnel /30 (inside the tunnel)
-# Convention: odd = responder/server, even = initiator/client
+# Convention: odd = initiator/client, even = responder/server
 GUT_RELAY_ADDR="10.254.0.2/30"
 GUT_RELAY_TUN_IP="10.254.0.2"
 GUT_SERVER_ADDR="10.254.0.1/30"

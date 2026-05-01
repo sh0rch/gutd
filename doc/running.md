@@ -48,7 +48,6 @@ maps without detaching hooks or recreating the veth pair.
 
 ```ini
 [peer]
-responder = true
 address = 10.47.0.1/30
 peer_ip = 10.0.0.2
 ports = 41000,41001,41002,41003
@@ -65,7 +64,7 @@ ports = 41000,41001,41002,41003
 key = <shared key>
 ```
 
-Convention: server (responder) gets an **odd** tunnel address, client gets **even**.
+Convention: server (responder) gets an **odd** tunnel address (`.1`), client (initiator) gets **even** (`.2`).
 If `address` is omitted, it is auto-assigned following this rule.
 
 Only `peer_ip`, `ports`, and `key` are required. `bind_ip` defaults to `0.0.0.0`

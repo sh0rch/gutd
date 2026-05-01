@@ -2468,7 +2468,9 @@ static __always_inline void write_quic_long_header(__u8 *quic, void *data_end, _
     quic[3] = 0x00;
     quic[4] = 0x01; /* QUIC v1 */
 
-    /* Fixed DCID from config (precomputed, QUIC keys derived from it) */
+    /* DCID = cfg->quic_dcid (8 bytes, derived from shared key via ChaCha block 99).
+     * Must match AEAD key derivation so DPI tools (e.g. nDPI) can decrypt the
+     * CRYPTO frame and verify the fake SNI — that is the whole point of Long Header. */
     quic[5] = 0x08;
     __builtin_memcpy(quic + 6, cfg->quic_dcid, 8);
 
