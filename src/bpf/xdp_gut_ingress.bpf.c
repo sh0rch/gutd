@@ -611,15 +611,17 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     }
     else
     {
-        /* Long Header: DCID is fixed from config (precomputed for QUIC key derivation) */
+        /* Long Header: DCID = cfg->quic_dcid (fixed, key-derived).
+         * Must match AEAD key derivation so DPI (nDPI) can decrypt the CRYPTO frame
+         * and see the fake SNI. PPN is stored unmasked in SCID[0..3] (quic+15). */
+        if (quic[5] != 0x08) // DCID length 8
+            return -1;
+
         __u32 pkt_dcid = 0;
         __builtin_memcpy(&pkt_dcid, quic + 6, 4);
         __u32 cfg_dcid = 0;
         __builtin_memcpy(&cfg_dcid, cfg->quic_dcid, 4);
         if (pkt_dcid != cfg_dcid)
-            return -1;
-
-        if (quic[5] != 0x08) // DCID length 8
             return -1;
 
         /* PPN stored unmasked in SCID[0..3] (quic+15) by egress for fast ingress path */

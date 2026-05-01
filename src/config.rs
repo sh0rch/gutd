@@ -150,6 +150,7 @@ pub fn load_config_from_env() -> Result<Config> {
         .map(|v| v == "true" || v == "1");
 
     // Resolve responder: explicit > address parity > dynamic_peer
+    // Convention: odd last octet → responder (server, e.g. .1); even → initiator (client, e.g. .2)
     let responder = if let Some(r) = responder_opt {
         r
     } else if let Some(ref addr) = address_opt {
@@ -362,7 +363,7 @@ impl PeerBuilder {
     fn build(self, outer_mtu: u16, peer_index: usize) -> Result<PeerConfig> {
         // Resolve responder role:
         //   1. Explicit `responder = true/false` wins
-        //   2. If address is set, derive from last-octet parity (odd = responder)
+        //   2. If address is set, derive from last-octet parity (odd = responder, even = initiator)
         //   3. dynamic_peer implies responder (server side)
         //   4. Default: initiator (false)
         let responder = if let Some(r) = self.responder {
@@ -795,7 +796,7 @@ key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 ";
         let config = parse_config(content).unwrap();
         assert!(config.peer().dynamic_peer);
-        assert!(config.peer().responder); // 10.0.0.1 → odd → responder
+        assert!(config.peer().responder); // dynamic_peer → responder
         assert_eq!(
             config.peer().peer_ip,
             "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
@@ -815,7 +816,7 @@ key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 ";
         let config = parse_config(content).unwrap();
         assert!(config.peer().responder);
-        assert_eq!(config.peer().address, "10.47.0.1/30");
+        assert_eq!(config.peer().address, "10.47.0.2/30");
     }
 
     #[test]
@@ -830,7 +831,7 @@ key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 ";
         let config = parse_config(content).unwrap();
         assert!(config.peer().responder);
-        assert_eq!(config.peer().address, "10.47.0.1/30");
+        assert_eq!(config.peer().address, "10.47.0.2/30");
     }
 
     #[test]
@@ -845,7 +846,7 @@ key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 ";
         let config = parse_config(content).unwrap();
         assert!(!config.peer().responder);
-        assert_eq!(config.peer().address, "10.47.0.2/30");
+        assert_eq!(config.peer().address, "10.47.0.1/30");
     }
 
     #[test]
@@ -860,7 +861,7 @@ ports = 41000
 key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 ";
         let config = parse_config(content).unwrap();
-        assert!(config.peer().responder); // .1 is odd
+        assert!(config.peer().responder); // .1 is odd → responder (server)
         assert_eq!(config.peer().address, "10.0.0.1/30");
     }
 }
