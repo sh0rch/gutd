@@ -816,7 +816,7 @@ key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 ";
         let config = parse_config(content).unwrap();
         assert!(config.peer().responder);
-        assert_eq!(config.peer().address, "10.47.0.2/30");
+        assert_eq!(config.peer().address, "10.47.0.1/30");
     }
 
     #[test]
@@ -831,7 +831,7 @@ key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 ";
         let config = parse_config(content).unwrap();
         assert!(config.peer().responder);
-        assert_eq!(config.peer().address, "10.47.0.2/30");
+        assert_eq!(config.peer().address, "10.47.0.1/30");
     }
 
     #[test]
@@ -846,7 +846,7 @@ key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 ";
         let config = parse_config(content).unwrap();
         assert!(!config.peer().responder);
-        assert_eq!(config.peer().address, "10.47.0.1/30");
+        assert_eq!(config.peer().address, "10.47.0.2/30");
     }
 
     #[test]
