@@ -8,6 +8,37 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::proto::feistel::sip_hash32;
 use crate::proto::mask_balanced::{chacha_block_fast, chacha_init};
 
+/// Bind a UDP socket. On Windows, if WSAEACCES (10013) is returned we annotate
+/// the error with the most likely cause (Hyper-V/WinNAT excluded port range)
+/// and the exact `netsh` commands the user can run to reserve the port.
+fn bind_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    match UdpSocket::bind(addr) {
+        Ok(s) => Ok(s),
+        #[cfg(target_os = "windows")]
+        Err(e) if e.raw_os_error() == Some(10013) => {
+            eprintln!(
+                "\ngutd: ERROR — cannot bind UDP {} (WSAEACCES / 10013).\n\
+                 gutd: This port is in a Windows excluded port range \
+                 (reserved by Hyper-V / WSL2 / Docker / WinNAT).\n\
+                 gutd: Check with:\n\
+                 gutd:     netsh int ipv4 show excludedportrange protocol=udp\n\
+                 gutd: Workaround — reserve the port for gutd (run as Administrator):\n\
+                 gutd:     net stop winnat\n\
+                 gutd:     netsh int ipv4 add excludedportrange protocol=udp \
+                 startport={} numberofports=1 store=persistent\n\
+                 gutd:     net start winnat\n\
+                 gutd: (If winnat won't stop, run `wsl --shutdown` first.)\n\
+                 gutd: Alternatively, change `ports` in gutd.conf to a port \
+                 outside the excluded ranges.",
+                addr,
+                addr.port()
+            );
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 const GUT_QUIC_SHORT_HEADER_SIZE: usize = 16;
 const GUT_HEADER_SIZE: usize = 10;
 const GUT_QUIC_LONG_HEADER_SIZE: usize = 1200;
@@ -1168,12 +1199,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         match crate::windows_wfp::install_for_self() {
             Ok(b) => Some(b),
             Err(e) => {
-                return Err(format!(
-                    "gutd: WFP bypass install failed: {} \
-                     (is the Base Filtering Engine service running? are we Admin?)",
-                    e
-                )
-                .into());
+                return Err(format!("gutd: WFP watchdog spawn failed: {}", e).into());
             }
         }
     } else {
@@ -1207,7 +1233,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let mut ext_sockets = Vec::new();
     for &port in &peer.ports {
         let ext_addr = SocketAddr::new(effective_bind_ip, port);
-        let ext_socket = Arc::new(UdpSocket::bind(ext_addr)?);
+        let ext_socket = Arc::new(bind_udp(ext_addr)?);
         tune_udp_buffers(&ext_socket, sock_buf_size);
         disable_df(&ext_socket);
         println!("Listening (ext) on {}", ext_addr);
@@ -1222,7 +1248,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     } else {
         SocketAddr::new(peer.bind_ip, peer.bind_port)
     };
-    let local_socket = Arc::new(UdpSocket::bind(local_bind)?);
+    let local_socket = Arc::new(bind_udp(local_bind)?);
     tune_udp_buffers(&local_socket, sock_buf_size);
     disable_df(&local_socket);
     println!("Local WG-facing socket on {}", local_bind);
@@ -1297,6 +1323,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         if !is_server {
                             if let Some(dest) = remote_peer_addr {
                                 let n = egress_exts[0].send_to(&ka_pkt, dest);
+                                #[cfg(debug_assertions)]
                                 eprintln!("[gutd/egress] idle-KA → {} result={:?}", dest, n);
                             }
                         }
@@ -1309,7 +1336,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                 };
                 #[cfg(not(target_os = "linux"))]
                 let buf: &mut [u8] = &mut recv_buf[..];
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(debug_assertions)]
                 eprintln!(
                     "[gutd/egress] got {} B from WG (src={}) type=0x{:02x}",
                     size, src, buf[0]
@@ -1328,6 +1355,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                 } else if size >= 4 {
                     let wg_type = buf[0] & 0x1F;
                     if wg_type == 1 {
+                        #[cfg(debug_assertions)]
                         eprintln!("[gutd] dropping server-initiated Type 1 rekey (dynamic mode)");
                         None
                     } else if wg_type == 2 && size >= 12 {
@@ -1447,6 +1475,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                     .copy_from_slice(&sip_buf[..sip_header_len]);
 
                                 final_dest.set_port(peer.ports[0]);
+                                #[cfg(debug_assertions)]
                                 println!("[gutd] sending SIP to port {}", peer.ports[0]);
                                 sock_idx = 0;
 
@@ -1457,6 +1486,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         };
 
                         let r = egress_exts[sock_idx].send_to(final_buf, final_dest);
+                        #[cfg(debug_assertions)]
                         eprintln!(
                             "[gutd/egress] send {} B → {} via sock[{}] result={:?}",
                             final_buf.len(),
