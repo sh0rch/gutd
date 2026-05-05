@@ -60,6 +60,7 @@ jobs:
   evasion-test:
     name: "${{ matrix.mode }} (userspace)"
     needs: [build, ndpi-build]
+    if: ${{ !cancelled() && needs.ndpi-build.result == 'success' }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false

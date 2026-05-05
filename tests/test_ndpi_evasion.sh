@@ -263,8 +263,19 @@ RESULTS_FILE="/tmp/ndpi_results.txt"
 ndpiReader -v2 -i $PCAP_FILE > $RESULTS_FILE
 
 echo ""
-echo "=== nDPI classification (mode: ${OBFS_MODE}) ==="
-cat $RESULTS_FILE
+echo "=== nDPI flows (mode: ${OBFS_MODE}) ==="
+# Show only flow lines — skip summary stats and empty lines
+grep -E "^\s+(UDP|TCP)" "$RESULTS_FILE" || true
+
+echo ""
+echo "=== nDPI detected protocols ==="
+# Protocols/categories summary block
+sed -n '/^Detected protocols:/,/^$/p' "$RESULTS_FILE" | grep -v "^$" || true
+
+echo ""
+echo "=== nDPI detected SNI / metadata ==="
+# -v2 emits per-flow metadata: ServerName, SNI, QUIC UA, etc.
+grep -E "(ServerName|SNI|server_name|QUIC|TLS|Host):" "$RESULTS_FILE" || echo "(none detected)"
 
 # Verify nDPI classified traffic as the expected protocol
 case "$OBFS_MODE" in
@@ -276,6 +287,7 @@ esac
 
 if [ -n "$EXPECT" ]; then
     grep -qi "$EXPECT" "$RESULTS_FILE" || err "nDPI did not classify traffic as $EXPECT"
+    log "✓ nDPI correctly identified protocol: $EXPECT"
 fi
 
 # Extract the GUT flow port used for this mode
@@ -289,9 +301,14 @@ GUT_FLOW=$(grep "UDP.*:${GUT_PORT} " "$RESULTS_FILE" || true)
 if [ -z "$GUT_FLOW" ]; then
     err "GUT flow on port $GUT_PORT not found in nDPI output"
 fi
+
+echo ""
+echo "=== GUT obfuscated flow (port $GUT_PORT) ==="
+echo "$GUT_FLOW"
+
 if echo "$GUT_FLOW" | grep -qi "Risk:"; then
     echo -e "${RED}[!]${NC} GUT flow has nDPI risks:"
     echo "$GUT_FLOW" | grep -oi '\[Risk: [^]]*\]'
     err "GUT flow on port $GUT_PORT flagged with risks by nDPI"
 fi
-log "GUT flow (port $GUT_PORT) — clean, no risks"
+log "✓ GUT flow (port $GUT_PORT) — clean, no risks"
