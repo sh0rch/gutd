@@ -159,6 +159,20 @@ int gut_egress(struct __sk_buff *skb)
     if (wg_type < 1 || wg_type > 4 || wg_head[1] != 0 || wg_head[2] != 0)
         return TC_ACT_OK;
 
+    /* Keepalive drop: WG type=4, size=32 (empty transport).
+     * Drop probabilistically on egress so the packet never hits the wire,
+     * suppressing WireGuard timing fingerprints without breaking liveness. */
+    if (wg_type == 4 && wg_len == WG_MIN_PACKET && cfg->keepalive_drop_percent > 0)
+    {
+        __u32 r = bpf_get_prandom_u32();
+        if ((r % 100) < (__u32)cfg->keepalive_drop_percent)
+        {
+            if (stats)
+                __sync_fetch_and_add(&stats->packets_dropped, 1);
+            return TC_ACT_SHOT;
+        }
+    }
+
 #if defined(GUT_MODE_SIP)
     /* SIP mode: data pkts (type 4, size > 32) → RTP path; rest → SIP+b64 signaling */
     __u8 sip_is_rtp = (wg_type == 4 && wg_len > 32) ? 1 : 0;
