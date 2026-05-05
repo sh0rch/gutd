@@ -36,7 +36,7 @@ jobs:
 
   verify_and_prepare:
     needs: [build, integration-test, ndpi-evasion]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v4
       with:
@@ -95,7 +95,7 @@ jobs:
   release:
     needs: verify_and_prepare
     if: github.event_name == 'push' || github.event.inputs.version != ''
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:

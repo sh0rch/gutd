@@ -21,7 +21,7 @@ permissions:
 jobs:
   build:
     name: Build gutd (x86_64)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v4
 
@@ -62,7 +62,7 @@ jobs:
 
   ndpi-build:
     name: Build nDPI
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
     - name: Cache nDPI build
       id: cache-ndpi
@@ -95,7 +95,7 @@ jobs:
   relay-test:
     name: "relay-${{ matrix.mode }}"
     needs: [build, ndpi-build]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:

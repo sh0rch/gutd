@@ -46,10 +46,23 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
     apt-get update && \
     apt-get install -y --no-install-recommends tzdata && \
     apt-get install -y --no-install-recommends \
-    clang llvm lld pkg-config libelf-dev zlib1g-dev gettext autopoint flex bison gawk make && \
+    pkg-config libelf-dev zlib1g-dev gettext flex bison gawk make wget ca-certificates && \
+    # Install clang/llvm/lld from standard distro repos, descending version preference.
+    # Ubuntu 18.04 (bionic, cross-rs 0.2.5 arm64): clang-10; focal: clang-12; 22.04: clang-14; 24.04: clang-18.
+    # No external repos needed — all versions >= 10 satisfy libbpf-cargo requirements.
+    CLANG_V="" && \
+    for v in 18 17 16 15 14 13 12 11 10; do \
+    if apt-get install -y --no-install-recommends clang-$v llvm-$v lld-$v >/dev/null 2>&1; then \
+    CLANG_V=$v; break; \
+    fi; \
+    done && \
+    { [ -n "$CLANG_V" ] || { echo "ERROR: no clang >= 11 found in standard repos"; exit 1; }; } && \
+    update-alternatives --install /usr/bin/clang clang /usr/bin/clang-$CLANG_V 100 && \
+    update-alternatives --install /usr/bin/lld lld /usr/bin/lld-$CLANG_V 100 && \
+    update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-$CLANG_V 100 && \
     if [ "$IS_MIPS" = "true" ]; then \
     apt-get install -y --no-install-recommends \
-    autoconf automake libtool wget ca-certificates; \
+    autoconf automake libtool autopoint; \
     fi && \
     # Install libelf headers into target compiler sysroot so libbpf-sys make can include <libelf.h>/<gelf.h>
     target_cc="" && \
@@ -118,8 +131,10 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
     cd / && rm -rf "$workdir"; \
     fi; \
     fi && \
-    # clang -target bpf needs /usr/include/asm/
-    ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/asm && \
+    asm_src="$(find /usr/include -maxdepth 2 -name 'asm' -type d | grep -v '^/usr/include/asm$' | head -n1)" && \
+    if [ -n "$asm_src" ] && [ ! -e /usr/include/asm ]; then ln -sf "$asm_src" /usr/include/asm; fi && \
+    cp -r /sysroot/include/linux/. /usr/include/linux/ && \
+    cp -r /sysroot/include/asm-generic/. /usr/include/asm-generic/ 2>/dev/null || true && \
     rm -rf /var/lib/apt/lists/*
 
 # ── Environment configuration for rust linker ──────────────────────

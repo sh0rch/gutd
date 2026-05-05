@@ -15,7 +15,7 @@ permissions:
 jobs:
   benchmark-wgobfs:
     name: Benchmark wg-obfuscator
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       tcp: ${{ steps.run-test.outputs.WGOBFS_TCP }}
       udp: ${{ steps.run-test.outputs.WGOBFS_UDP }}
@@ -109,7 +109,7 @@ jobs:
   benchmark-gutd:
     needs: benchmark-wgobfs
     name: Benchmark gutd
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       tcp: ${{ steps.run-test.outputs.GUTD_TCP }}
       udp: ${{ steps.run-test.outputs.GUTD_UDP }}
@@ -213,7 +213,7 @@ jobs:
   benchmark-gutd-userspace:
     needs: benchmark-gutd
     name: Benchmark gutd
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       tcp: ${{ steps.run-test.outputs.GUTD_USERSPACE_TCP }}
       udp: ${{ steps.run-test.outputs.GUTD_USERSPACE_UDP }}
@@ -317,7 +317,7 @@ jobs:
   publish-results:
     name: Compare & Publish
     needs: [benchmark-wgobfs, benchmark-gutd, benchmark-gutd-userspace]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
     - name: Publish Comparative Summary
       env:
