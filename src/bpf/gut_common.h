@@ -230,7 +230,7 @@ struct
 struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 1024);
+    __uint(max_entries, 8192);
     __type(key, __u32);
     __type(value, struct peer_endpoint);
 } client_map SEC(".maps");
@@ -238,7 +238,7 @@ struct
 struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 1024);
+    __uint(max_entries, 8192);
     __type(key, __u32);
     __type(value, __u32);
 } session_map SEC(".maps");
