@@ -10,13 +10,13 @@
 [target.aarch64-unknown-linux-musl]
 dockerfile.file    = "docker/Dockerfile.cross"
 dockerfile.context = "."
-dockerfile.build-args = { BASE_IMAGE = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main", SYSROOT_PLATFORM = "linux/arm64" }
+dockerfile.build-args = { BASE_IMAGE = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5", SYSROOT_PLATFORM = "linux/arm64" }
 
 # ── armv7 ────────────────────────────────────────────────────────
 [target.armv7-unknown-linux-musleabihf]
 dockerfile.file    = "docker/Dockerfile.cross"
 dockerfile.context = "."
-dockerfile.build-args = { BASE_IMAGE = "ghcr.io/cross-rs/armv7-unknown-linux-musleabihf:main", SYSROOT_PLATFORM = "linux/arm/v7" }
+dockerfile.build-args = { BASE_IMAGE = "ghcr.io/cross-rs/armv7-unknown-linux-musleabihf:0.2.5", SYSROOT_PLATFORM = "linux/arm/v7" }
 
 # ── mipsel ───────────────────────────────────────────────────────
 [target.mipsel-unknown-linux-musl]

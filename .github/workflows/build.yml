@@ -29,7 +29,7 @@ jobs:
   cross-build:
     needs: prepare-matrix
     name: Build ${{ matrix.label }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
@@ -45,9 +45,9 @@ jobs:
     - name: Ensure target directory exists
       run: mkdir -p target/${{ matrix.target }}/release
 
-    - name: Install QEMU for multi-arch Docker builds
+    - name: Set up QEMU for multi-arch Docker builds
       if: matrix.uses_cross
-      run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      uses: docker/setup-qemu-action@v3
 
     - name: Build (Uses Cross)
       if: matrix.uses_cross
@@ -81,7 +81,7 @@ jobs:
         if [ -n "${{ matrix.qemu }}" ]; then
           docker run --rm \
             -v $(pwd)/target/${{ matrix.target }}/release:/mnt \
-            ghcr.io/cross-rs/${{ matrix.target }}:${{ matrix.nightly && 'edge' || 'main' }} \
+            ghcr.io/cross-rs/${{ matrix.target }}:${{ matrix.nightly && 'edge' || '0.2.5' }} \
             bash -c "STRIP_CMD=\$(find /usr/local/bin -maxdepth 1 -name '*-strip' | head -n 1); if [ -n \"\$STRIP_CMD\" ]; then \$STRIP_CMD /mnt/gutd; else strip /mnt/gutd || true; fi"
         else
           strip target/${{ matrix.target }}/release/gutd || true

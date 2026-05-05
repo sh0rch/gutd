@@ -1,6 +1,6 @@
 [package]
 name = "gutd"
-version = "3.0.6"
+version = "3.0.11"
 edition = "2021"
 authors = ["GUT Project"]
 description = "WireGuard traffic obfuscation library — QUIC-like encapsulation, cross-platform userspace proxy, optional eBPF fast path on Linux"

@@ -78,7 +78,7 @@ jobs:
   #    Proves that two Windows peers can tunnel WireGuard traffic.
   userspace-tunnel:
     name: Userspace ↔ Userspace (Win-Win compat)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     steps:
     - uses: actions/checkout@v4
@@ -202,7 +202,7 @@ jobs:
   #    Proves a Windows client can tunnel to a Linux eBPF server.
   cross-compat:
     name: eBPF ↔ Userspace (Linux-Win compat)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     steps:
     - uses: actions/checkout@v4

@@ -1485,14 +1485,14 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                             &buf[..new_size]
                         };
 
-                        let r = egress_exts[sock_idx].send_to(final_buf, final_dest);
+                        let _r = egress_exts[sock_idx].send_to(final_buf, final_dest);
                         #[cfg(debug_assertions)]
                         eprintln!(
                             "[gutd/egress] send {} B → {} via sock[{}] result={:?}",
                             final_buf.len(),
                             final_dest,
                             sock_idx,
-                            r
+                            _r
                         );
                     }
                 }
