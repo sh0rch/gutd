@@ -447,6 +447,12 @@ fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<(
         } else {
             0
         };
+        // Periodic network refresh: re-resolve bind_ip and dst_mac every 60 s.
+        // Catches IP changes from DHCP renewal / PPPoE reconnect / cloud reassignment
+        // that would otherwise leave a stale partial_ip_csum in the BPF config map
+        // and silently black-hole all outgoing traffic until the next SIGHUP.
+        let mut net_refresh_tick: u32 = 0;
+        const NET_REFRESH_TICKS: u32 = 120; // 120 × 500 ms = 60 s
 
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -470,6 +476,25 @@ fn run_daemon(config: config::Config, reload_source: Option<String>) -> Result<(
                 if stats_tick >= stats_ticks_target {
                     stats_tick = 0;
                     dump_counters_file(&stat_file, start.elapsed().as_secs_f64(), &managers);
+                }
+            }
+
+            // Periodic network refresh: re-resolve bind_ip, partial_ip_csum and dst_mac.
+            // Re-uses build_gut_config which does a fast ARP-cache lookup first;
+            // the slow path (ARP probes) only fires when the cache is empty.
+            net_refresh_tick += 1;
+            if net_refresh_tick >= NET_REFRESH_TICKS {
+                net_refresh_tick = 0;
+                for mgr in &mut managers {
+                    if let Some(peer) = config.peers.iter().find(|p| p.name == mgr.interface()) {
+                        let single = make_single(&config, peer);
+                        if let Err(e) = mgr.update_config(&single) {
+                            eprintln!(
+                                "Periodic network refresh failed for '{}': {e}",
+                                mgr.interface()
+                            );
+                        }
+                    }
                 }
             }
 
