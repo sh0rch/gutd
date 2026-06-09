@@ -70,6 +70,9 @@ pub struct PeerConfig {
     pub dynamic_peer: bool,
     pub responder: bool,
     pub ports: Vec<u16>,
+    /// Ports the remote peer listens on (egress target).
+    /// Defaults to `ports` when not explicitly configured — backward compatible.
+    pub peer_ports: Vec<u16>,
     pub key: [u8; 32],
     pub keepalive_drop_percent: u8,
     pub outer_mtu: u16,
@@ -191,6 +194,26 @@ pub fn load_config_from_env() -> Result<Config> {
         }
     }
 
+    // GUTD_PEER_PORTS overrides which ports are used as egress targets (remote peer ports).
+    // Defaults to GUTD_PORTS for backward compatibility.
+    let peer_ports: Vec<u16> = if let Ok(pp_str) = std::env::var("GUTD_PEER_PORTS") {
+        let parsed: std::result::Result<Vec<u16>, _> = pp_str
+            .split(',')
+            .map(|s| {
+                s.trim()
+                    .parse::<u16>()
+                    .map_err(|e| format!("GUTD_PEER_PORTS: invalid port '{s}': {e}"))
+            })
+            .collect();
+        let parsed = parsed?;
+        if parsed.is_empty() {
+            return Err("GUTD_PEER_PORTS must not be empty".into());
+        }
+        parsed
+    } else {
+        ports.clone()
+    };
+
     let key: [u8; 32] = if let Ok(hex) = std::env::var("GUTD_KEY")
         .or_else(|_| std::env::var("GUTD_SECRET"))
         .or_else(|_| std::env::var("GUTD_CIPHER"))
@@ -259,10 +282,12 @@ pub fn load_config_from_env() -> Result<Config> {
             .into())
         }
     };
-    if obfs == ObfsMode::Sip && ports.len() < 2 {
-        return Err("GUTD_OBFS=sip requires at least 2 ports in GUTD_PORTS: \
+    if obfs == ObfsMode::Sip && peer_ports.len() < 2 {
+        return Err(
+            "GUTD_OBFS=sip requires at least 2 ports in GUTD_PEER_PORTS (or GUTD_PORTS): \
              ports[0] = SIP signaling, ports[1+] = RTP media"
-            .into());
+                .into(),
+        );
     }
 
     let stats_interval: u32 = std::env::var("GUTD_STATS_INTERVAL")
@@ -291,7 +316,8 @@ pub fn load_config_from_env() -> Result<Config> {
             peer_ip,
             dynamic_peer,
             responder,
-            ports,
+            ports: ports.clone(),
+            peer_ports,
             key,
             keepalive_drop_percent,
             outer_mtu,
@@ -324,6 +350,7 @@ struct PeerBuilder {
     dynamic_peer: bool,
     responder: Option<bool>,
     ports: Option<Vec<u16>>,
+    peer_ports: Option<Vec<u16>>,
     key: Option<[u8; 32]>,
     passphrase: Option<String>,
     keepalive_drop_percent: u8,
@@ -347,6 +374,7 @@ impl Default for PeerBuilder {
             dynamic_peer: false,
             responder: None,
             ports: None,
+            peer_ports: None,
             key: None,
             passphrase: None,
             keepalive_drop_percent: 30,
@@ -400,10 +428,11 @@ impl PeerBuilder {
             self.peer_ip.ok_or("peer_ip not set")?
         };
         let ports = self.ports.ok_or("ports not set")?;
-        if self.obfs == ObfsMode::Sip && ports.len() < 2 {
+        let peer_ports = self.peer_ports.unwrap_or_else(|| ports.clone());
+        if self.obfs == ObfsMode::Sip && peer_ports.len() < 2 {
             return Err(format!(
                 "SIP mode requires at least 2 ports (peer '{}'): \
-                 ports[0] = SIP signaling, ports[1+] = RTP media",
+                 peer_ports[0] = SIP signaling, peer_ports[1+] = RTP media",
                 self.name
             )
             .into());
@@ -437,6 +466,7 @@ impl PeerBuilder {
             dynamic_peer: self.dynamic_peer,
             responder,
             ports,
+            peer_ports,
             key,
             keepalive_drop_percent: self.keepalive_drop_percent,
             outer_mtu,
@@ -558,6 +588,21 @@ fn parse_config(content: &str) -> Result<Config> {
                                 }
                             }
                             b.ports = Some(parsed);
+                        }
+                        "peer_ports" => {
+                            let parsed: Result<Vec<u16>> = value
+                                .split(',')
+                                .map(|s| {
+                                    s.trim()
+                                        .parse()
+                                        .map_err(|e| format!("Port parse error: {e}").into())
+                                })
+                                .collect();
+                            let parsed = parsed?;
+                            if parsed.is_empty() {
+                                return Err("peer_ports must not be empty".into());
+                            }
+                            b.peer_ports = Some(parsed);
                         }
                         "key" => {
                             b.key = Some(parse_hex_key(value.trim())?);

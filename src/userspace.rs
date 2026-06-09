@@ -1143,7 +1143,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let dynamic_peer = peer.dynamic_peer
         || peer_ip_str.eq_ignore_ascii_case("dynamic")
         || peer_ip_str == "0.0.0.0";
-    let peer_port = peer.ports.first().copied().unwrap_or(41000);
+    let peer_port = peer.peer_ports.first().copied().unwrap_or(41000);
     let remote_peer_addr: Option<SocketAddr> = if dynamic_peer {
         None
     } else {
@@ -1229,14 +1229,23 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
 
     let sock_buf_size = adaptive_socket_buf_size();
 
-    // ext_sockets: GUT traffic to/from remote peer (bound to all configured ports).
+    // ext_sockets: GUT traffic to/from remote peer.
+    // Server: binds to each configured port so peers can reach us.
+    // Client: binds to port 0 (OS assigns ephemeral port) — one socket per peer_port so
+    //         the socket index still matches the port-striping logic in the egress path.
+    //         This allows multiple clients on the same machine to connect to the same server
+    //         ports without conflict.
     let mut ext_sockets = Vec::new();
     for &port in &peer.ports {
-        let ext_addr = SocketAddr::new(effective_bind_ip, port);
+        let bind_port = if is_server { port } else { 0 };
+        let ext_addr = SocketAddr::new(effective_bind_ip, bind_port);
         let ext_socket = Arc::new(bind_udp(ext_addr)?);
         tune_udp_buffers(&ext_socket, sock_buf_size);
         disable_df(&ext_socket);
-        println!("Listening (ext) on {}", ext_addr);
+        println!(
+            "Listening (ext) on {}",
+            ext_socket.local_addr().unwrap_or(ext_addr)
+        );
         ext_sockets.push(ext_socket);
     }
 
@@ -1420,9 +1429,9 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                     ..crate::proto::sip::RTP_HEADER_LEN + new_size]
                                     .copy_from_slice(&buf[..new_size]);
 
-                                if peer.ports.len() > 1 {
-                                    sock_idx = 1 + (ts as usize % (peer.ports.len() - 1));
-                                    final_dest.set_port(peer.ports[sock_idx]);
+                                if peer.peer_ports.len() > 1 {
+                                    sock_idx = 1 + (ts as usize % (peer.peer_ports.len() - 1));
+                                    final_dest.set_port(peer.peer_ports[sock_idx]);
                                 }
 
                                 &out_buf[..crate::proto::sip::RTP_HEADER_LEN + new_size]
@@ -1446,7 +1455,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 sip_buf.fill(0);
                                 let src_ip_str = src.ip().to_string();
                                 let dst_ip_str = dest.ip().to_string();
-                                let rtp_port = peer.ports.get(1).copied().unwrap_or(10000);
+                                let rtp_port = peer.peer_ports.get(1).copied().unwrap_or(10000);
                                 let date_str = crate::proto::sip::format_sip_date_only(
                                     SystemTime::now()
                                         .duration_since(UNIX_EPOCH)
@@ -1474,9 +1483,9 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 out_buf[..sip_header_len]
                                     .copy_from_slice(&sip_buf[..sip_header_len]);
 
-                                final_dest.set_port(peer.ports[0]);
+                                final_dest.set_port(peer.peer_ports[0]);
                                 #[cfg(debug_assertions)]
-                                println!("[gutd] sending SIP to port {}", peer.ports[0]);
+                                println!("[gutd] sending SIP to port {}", peer.peer_ports[0]);
                                 sock_idx = 0;
 
                                 &out_buf[..sip_header_len + b64_len]
