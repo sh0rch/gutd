@@ -1264,6 +1264,11 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
 
     // Lock-free shared WG peer address (client mode: egress writes, ingress reads)
     let shared_wg_peer = Arc::new(SharedAddr::new());
+    // Endpoint roaming: ingress writes the actual source addr of the last authenticated
+    // packet from the peer; egress prefers this over the configured remote_peer_addr.
+    // This lets the server respond to the client's real (possibly ephemeral) port without
+    // requiring peer_ip=dynamic.
+    let shared_peer_ext = Arc::new(SharedAddr::new());
 
     // Shared maps for dynamic_peer routing (egress reads client_map, ingress writes it; vice versa for session_map)
     let client_map: Arc<Mutex<HashMap<u32, SocketAddr>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -1280,6 +1285,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let egress_session_map = Arc::clone(&session_map);
     let egress_peer = peer.clone();
     let egress_client_obfs = Arc::clone(&client_obfs);
+    let egress_peer_ext = Arc::clone(&shared_peer_ext);
     let egress_handle = std::thread::Builder::new()
         .name("gutd-egress".into())
         .spawn(move || {
@@ -1360,7 +1366,9 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                 }
 
                 let egress_dest = if !dynamic_peer {
-                    remote_peer_addr
+                    // Prefer the endpoint learned from the last authenticated inbound
+                    // packet (roaming), fall back to the statically configured address.
+                    egress_peer_ext.load().map(Some).unwrap_or(remote_peer_addr)
                 } else if size >= 4 {
                     let wg_type = buf[0] & 0x1F;
                     if wg_type == 1 {
@@ -1517,6 +1525,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         let ingress_client_map = Arc::clone(&client_map);
         let ingress_session_map = Arc::clone(&session_map);
         let ingress_client_obfs = Arc::clone(&client_obfs);
+        let ingress_peer_ext = Arc::clone(&shared_peer_ext);
         let ingress_peer = peer.clone();
 
         let ingress_handle = std::thread::Builder::new()
@@ -1725,6 +1734,11 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                     if let Some((new_size, _wg_sport, _wg_dport)) =
                         obfs_decap(buf, size, &key_init, rounds, detected_obfs)
                     {
+                        // Endpoint roaming: remember the actual source of every
+                        // authenticated packet so the egress thread can respond
+                        // to the peer's real (possibly ephemeral) port.
+                        ingress_peer_ext.store(src);
+
                         if dynamic_peer && new_size >= 8 {
                             let wg_type = buf[0] & 0x1F;
                             if wg_type == 1 {
