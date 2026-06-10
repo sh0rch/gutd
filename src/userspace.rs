@@ -1230,14 +1230,17 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
     let sock_buf_size = adaptive_socket_buf_size();
 
     // ext_sockets: GUT traffic to/from remote peer.
-    // Server: binds to each configured port so peers can reach us.
-    // Client: binds to port 0 (OS assigns ephemeral port) — one socket per peer_port so
-    //         the socket index still matches the port-striping logic in the egress path.
-    //         This allows multiple clients on the same machine to connect to the same server
-    //         ports without conflict.
+    // Server: always binds to each configured port so peers can reach us.
+    // Client (non-SIP): binds to port 0 (OS assigns ephemeral port). This allows
+    //   multiple clients on the same machine to connect to the same server ports
+    //   without conflict. Endpoint roaming ensures the server learns the real port.
+    // Client (SIP): must bind to configured ports — SIP INVITE embeds the RTP port
+    //   numbers that both sides must agree on; ephemeral binding would break the
+    //   SIP session description and RTP striping.
+    let client_needs_fixed_port = is_server || peer.obfs == crate::config::ObfsMode::Sip;
     let mut ext_sockets = Vec::new();
     for &port in &peer.ports {
-        let bind_port = if is_server { port } else { 0 };
+        let bind_port = if client_needs_fixed_port { port } else { 0 };
         let ext_addr = SocketAddr::new(effective_bind_ip, bind_port);
         let ext_socket = Arc::new(bind_udp(ext_addr)?);
         tune_udp_buffers(&ext_socket, sock_buf_size);
