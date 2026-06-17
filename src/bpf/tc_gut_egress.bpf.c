@@ -475,7 +475,9 @@ int gut_egress(struct __sk_buff *skb)
     __u32 room = outer_hdr_len;
 #endif
 
-    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, 0) < 0)
+    __u64 adj_flags = BPF_F_ADJ_ROOM_ENCAP_L4_UDP | BPF_F_ADJ_ROOM_FIXED_GSO;
+    adj_flags |= (ipver == 6) ? BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 : BPF_F_ADJ_ROOM_ENCAP_L3_IPV4;
+    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, adj_flags) < 0)
         return TC_ACT_OK;
 
     if (bpf_skb_pull_data(skb, skb->len) < 0)
@@ -596,7 +598,17 @@ int gut_egress(struct __sk_buff *skb)
     }
 #elif defined(GUT_MODE_GUT)
     __u8 *quic = (__u8 *)data + new_quic_off;
+    __u8 gut_type4_len_byte = 0;
     write_gut_header(quic, data_end, ppn, enc_ports, pad_len);
+    if (wg_type == 4)
+    {
+        if (wg_len < WG_MIN_PACKET || ((wg_len - WG_MIN_PACKET) & 0x0F))
+            return TC_ACT_OK;
+        __u32 len_code = (wg_len - WG_MIN_PACKET) >> 4;
+        if (len_code > 255)
+            return TC_ACT_OK;
+        gut_type4_len_byte = (__u8)len_code;
+    }
 #else  /* GUT_MODE_QUIC */
     __u8 *quic = (__u8 *)data + new_quic_off;
     if (outer_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
@@ -696,20 +708,12 @@ int gut_egress(struct __sk_buff *skb)
         __u64 ip_csum = bpf_csum_diff(0, 0, (__be32 *)iph, sizeof(struct iphdr), 0);
         iph->check = csum_fold(ip_csum);
 
-        /* Kernel's udp_set_csum() forces skb->ip_summed = CHECKSUM_PARTIAL
-         * for locally-generated UDP-encapsulated traffic (WireGuard). In that
-         * mode the NIC offload (or skb_checksum_help() when offload is off)
-         * finalises the checksum by adding the payload sum. We must therefore
-         * write ONLY the pseudo-header fold into udph->check (matching what
-         * udp_set_csum() does). Writing the full checksum here causes HW
-         * offload to add the payload sum a second time and corrupts the
-         * value on the wire. */
+        /* IPv4 UDP checksums are optional.  The encapsulated skb can carry stale
+         * CHECKSUM_PARTIAL metadata from the inner WireGuard UDP packet, which
+         * makes the outer checksum field wrong on some VM/NAT paths.  Emit an
+         * explicit zero checksum for the final outer IPv4 UDP packet instead of
+         * relying on skb checksum metadata/offload state. */
         udph->check = 0;
-        __u32 pseudo = 0;
-        pseudo = bpf_csum_diff(0, 0, &iph->saddr, 8, pseudo); // saddr and daddr are contiguous
-        __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
-        pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
-        udph->check = (__u16)~csum_fold(pseudo); // pseudo-only; NIC/kernel adds payload
     }
     else if (ipver == 6)
     {
@@ -780,6 +784,21 @@ int gut_egress(struct __sk_buff *skb)
     __builtin_memcpy(eth->h_dest, cfg->dst_mac, 6);
     __builtin_memcpy(eth->h_source, cfg->src_mac, 6);
 
+#if defined(GUT_MODE_GUT)
+    if (wg_type == 4)
+    {
+        __u8 gut_hdr[GUT_HEADER_SIZE];
+        __builtin_memcpy(gut_hdr + 0, &ppn, 4);
+        __builtin_memcpy(gut_hdr + 4, &enc_ports, 4);
+        gut_hdr[8] = gut_type4_len_byte;
+        gut_hdr[9] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
+        if (bpf_skb_store_bytes(skb, new_quic_off, gut_hdr, GUT_HEADER_SIZE, 0) < 0)
+        {
+            return TC_ACT_OK;
+        }
+    }
+#endif
+
     if (stats)
     {
         stats->packets_processed++;
@@ -787,7 +806,24 @@ int gut_egress(struct __sk_buff *skb)
         stats->bytes_processed += (__u64)skb->len;
     }
 
-    bpf_debug("TC egress: wg_type=%d outer_hdr=%d pad=%d port=%d", wg_type, outer_hdr_len, pad_len, tunnel_port);
+
+#if defined(GUT_MODE_GUT)
+    if (wg_type == 4) {
+        __u8 emit_gut_hdr[GUT_HEADER_SIZE];
+        __builtin_memcpy(emit_gut_hdr + 0, &ppn, 4);
+        __builtin_memcpy(emit_gut_hdr + 4, &enc_ports, 4);
+        emit_gut_hdr[8] = gut_type4_len_byte;
+        emit_gut_hdr[9] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
+
+
+        if (bpf_skb_store_bytes(skb, new_quic_off, emit_gut_hdr, GUT_HEADER_SIZE, 0) < 0) {
+            return TC_ACT_OK;
+        }
+
+
+    }
+#endif
+bpf_debug("TC egress: wg_type=%d outer_hdr=%d pad=%d port=%d", wg_type, outer_hdr_len, pad_len, tunnel_port);
     return bpf_redirect(cfg->egress_ifindex, 0);
 }
 
@@ -893,7 +929,10 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
     }
 
     /* ── Adjust packet size and shift IP/UDP headers ── */
-    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, 0) < 0)
+    __u64 adj_flags = BPF_F_ADJ_ROOM_ENCAP_L4_UDP | BPF_F_ADJ_ROOM_FIXED_GSO;
+    adj_flags |= (ipver == 6) ? BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 : BPF_F_ADJ_ROOM_ENCAP_L3_IPV4;
+
+    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, adj_flags) < 0)
         return TC_ACT_OK;
 
     if (bpf_skb_pull_data(skb, skb->len) < 0)

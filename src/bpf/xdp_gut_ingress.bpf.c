@@ -754,6 +754,57 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     }
 #endif
 
+#if defined(GUT_MODE_GUT)
+    __u32 restored_wg_len = wg_len;
+    if (wg_type == 1)
+    {
+        if (wg_len < 148)
+            return -1;
+        restored_wg_len = 148;
+    }
+    else if (wg_type == 2)
+    {
+        if (wg_len < 92)
+            return -1;
+        restored_wg_len = 92;
+    }
+    else if (wg_type == 3)
+    {
+        if (wg_len < 64)
+            return -1;
+        restored_wg_len = 64;
+    }
+    else if (wg_type == 4) {
+        /* GUT type4: infer restored WireGuard transport length from wire length.
+         * Do not trust quic[8] / quic[9] on the dynamic-peer reverse path: v12
+         * proved TC can read byte8=0x06 before redirect while the emitted eth0
+         * packet still has random bytes at GUT header positions 8/9.  The wire
+         * payload length is still stable. WireGuard transport-data packets are
+         * aligned as 32 + 16*N; TC adds only ballast after the encrypted WG
+         * packet.  Therefore strip ballast by rounding the post-GUT payload
+         * length down to the nearest WG type4-aligned size.
+         */
+        if (wg_len < WG_MIN_PACKET) return -2;
+        __u32 inferred_delta = wg_len - WG_MIN_PACKET;
+        inferred_delta &= ~0x0FU;
+        restored_wg_len = WG_MIN_PACKET + inferred_delta;
+        if (restored_wg_len < WG_MIN_PACKET || restored_wg_len > wg_len) return -2;
+        if (wg_len - restored_wg_len > 63) return -2;
+    }
+    else
+    {
+        return -1;
+    }
+
+    if (restored_wg_len > wg_len)
+        return -1;
+
+    __u32 tail_total = wg_len - restored_wg_len;
+    if (tail_total > 63)
+        return -1;
+
+    __u16 new_udp_len = (__u16)(sizeof(struct udphdr) + restored_wg_len);
+#else
     if (ballast_len > 63 || ballast_len > wg_len)
         return -1;
 
@@ -761,9 +812,21 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     if (wg_len < tail_total || wg_len - tail_total < WG_MIN_PACKET)
         return -1;
 
-    // "нам ничего не надо считать от конца пакета!!" -> we removed meta extraction.
-
     __u16 new_udp_len = (__u16)(udp_len - tail_total - outer_hdr_len);
+#endif
+    if (ipver == 4)
+    {
+        struct iphdr *iph_check = (void *)((__u8 *)data + ip_off);
+        if ((void *)(iph_check + 1) > data_end)
+            return -1;
+    }
+    else
+    {
+        struct ipv6hdr *ip6h_check = (void *)((__u8 *)data + ip_off);
+        if ((void *)(ip6h_check + 1) > data_end)
+            return -1;
+    }
+
     udph->len = bpf_htons(new_udp_len);
     udph->check = 0;
 
@@ -1322,6 +1385,9 @@ int xdp_gut_ingress(struct xdp_md *ctx)
     int rc = gut_xdp_core(ctx, cfg);
     if (rc != 0)
     {
+        if (rc == -2)
+            return XDP_DROP;
+
 #if defined(GUT_MODE_QUIC)
         /* QUIC mode: tail-call to probe handler to stay within verifier
          * budget on kernel ≤6.2.  On tail-call failure, fall through. */
