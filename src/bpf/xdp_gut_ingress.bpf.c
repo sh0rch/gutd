@@ -792,55 +792,60 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         }
     }
 
-    __u32 shift_len_head = udp_off + 8;
-    if (shift_len_head < 14 || shift_len_head > 62)
+    /* ── Virtio-net / e1000-safe packet resize ────────────────────────────
+     * bpf_xdp_adjust_head() gives driver-dependent results on virtio-net
+     * (mergeable RX buffers) and other real NICs: the helper may succeed
+     * on veth but silently mis-size the frame on virtio-net, causing
+     * wrong-length WireGuard packets on every cloud/VPS deployment.
+     *
+     * Fix: do NOT call adjust_head at all.  Instead, slide the WG inner
+     * payload backward over the outer header using scratch as a relay,
+     * then shrink the tail with a single adjust_tail.
+     *
+     * Layout before:  [Eth+IP+UDP(wg_off)] [outer_hdr(outer_hdr_len)] [WG(inner_wg_len)] [ballast(tail_total)]
+     * Layout after:   [Eth+IP+UDP(wg_off)] [WG(inner_wg_len)] <stale tail>
+     *
+     * The stale tail is trimmed by adjust_tail(-(outer_hdr_len+tail_total)).
+     * If adjust_tail is a silent no-op on this NIC driver (e.g. virtio-net
+     * with mrg_rxbuf=on), the IP and UDP length fields have already been
+     * set to the correct inner size.  The kernel network stack calls
+     * pskb_trim_rcsum(skb, iph->tot_len) in ip_rcv() before the sk_buff
+     * reaches WireGuard, so WireGuard always receives the right payload. */
+    __u32 inner_wg_len = wg_len - tail_total;
+    if (inner_wg_len < WG_MIN_PACKET || inner_wg_len > MAX_INNER_TECH_LIMIT)
+        return -1;
+    /* Re-establish scalar bounds for BPF verifier after potential spill/reload */
+    asm volatile("" : "+r"(inner_wg_len));
+    if (inner_wg_len < WG_MIN_PACKET)
+        inner_wg_len = WG_MIN_PACKET;
+    if (inner_wg_len > MAX_INNER_TECH_LIMIT)
+        inner_wg_len = MAX_INNER_TECH_LIMIT;
+
+    /* Load WG inner payload (skipping outer_hdr) into scratch[512..].
+     * Scratch regions used elsewhere:
+     *   ks47           @ scratch[64..127]
+     *   mac2 tmp       @ scratch[192..207]
+     *   B64_INNER_OFF  @ scratch[384..1279]  — B64 modes only, already consumed
+     *   B64_ENC_OFF    @ scratch[1280..2479] — B64 modes only, already consumed
+     *   SIP_SCAN_OFF   @ scratch[2560..3583] — SIP mode only, already consumed
+     * scratch[512..512+MAX_INNER_TECH_LIMIT-1] is free for all modes here. */
+    __u32 src_pkt_off = (wg_off + outer_hdr_len) & 0xFFFF;
+    if (bpf_xdp_load_bytes(ctx, src_pkt_off, scratch + 512, inner_wg_len) < 0)
         return -1;
 
-    /* Verifier-safe clamp for bpf_xdp_load/store_bytes size arg */
-    asm volatile("" : "+r"(shift_len_head));
-    if (shift_len_head < 14)
-        shift_len_head = 14;
-    if (shift_len_head > 62)
-        shift_len_head = 62;
-
-    /* Save original Eth+IP+UDP headers into scratch before adjust_head.
-     * Use bpf_xdp_load/store_bytes to avoid pragma-unroll failures when
-     * shift_len_head is not compile-time constant (VLAN shifts ip_off). */
-    if (bpf_xdp_load_bytes(ctx, 0, scratch + 256, shift_len_head) < 0)
-        return -1;
-
-    if (bpf_xdp_adjust_head(ctx, outer_hdr_len) == 0)
-    {
-        if (bpf_xdp_store_bytes(ctx, 0, scratch + 256, shift_len_head) < 0)
-        {
-            stats->packets_dropped++;
-            return -1;
-        }
-    }
-    else
+    /* Write WG payload at wg_off, overwriting the outer header.
+     * Eth+IP+UDP headers at [0, wg_off) are not touched by this store. */
+    if (bpf_xdp_store_bytes(ctx, wg_off, scratch + 512, inner_wg_len) < 0)
     {
         stats->packets_dropped++;
         return -1;
     }
-    data = (void *)(__u64)ctx->data;
-    data_end = (void *)(__u64)ctx->data_end;
-    eth = data;
-    if ((void *)(eth + 1) > data_end)
-        return -1;
 
-    if (tail_total > 0)
-    {
-        if (bpf_xdp_adjust_tail(ctx, -(int)tail_total) < 0)
-        {
-            stats->packets_dropped++;
-            return -1;
-        }
-        data = (void *)(__u64)ctx->data;
-        data_end = (void *)(__u64)ctx->data_end;
-        eth = data;
-        if ((void *)(eth + 1) > data_end)
-            return -1;
-    }
+    /* Trim the now-stale outer_hdr + ballast from the tail.
+     * Return value is intentionally ignored: NIC drivers that do not honour
+     * adjust_tail (e.g. virtio-net mergeable) are handled by ip_rcv() via
+     * iph->tot_len which was already written with the correct inner size. */
+    bpf_xdp_adjust_tail(ctx, -(int)(outer_hdr_len + tail_total));
 
     data = (void *)(__u64)ctx->data;
     data_end = (void *)(__u64)ctx->data_end;
