@@ -551,10 +551,14 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     }
 #endif
 
+    /* GUT_MODE_GUT derives payload length from WG message type (see below).
+     * Other modes read ballast length from the protocol header pad byte. */
+#if !defined(GUT_MODE_GUT)
     __u8 pad_byte = wg[outer_hdr_len - 1];
     /* bit6 (0x40) = has-ballast flag; bits[0:5]+1 = actual ballast len [1..64].
      * 0x00 = no ballast (large packet — skip tail trimming). */
     __u32 ballast_len = (pad_byte & 0x40) ? ((__u32)(pad_byte & 0x3F) + 1) : 0;
+#endif
 
     wg += outer_hdr_len;
     wg_len -= outer_hdr_len;
@@ -754,16 +758,68 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     }
 #endif
 
-    if (ballast_len > 63 || ballast_len > wg_len)
+    /* ── WG payload length recovery ─────────────────────────────────────────
+     * Types 1/2/3: WireGuard handshake/cookie sizes are fixed by the protocol
+     * (148/92/64 bytes) for ALL obfuscation modes.  Any trailing bytes are
+     * ballast regardless of how the outer mode encodes the pad length.
+     *
+     * Type 4 and unknown types: mode-specific (see below). */
+    __u32 restored_wg_len;
+    if (wg_type == 1)
+    {
+        if (wg_len < 148)
+            return -1;
+        restored_wg_len = 148;
+    }
+    else if (wg_type == 2)
+    {
+        if (wg_len < 92)
+            return -1;
+        restored_wg_len = 92;
+    }
+    else if (wg_type == 3)
+    {
+        if (wg_len < 64)
+            return -1;
+        restored_wg_len = 64;
+    }
+#if defined(GUT_MODE_GUT)
+    else if (wg_type == 4)
+    {
+        /* GUT_MODE_GUT pads type-4 to 16-byte UDP alignment.  WireGuard
+         * type-4 is always 16*N bytes (16-byte header + 16*K AEAD output),
+         * so base_udp = 18 + 16*N → remainder = 2 → pad_len = 14 (< 256 B)
+         * or pad_len = 0 (>= 256 B).  Both values are < 16, therefore
+         * rounding (wg_len - WG_MIN_PACKET) & ~0x0F strips exactly the
+         * ballast without reading the GUT header pad-byte (byte 9), which
+         * may be corrupted by GSO on some VM/relay egress paths.
+         * Drop with -2 (→ XDP_DROP) to skip probe handlers on bad geometry:
+         * the packet already passed GUT crypto, so it is not a DPI probe. */
+        if (wg_len < WG_MIN_PACKET)
+            return -2;
+        __u32 inferred_delta = (wg_len - WG_MIN_PACKET) & ~0x0FU;
+        restored_wg_len = WG_MIN_PACKET + inferred_delta;
+        if (restored_wg_len > wg_len || wg_len - restored_wg_len > 15)
+            return -2;
+    }
+    else
+    {
         return -1;
-
-    __u32 tail_total = ballast_len;
-    if (wg_len < tail_total || wg_len - tail_total < WG_MIN_PACKET)
-        return -1;
-
-    // "нам ничего не надо считать от конца пакета!!" -> we removed meta extraction.
-
-    __u16 new_udp_len = (__u16)(udp_len - tail_total - outer_hdr_len);
+    }
+#else
+    else
+    {
+        /* QUIC/B64 modes: ballast length is encoded in the protocol header
+         * pad-byte.  For B64 modes it was zeroed during decode (ballast = 0). */
+        if (ballast_len > 63 || ballast_len > wg_len)
+            return -1;
+        if (wg_len - ballast_len < WG_MIN_PACKET)
+            return -1;
+        restored_wg_len = wg_len - ballast_len;
+    }
+#endif
+    __u32 tail_total = wg_len - restored_wg_len;
+    __u16 new_udp_len = (__u16)(8 + restored_wg_len);
     udph->len = bpf_htons(new_udp_len);
     udph->check = 0;
 
@@ -1327,6 +1383,11 @@ int xdp_gut_ingress(struct xdp_md *ctx)
     int rc = gut_xdp_core(ctx, cfg);
     if (rc != 0)
     {
+        /* rc == -2: passed GUT crypto but invalid WG geometry — drop without
+         * invoking probe handlers (this is not a legitimate DPI probe). */
+        if (rc == -2)
+            return XDP_DROP;
+
 #if defined(GUT_MODE_QUIC)
         /* QUIC mode: tail-call to probe handler to stay within verifier
          * budget on kernel ≤6.2.  On tail-call failure, fall through. */
