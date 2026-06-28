@@ -269,10 +269,17 @@ fn write_options_keepalive(
     let minute = ((time_of_day_us % 3_600_000_000) / 60_000_000) as u8;
     let second = ((time_of_day_us % 60_000_000) / 1_000_000) as u8;
     let microsecond = (time_of_day_us % 1_000_000) as u32;
-    // Derive auth_token from date_numeric (same formula as BPF sip_date_extract_cb)
-    let packed = CACHED_DATE.load(Ordering::Relaxed);
-    let day = ((packed >> 20) & 0x1F) as u8;
-    let year = (packed & 0xFFFF) as u16;
+    // Parse day and year from date_str (format "Mon, DD Mon YYYY") — must match
+    // what goes into the Date header so BPF anti-probing hash agrees.
+    // date_str[5..7] = two-digit day, date_str[12..16] = four-digit year.
+    let day = date_str
+        .get(5..7)
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(0);
+    let year = date_str
+        .get(12..16)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
     let auth_token = generate_auth_token(
         day,
         year,
@@ -357,9 +364,17 @@ pub fn write_header(
     let minute = (time_of_day_us % 3_600_000_000) / 60_000_000;
     let second = (time_of_day_us % 60_000_000) / 1_000_000;
     let microsecond = time_of_day_us % 1_000_000;
-    let packed = CACHED_DATE.load(Ordering::Relaxed);
-    let day = ((packed >> 20) & 0x1F) as u8;
-    let year = (packed & 0xFFFF) as u16;
+    // Parse day and year from date_str (format "Mon, DD Mon YYYY") — must match
+    // what goes into the Date header so BPF anti-probing hash agrees.
+    // date_str[5..7] = two-digit day, date_str[12..16] = four-digit year.
+    let day = date_str
+        .get(5..7)
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(0);
+    let year = date_str
+        .get(12..16)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
     // auth_token uses date_numeric/10000 — same formula as BPF sip_date_extract_cb
     let auth_token = generate_auth_token(day, year, hour, minute, second, microsecond, feistel_key);
 
