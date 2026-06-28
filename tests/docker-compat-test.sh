@@ -395,9 +395,12 @@ if [[ $RELAY_US -eq 0 ]]; then
             ip route add ${NET_SERVER_SUBNET} via ${NDPI_CLIENT_IP}
             iptables -t nat -A PREROUTING -i eth0 -p udp --dport ${WG_PORT} \
                 -j DNAT --to-destination ${GUT_SERVER_TUN_IP}:${WG_PORT}
-            # Use SNAT with a fixed port instead of MASQUERADE so that the US
-            # server's enc_ports=(WG_PORT, WG_PORT) matches the conntrack reply.
-            iptables -t nat -A POSTROUTING -o gut0 \
+            # SNAT wg_client src to gut0_local:WG_PORT so US server always sees
+            # enc_ports=(WG_PORT,WG_PORT) and conntrack can reverse the reply.
+            # Use source-subnet match (not -o gut0) so the rule applies even before
+            # gut0 is created by gutd.
+            iptables -t nat -A POSTROUTING \
+                -p udp -s ${NET_CLIENT_SUBNET} --dport ${WG_PORT} \
                 -j SNAT --to-source ${GUT_RELAY_TUN_IP}:${WG_PORT}
             iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
             iptables -A FORWARD -i eth0 -o gut0 -j ACCEPT
