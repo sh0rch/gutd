@@ -114,7 +114,7 @@ jobs:
       matrix:
         scenario: ${{ fromJSON(
             inputs.scenario == 'all'
-              && '["bpf-us","us-bpf","us-us"]'
+              && '["bpf-us","us-bpf","us-us","bpf-bpf"]'
               || format('["{0}"]', inputs.scenario)
           ) }}
         obfs: ${{ fromJSON(
