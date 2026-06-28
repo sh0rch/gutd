@@ -173,6 +173,9 @@ save_logs() {
         docker logs ndpi_router > /tmp/compat-logs/ndpi_router.log 2>&1 || true
         docker logs wg_client   > /tmp/compat-logs/wg_client.log   2>&1 || true
         docker logs wg_server   > /tmp/compat-logs/wg_server.log   2>&1 || true
+        docker cp gutd_server:/tmp/eth0_server.pcap /tmp/compat-logs/eth0_server.pcap 2>/dev/null || true
+        docker cp gutd_server:/tmp/bpf_trace.txt    /tmp/compat-logs/bpf_trace.txt    2>/dev/null || true
+        docker cp gutd_relay:/tmp/bpf_trace_relay.txt /tmp/compat-logs/bpf_trace_relay.txt 2>/dev/null || true
     fi
 }
 
@@ -631,6 +634,18 @@ if [[ $RELAY_US -eq 0 ]]; then
 fi
 docker exec -d gutd_relay sh -c \
     'tcpdump -i eth0 -n -c 40 -w /tmp/eth0_compat.pcap 2>/dev/null' 2>/dev/null || true
+# Server-side capture (helps diagnose missing traffic in bpf-us/us-bpf)
+docker exec -d gutd_server sh -c \
+    'tcpdump -i eth0 -n -c 40 -w /tmp/eth0_server.pcap 2>/dev/null' 2>/dev/null || true
+# BPF trace_pipe: capture auth-drop debug messages in background
+docker exec -d gutd_server sh -c \
+    'timeout 35 cat /sys/kernel/tracing/trace_pipe 2>/dev/null \
+        | grep -a "SIP\|gut" > /tmp/bpf_trace.txt 2>/dev/null || true' 2>/dev/null || true
+if [[ $RELAY_US -eq 0 ]]; then
+    docker exec -d gutd_relay sh -c \
+        'timeout 35 cat /sys/kernel/tracing/trace_pipe 2>/dev/null \
+            | grep -a "SIP\|gut" > /tmp/bpf_trace_relay.txt 2>/dev/null || true' 2>/dev/null || true
+fi
 
 WG_READY=0
 for i in $(seq 1 30); do
@@ -657,6 +672,20 @@ if [[ $WG_READY -eq 0 ]]; then
         log "=== relay gut0 traffic (first 20 pkts) ==="
         docker exec gutd_relay sh -c \
             'tcpdump -r /tmp/gut0_compat.pcap -n 2>/dev/null | head -20 || echo "(no gut0 pcap)"' \
+            2>&1 | sed 's/^/  /'
+    fi
+    log "=== server eth0 traffic (first 40 pkts) ==="
+    docker exec gutd_server sh -c \
+        'tcpdump -r /tmp/eth0_server.pcap -n 2>/dev/null | head -40 || echo "(no server pcap)"' \
+        2>&1 | sed 's/^/  /'
+    log "=== BPF trace (server — SIP auth drops) ==="
+    docker exec gutd_server sh -c \
+        'cat /tmp/bpf_trace.txt 2>/dev/null | head -40 || echo "(no trace)"' \
+        2>&1 | sed 's/^/  /'
+    if [[ $RELAY_US -eq 0 ]]; then
+        log "=== BPF trace (relay) ==="
+        docker exec gutd_relay sh -c \
+            'cat /tmp/bpf_trace_relay.txt 2>/dev/null | head -40 || echo "(no relay trace)"' \
             2>&1 | sed 's/^/  /'
     fi
     log "=== relay iptables nat (with counters) ==="
@@ -739,8 +768,8 @@ if [[ $PING_OK -eq 1 ]]; then
     IPERF_OUT=$(docker exec wg_client \
         iperf3 -c "$WG_SERVER_IP" -p 5202 -u -b 500M -n 128M 2>&1) || true
     echo "$IPERF_OUT" | tail -4 | sed 's/^/  /'
-    IPERF_UDP_UP=$(echo "$IPERF_OUT" | grep "sender" | grep -oP '[\d.]+\s+[GM]bits/sec') || true
-    IPERF_UDP_LOSS_UP=$(echo "$IPERF_OUT" | grep "sender" \
+    IPERF_UDP_UP=$(echo "$IPERF_OUT" | grep "receiver" | grep -oP '[\d.]+\s+[GM]bits/sec') || true
+    IPERF_UDP_LOSS_UP=$(echo "$IPERF_OUT" | grep "receiver" \
         | grep -oP '\([\d.]+%\)' | tr -d '()') || true
     [[ -n "$IPERF_UDP_UP" ]] \
         && ok "UDP upload: $IPERF_UDP_UP  loss: ${IPERF_UDP_LOSS_UP:-?}" \
@@ -752,8 +781,8 @@ if [[ $PING_OK -eq 1 ]]; then
     IPERF_OUT=$(docker exec wg_client \
         iperf3 -c "$WG_SERVER_IP" -p 5202 -u -b 500M -n 128M -R 2>&1) || true
     echo "$IPERF_OUT" | tail -4 | sed 's/^/  /'
-    IPERF_UDP_DN=$(echo "$IPERF_OUT" | grep "sender" | grep -oP '[\d.]+\s+[GM]bits/sec') || true
-    IPERF_UDP_LOSS_DN=$(echo "$IPERF_OUT" | grep "sender" \
+    IPERF_UDP_DN=$(echo "$IPERF_OUT" | grep "receiver" | grep -oP '[\d.]+\s+[GM]bits/sec') || true
+    IPERF_UDP_LOSS_DN=$(echo "$IPERF_OUT" | grep "receiver" \
         | grep -oP '\([\d.]+%\)' | tr -d '()') || true
     [[ -n "$IPERF_UDP_DN" ]] \
         && ok "UDP download: $IPERF_UDP_DN  loss: ${IPERF_UDP_LOSS_DN:-?}" \

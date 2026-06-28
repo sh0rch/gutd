@@ -169,6 +169,9 @@ jobs:
         docker logs ndpi_router > /tmp/compat-logs/ndpi_router.log 2>&1 || true
         docker logs wg_client   > /tmp/compat-logs/wg_client.log   2>&1 || true
         docker logs wg_server   > /tmp/compat-logs/wg_server.log   2>&1 || true
+        docker cp gutd_server:/tmp/eth0_server.pcap /tmp/compat-logs/eth0_server.pcap 2>/dev/null || true
+        docker cp gutd_server:/tmp/bpf_trace.txt    /tmp/compat-logs/bpf_trace.txt    2>/dev/null || true
+        docker cp gutd_relay:/tmp/bpf_trace_relay.txt /tmp/compat-logs/bpf_trace_relay.txt 2>/dev/null || true
         cp /tmp/ndpi_compat.pcap         /tmp/compat-logs/ 2>/dev/null || true
         cp /tmp/ndpi-compat-report.txt   /tmp/compat-logs/ 2>/dev/null || true
 
