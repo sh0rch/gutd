@@ -253,15 +253,19 @@ int gut_egress(struct __sk_buff *skb)
      * tnum loses umin; explicit re-check restores [1,64] before the store. */
     __u32 pad_len = 0;
 #if defined(GUT_MODE_GUT)
-    /* GUT: 16-byte alignment for small packets (< 256 bytes) only */
+    /* GUT: random padding [1..63] bytes, always 16-byte-aligned, for small packets.
+     * Structure: align_base (1..16) + extra_groups * 16 where extra_groups ∈ [0..3].
+     * Encoded in GUT header byte 9 as 0x40 | (pad_len-1) so the receiver can strip
+     * it directly — no alignment formula needed on the receive side. */
+    if (wg_len < BALLAST_THRESHOLD)
     {
         __u32 base_udp = 8 + outer_hdr_len + wg_len;
-        if (wg_len < 256)
-        {
-            __u32 remainder = base_udp & 0x0F;
-            if (remainder != 0)
-                pad_len = 16 - remainder;
-        }
+        __u32 remainder = base_udp & 0x0F;
+        __u32 align_base = (remainder == 0) ? 16 : (16 - remainder); /* 1..16 */
+        __u32 extra_groups = pad_block[63] & 0x03;                   /* 0..3  */
+        pad_len = align_base + extra_groups * 16;                    /* 1..64 */
+        if (pad_len > 63)
+            pad_len = 63; /* cap: fits in 6-bit field */
     }
 #else
     if (wg_len < BALLAST_THRESHOLD)

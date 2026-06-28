@@ -452,13 +452,15 @@ pub fn obfs_encap(
 
     let mut pad_len = 0;
     if obfs == crate::config::ObfsMode::Gut {
-        // GUT: 16-byte alignment for small packets (< 256 bytes) only
-        if orig_len < 256 {
+        // GUT: random padding [1..63] bytes, 16-byte-aligned, for small packets.
+        // Structure: align_base (1..16) + extra_groups * 16, where extra_groups ∈ [0..3].
+        // Encoded in byte 9 of GUT header so the receiver strips exactly pad_len bytes.
+        if orig_len < 220 {
             let base_udp_size = 8 + quic_hdr_len + orig_len;
             let remainder = base_udp_size % 16;
-            if remainder != 0 {
-                pad_len = 16 - remainder;
-            }
+            let align_base = if remainder == 0 { 16 } else { 16 - remainder };
+            let extra_groups = (pad_block[63] & 0x03) as usize;
+            pad_len = (align_base + extra_groups * 16).min(63);
         }
     } else if obfs == crate::config::ObfsMode::Quic && orig_len >= 220 {
         // QUIC large packets: no padding — real QUIC has uniform MTU-sized data
@@ -494,15 +496,13 @@ pub fn obfs_encap(
 
     if quic_hdr_len == GUT_HEADER_SIZE {
         write_gut_header(buf, ppn, enc_ports, pad_len, pad_block[0]);
-        // write_gut_header writes noise to byte 9 (correct for GUT).
-        // SIP/Syslog: byte 9 must encode pad_len so the receiver can strip padding.
-        if obfs != crate::config::ObfsMode::Gut {
-            buf[9] = if pad_len > 0 {
-                0x40 | ((pad_len - 1) as u8 & 0x3F)
-            } else {
-                0x00
-            };
-        }
+        // All modes (including GUT) encode pad_len in byte 9:
+        //   0x40 | (pad_len-1)  or  0x00 if no padding.
+        buf[9] = if pad_len > 0 {
+            0x40 | ((pad_len - 1) as u8 & 0x3F)
+        } else {
+            0x00
+        };
     } else if quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
         write_quic_short_header(buf, dcid, ppn, enc_ports, pad_len);
     } else {
@@ -523,9 +523,10 @@ fn write_gut_header(buf: &mut [u8], ppn: u32, enc_ports: u32, pad_len: usize, no
     buf[0..4].copy_from_slice(&ppn.to_le_bytes());
     buf[4..8].copy_from_slice(&enc_ports.to_le_bytes());
     buf[8] = 0x00;
-    // byte 9: random key-derived noise — ingress recovers length from wg_type, not this byte
+    // byte 9: overridden by caller with 0x40|(pad_len-1) encoding (or 0x00 if no padding)
     let _ = pad_len;
-    buf[9] = noise_byte;
+    let _ = noise_byte;
+    buf[9] = 0x00; // placeholder; caller writes the real value
 }
 
 #[inline]
@@ -799,22 +800,17 @@ pub fn obfs_verify(
 
     let wg_off = hdr_len;
     let wg_len = orig_len - hdr_len;
-    // GUT mode: byte 9 is random noise; nonce only reads bytes [16..32], length >= 32 is enough.
-    // SIP/Syslog/QUIC: read ballast from pad_byte at buf[hdr_len-1].
-    let actual_wg_len = if obfs == crate::config::ObfsMode::Gut {
-        wg_len
+    // All modes encode ballast in buf[hdr_len-1] (GUT byte 9, QUIC pad byte, etc.).
+    let pad_byte = buf[hdr_len - 1];
+    let ballast_len = if (pad_byte & 0x40) != 0 {
+        ((pad_byte & 0x3F) as usize) + 1
     } else {
-        let pad_byte = buf[hdr_len - 1];
-        let ballast_len = if (pad_byte & 0x40) != 0 {
-            ((pad_byte & 0x3F) as usize) + 1
-        } else {
-            0
-        };
-        if ballast_len > wg_len {
-            return false;
-        }
-        wg_len - ballast_len
+        0
     };
+    if ballast_len > wg_len {
+        return false;
+    }
+    let actual_wg_len = wg_len - ballast_len;
     if actual_wg_len < 32 {
         return false;
     }
@@ -889,22 +885,17 @@ pub fn obfs_decap(
 
     let wg_off = hdr_len;
     let wg_len = orig_len - hdr_len;
-    // GUT mode: byte 9 is random noise; actual_wg_len is refined below after decryption reveals wg_type.
-    // SIP/Syslog/QUIC: read ballast from pad_byte at buf[hdr_len-1].
-    let mut actual_wg_len = if obfs == crate::config::ObfsMode::Gut {
-        wg_len
+    // All modes encode ballast in buf[hdr_len-1] (GUT byte 9, QUIC pad byte, etc.).
+    let pad_byte = buf[hdr_len - 1];
+    let ballast_len = if (pad_byte & 0x40) != 0 {
+        ((pad_byte & 0x3F) as usize) + 1
     } else {
-        let pad_byte = buf[hdr_len - 1];
-        let ballast_len = if (pad_byte & 0x40) != 0 {
-            ((pad_byte & 0x3F) as usize) + 1
-        } else {
-            0
-        };
-        if ballast_len > wg_len {
-            return None;
-        }
-        wg_len - ballast_len
+        0
     };
+    if ballast_len > wg_len {
+        return None;
+    }
+    let mut actual_wg_len = wg_len - ballast_len;
 
     let enc_ports = if hdr_len == GUT_HEADER_SIZE {
         u32::from_le_bytes(buf[4..8].try_into().unwrap())
@@ -926,8 +917,7 @@ pub fn obfs_decap(
     let wg_type = buf[wg_off] & 0x1F;
 
     // Types 1/2/3 have fixed WireGuard lengths — use them for all modes.
-    // Type 4 (data/keepalive): GUT uses 16-alignment (byte 9 was noise, ballast is 16-aligned);
-    // SIP/Syslog/QUIC keep actual_wg_len already computed from pad_byte above.
+    // Type 4: actual_wg_len already has ballast stripped via byte-9 encoding.
     actual_wg_len = match wg_type {
         1 => {
             if wg_len < 148 {
@@ -948,19 +938,8 @@ pub fn obfs_decap(
             64
         }
         4 => {
-            if obfs == crate::config::ObfsMode::Gut {
-                if wg_len < 32 {
-                    return None;
-                }
-                let restored = 32 + ((wg_len - 32) & !0x0F);
-                if wg_len - restored > 15 {
-                    return None;
-                }
-                restored
-            } else {
-                // pad_byte already stripped in initial actual_wg_len computation
-                actual_wg_len
-            }
+            // ballast already stripped via byte-9 encoding for all modes
+            actual_wg_len
         }
         _ => return None,
     };
