@@ -694,10 +694,13 @@ fi
 IPERF_TCP_UP="N/A"; IPERF_TCP_DN="N/A"
 IPERF_TCP_UP_RETR="N/A"; IPERF_TCP_DN_RETR="N/A"
 if [[ $PING_OK -eq 1 ]]; then
-    step "iperf3 TCP upload 256M"
-    docker exec -d wg_server iperf3 -s -1 -p 5201 2>/dev/null || true
-    sleep 0.5
-    IPERF_OUT=$(docker exec wg_client iperf3 -c "$WG_SERVER_IP" -p 5201 -P 4 -n 256M 2>&1) || true
+    # TCP tests: time-bounded (-t 10) avoids the cwnd-collapse / control-socket
+    # race that occurs with large byte-count tests (-n 256M) in CI environments.
+    # Port 5201 is already served by the iperf3 daemon started in wg_server; the
+    # old "-s -1 -p 5201" docker exec silently failed (port in use) and created a
+    # timing race on the result JSON exchange.
+    step "iperf3 TCP upload 10s"
+    IPERF_OUT=$(docker exec wg_client iperf3 -c "$WG_SERVER_IP" -p 5201 -P 4 -t 10 2>&1) || true
     echo "$IPERF_OUT" | tail -4 | sed 's/^/  /'
     IPERF_TCP_UP=$(echo "$IPERF_OUT" | grep -oP '[\d.]+\s+[GM]bits/sec' | tail -1) || true
     IPERF_TCP_UP_RETR=$(echo "$IPERF_OUT" | grep '\[SUM\].*sender' \
@@ -706,10 +709,8 @@ if [[ $PING_OK -eq 1 ]]; then
         && ok "TCP upload: $IPERF_TCP_UP  retr: ${IPERF_TCP_UP_RETR:-?}" \
         || warn "TCP upload: could not parse"
 
-    step "iperf3 TCP download 256M"
-    docker exec -d wg_server iperf3 -s -1 -p 5201 2>/dev/null || true
-    sleep 0.5
-    IPERF_OUT=$(docker exec wg_client iperf3 -c "$WG_SERVER_IP" -p 5201 -P 4 -n 256M -R 2>&1) || true
+    step "iperf3 TCP download 10s"
+    IPERF_OUT=$(docker exec wg_client iperf3 -c "$WG_SERVER_IP" -p 5201 -P 4 -t 10 -R 2>&1) || true
     echo "$IPERF_OUT" | tail -4 | sed 's/^/  /'
     IPERF_TCP_DN=$(echo "$IPERF_OUT" | grep -oP '[\d.]+\s+[GM]bits/sec' | tail -1) || true
     IPERF_TCP_DN_RETR=$(echo "$IPERF_OUT" | grep '\[SUM\].*sender' \
@@ -719,7 +720,7 @@ if [[ $PING_OK -eq 1 ]]; then
         || warn "TCP download: could not parse"
 fi
 
-# ── iperf3 UDP ────────────────────────────────────────────────────
+# ── iperf3 UDP ──────────────────────────────────────────────────── 
 IPERF_UDP_UP="N/A"; IPERF_UDP_DN="N/A"
 IPERF_UDP_LOSS_UP="N/A"; IPERF_UDP_LOSS_DN="N/A"
 if [[ $PING_OK -eq 1 ]]; then
