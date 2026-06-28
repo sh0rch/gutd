@@ -1490,15 +1490,12 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                     4 if orig_wg_size == 32 => crate::proto::sip::SipKind::Options,
                                     _ => crate::proto::sip::SipKind::Message,
                                 };
-                                let b64_len =
-                                    if matches!(sip_kind, crate::proto::sip::SipKind::Options) {
-                                        0
-                                    } else {
-                                        crate::proto::base64::encode(
-                                            &buf[..new_size],
-                                            &mut out_buf[crate::proto::sip::MAX_SIP_HEADER_LEN..],
-                                        )
-                                    };
+                                // Always encode payload (including Options keepalive) so
+                                // BPF XDP can find the "a=fmtp:0 " marker and decode.
+                                let b64_len = crate::proto::base64::encode(
+                                    &buf[..new_size],
+                                    &mut out_buf[crate::proto::sip::MAX_SIP_HEADER_LEN..],
+                                );
                                 sip_buf.fill(0);
                                 let src_ip_str = src.ip().to_string();
                                 let dst_ip_str = dest.ip().to_string();
