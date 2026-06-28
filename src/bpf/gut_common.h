@@ -75,9 +75,9 @@
 #define GUT_WIRE_HDR_SIZE 0
 #define GUT_MIN_OVERHEAD 0
 
-/* Variable-length ballast: ChaCha-derived 0..63 bytes appended inside masked body
- * for packets with inner_len < BALLAST_THRESHOLD.  Receiver determines
- * inner length from IP header; remainder is ballast (ignored). */
+/* Variable-length ballast: ChaCha-derived 1..63 bytes appended after the WireGuard
+ * packet for small packets (inner_len < BALLAST_THRESHOLD).  Length encoded in GUT
+ * header byte 9 as 0x40|(pad_len-1) so receivers strip exactly pad_len bytes. */
 #define BALLAST_THRESHOLD 220
 #define BALLAST_MAX 63
 #define GUT_PMTU_RESERVE 20
@@ -1587,8 +1587,11 @@ static __always_inline void write_gut_header(__u8 *quic, void *data_end, __u32 p
     __builtin_memcpy((__u8 *)quic + 0, &ppn, 4);
     __builtin_memcpy((__u8 *)quic + 4, &enc_ports, 4);
     quic[8] = 0x00;
-    /* byte 9: random key-derived noise — ingress recovers length from wg_type, not this byte */
-    quic[9] = noise_byte;
+    /* byte 9: ballast length encoding (same as SIP/Syslog/QUIC):
+     *   0x40 | (pad_len-1)  — has ballast, length = (byte9 & 0x3F) + 1 ∈ [1..64]
+     *   0x00                — no ballast (large packet) */
+    quic[9] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
+    (void)noise_byte;
 }
 
 /* ── Base64 encode/decode for Syslog / SIP BPF modes ──────────────────

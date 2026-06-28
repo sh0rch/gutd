@@ -551,14 +551,15 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     }
 #endif
 
-    /* GUT_MODE_GUT derives payload length from WG message type (see below).
-     * Other modes read ballast length from the protocol header pad byte. */
-#if !defined(GUT_MODE_GUT)
+    /* All modes encode ballast in the last byte of the outer protocol header:
+     *   0x40 | (pad_len-1)  — has ballast, length = (byte & 0x3F) + 1 ∈ [1..64]
+     *   0x00                — no ballast
+     * GUT_MODE_GUT previously used an alignment formula; now uses the same
+     * byte-9 encoding so the receiver just reads pad_len directly. */
     __u8 pad_byte = wg[outer_hdr_len - 1];
     /* bit6 (0x40) = has-ballast flag; bits[0:5]+1 = actual ballast len [1..64].
      * 0x00 = no ballast (large packet — skip tail trimming). */
     __u32 ballast_len = (pad_byte & 0x40) ? ((__u32)(pad_byte & 0x3F) + 1) : 0;
-#endif
 
     wg += outer_hdr_len;
     wg_len -= outer_hdr_len;
@@ -786,21 +787,15 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
 #if defined(GUT_MODE_GUT)
     else if (wg_type == 4)
     {
-        /* GUT_MODE_GUT pads type-4 to 16-byte UDP alignment.  WireGuard
-         * type-4 is always 16*N bytes (16-byte header + 16*K AEAD output),
-         * so base_udp = 18 + 16*N → remainder = 2 → pad_len = 14 (< 256 B)
-         * or pad_len = 0 (>= 256 B).  Both values are < 16, therefore
-         * rounding (wg_len - WG_MIN_PACKET) & ~0x0F strips exactly the
-         * ballast without reading the GUT header pad-byte (byte 9), which
-         * may be corrupted by GSO on some VM/relay egress paths.
-         * Drop with -2 (→ XDP_DROP) to skip probe handlers on bad geometry:
-         * the packet already passed GUT crypto, so it is not a DPI probe. */
+        /* GUT_MODE_GUT: ballast length is encoded in byte 9 of the GUT header
+         * (same 0x40|(pad_len-1) scheme as SIP/Syslog/QUIC).  Strip it directly. */
+        if (ballast_len > 63 || ballast_len > wg_len)
+            return -2;
         if (wg_len < WG_MIN_PACKET)
             return -2;
-        __u32 inferred_delta = (wg_len - WG_MIN_PACKET) & ~0x0FU;
-        restored_wg_len = WG_MIN_PACKET + inferred_delta;
-        if (restored_wg_len > wg_len || wg_len - restored_wg_len > 15)
+        if (wg_len - ballast_len < WG_MIN_PACKET)
             return -2;
+        restored_wg_len = wg_len - ballast_len;
     }
     else
     {
