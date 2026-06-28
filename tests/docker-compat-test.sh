@@ -706,7 +706,8 @@ if [[ $PING_OK -eq 1 ]]; then
     sleep 0.5
     IPERF_OUT=$(docker exec wg_client iperf3 -c "$WG_SERVER_IP" -p 5201 -P 4 -t 10 2>&1) || true
     echo "$IPERF_OUT" | tail -4 | sed 's/^/  /'
-    IPERF_TCP_UP=$(echo "$IPERF_OUT" | grep -oP '[\d.]+\s+[GM]bits/sec' | tail -1) || true
+    IPERF_TCP_UP=$(echo "$IPERF_OUT" | grep '\[SUM\].*receiver' \
+        | grep -oP '[\d.]+\s+[GM]bits/sec') || true
     IPERF_TCP_UP_RETR=$(echo "$IPERF_OUT" | grep '\[SUM\].*sender' \
         | grep -oP '[\d.]+\s+[GM]bits/sec\s+\K\d+') || true
     [[ -n "$IPERF_TCP_UP" ]] \
@@ -719,7 +720,8 @@ if [[ $PING_OK -eq 1 ]]; then
     sleep 0.5
     IPERF_OUT=$(docker exec wg_client iperf3 -c "$WG_SERVER_IP" -p 5201 -P 4 -t 10 -R 2>&1) || true
     echo "$IPERF_OUT" | tail -4 | sed 's/^/  /'
-    IPERF_TCP_DN=$(echo "$IPERF_OUT" | grep -oP '[\d.]+\s+[GM]bits/sec' | tail -1) || true
+    IPERF_TCP_DN=$(echo "$IPERF_OUT" | grep '\[SUM\].*receiver' \
+        | grep -oP '[\d.]+\s+[GM]bits/sec') || true
     IPERF_TCP_DN_RETR=$(echo "$IPERF_OUT" | grep '\[SUM\].*sender' \
         | grep -oP '[\d.]+\s+[GM]bits/sec\s+\K\d+') || true
     [[ -n "$IPERF_TCP_DN" ]] \
