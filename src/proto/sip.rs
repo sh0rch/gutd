@@ -182,9 +182,9 @@ pub fn parse_timestamp_from_date_header(buf: &[u8]) -> Option<u64> {
 fn date_to_numeric(day: u8, year: u16, hour: u64, min: u64, sec: u64, usec: u64) -> u64 {
     day as u64 * 10_000_000_000_000_000
         + year as u64 * 1_000_000_000_000
-        + hour * 100_000_000
-        + min * 1_000_000
-        + sec * 10_000
+        + hour * 10_000_000_000
+        + min * 100_000_000
+        + sec * 1_000_000
         + usec
 }
 
