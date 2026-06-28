@@ -113,7 +113,8 @@ case "$OBFS_MODE" in
         NDPI_EXPECT=""
         ;;
     sip)
-        GUT_PORTS="5060,10000,10001,10002,10003,10004,10005"
+        # MAX_PORTS=6 in BPF build — keep exactly 6 SIP ports so BPF server handles all of them
+        GUT_PORTS="5060,10000,10001,10002,10003,10004"
         WG_MTU=1400; GUTD_SNI="sip.example.com"
         NDPI_EXPECT="SIP"
         ;;
@@ -161,7 +162,22 @@ echo -e "  Topology    : client(${CLIENT_IP}) → relay(${RELAY_IP}) → ndpi �
 
 # ── Cleanup ───────────────────────────────────────────────────────
 CONTAINERS=(wg_client gutd_relay ndpi_router gutd_server wg_server)
+
+# In CI mode, save docker logs to files before containers are removed so the
+# workflow artifact upload step can still collect them after cleanup.
+save_logs() {
+    if [[ $CI_MODE -eq 1 ]]; then
+        mkdir -p /tmp/compat-logs
+        docker logs gutd_relay  > /tmp/compat-logs/gutd_relay.log  2>&1 || true
+        docker logs gutd_server > /tmp/compat-logs/gutd_server.log 2>&1 || true
+        docker logs ndpi_router > /tmp/compat-logs/ndpi_router.log 2>&1 || true
+        docker logs wg_client   > /tmp/compat-logs/wg_client.log   2>&1 || true
+        docker logs wg_server   > /tmp/compat-logs/wg_server.log   2>&1 || true
+    fi
+}
+
 cleanup() {
+    save_logs
     log "Cleaning up..."
     for c in "${CONTAINERS[@]}"; do
         docker stop  "$c" 2>/dev/null || true
@@ -379,7 +395,10 @@ if [[ $RELAY_US -eq 0 ]]; then
             ip route add ${NET_SERVER_SUBNET} via ${NDPI_CLIENT_IP}
             iptables -t nat -A PREROUTING -i eth0 -p udp --dport ${WG_PORT} \
                 -j DNAT --to-destination ${GUT_SERVER_TUN_IP}:${WG_PORT}
-            iptables -t nat -A POSTROUTING -o gut0 -j MASQUERADE
+            # Use SNAT with a fixed port instead of MASQUERADE so that the US
+            # server's enc_ports=(WG_PORT, WG_PORT) matches the conntrack reply.
+            iptables -t nat -A POSTROUTING -o gut0 \
+                -j SNAT --to-source ${GUT_RELAY_TUN_IP}:${WG_PORT}
             iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
             iptables -A FORWARD -i eth0 -o gut0 -j ACCEPT
             iptables -A FORWARD -i gut0 -o eth0 -j ACCEPT

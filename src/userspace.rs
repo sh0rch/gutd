@@ -494,6 +494,15 @@ pub fn obfs_encap(
 
     if quic_hdr_len == GUT_HEADER_SIZE {
         write_gut_header(buf, ppn, enc_ports, pad_len, pad_block[0]);
+        // write_gut_header writes noise to byte 9 (correct for GUT).
+        // SIP/Syslog: byte 9 must encode pad_len so the receiver can strip padding.
+        if obfs != crate::config::ObfsMode::Gut {
+            buf[9] = if pad_len > 0 {
+                0x40 | ((pad_len - 1) as u8 & 0x3F)
+            } else {
+                0x00
+            };
+        }
     } else if quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
         write_quic_short_header(buf, dcid, ppn, enc_ports, pad_len);
     } else {
@@ -791,7 +800,7 @@ pub fn obfs_verify(
     let wg_off = hdr_len;
     let wg_len = orig_len - hdr_len;
     // GUT mode: byte 9 is random noise; nonce only reads bytes [16..32], length >= 32 is enough.
-    // Other modes: read ballast from pad_byte.
+    // SIP/Syslog/QUIC: read ballast from pad_byte at buf[hdr_len-1].
     let actual_wg_len = if obfs == crate::config::ObfsMode::Gut {
         wg_len
     } else {
@@ -881,7 +890,7 @@ pub fn obfs_decap(
     let wg_off = hdr_len;
     let wg_len = orig_len - hdr_len;
     // GUT mode: byte 9 is random noise; actual_wg_len is refined below after decryption reveals wg_type.
-    // Other modes: read ballast from pad_byte.
+    // SIP/Syslog/QUIC: read ballast from pad_byte at buf[hdr_len-1].
     let mut actual_wg_len = if obfs == crate::config::ObfsMode::Gut {
         wg_len
     } else {
@@ -916,28 +925,30 @@ pub fn obfs_decap(
     xor16(&mut buf[wg_off..wg_off + 16], &ks47_b[0..16]);
     let wg_type = buf[wg_off] & 0x1F;
 
-    // GUT mode: now that wg_type is known, set actual_wg_len precisely (byte 9 was random noise)
-    if obfs == crate::config::ObfsMode::Gut {
-        actual_wg_len = match wg_type {
-            1 => {
-                if wg_len < 148 {
-                    return None;
-                }
-                148
+    // Types 1/2/3 have fixed WireGuard lengths — use them for all modes.
+    // Type 4 (data/keepalive): GUT uses 16-alignment (byte 9 was noise, ballast is 16-aligned);
+    // SIP/Syslog/QUIC keep actual_wg_len already computed from pad_byte above.
+    actual_wg_len = match wg_type {
+        1 => {
+            if wg_len < 148 {
+                return None;
             }
-            2 => {
-                if wg_len < 92 {
-                    return None;
-                }
-                92
+            148
+        }
+        2 => {
+            if wg_len < 92 {
+                return None;
             }
-            3 => {
-                if wg_len < 64 {
-                    return None;
-                }
-                64
+            92
+        }
+        3 => {
+            if wg_len < 64 {
+                return None;
             }
-            4 => {
+            64
+        }
+        4 => {
+            if obfs == crate::config::ObfsMode::Gut {
                 if wg_len < 32 {
                     return None;
                 }
@@ -946,10 +957,13 @@ pub fn obfs_decap(
                     return None;
                 }
                 restored
+            } else {
+                // pad_byte already stripped in initial actual_wg_len computation
+                actual_wg_len
             }
-            _ => return None,
-        };
-    }
+        }
+        _ => return None,
+    };
 
     if wg_type == 1 && actual_wg_len >= 148 {
         xor16(&mut buf[wg_off + 132..wg_off + 148], &ks47_b[16..32]);
