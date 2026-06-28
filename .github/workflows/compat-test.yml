@@ -1,0 +1,181 @@
+name: BPF ↔ Userspace Compatibility Test (Docker)
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: 'Compatibility scenario'
+        required: true
+        type: choice
+        options:
+          - bpf-us
+          - us-bpf
+          - us-us
+          - bpf-bpf
+          - all
+        default: 'all'
+      obfs:
+        description: 'Obfuscation mode'
+        required: true
+        type: choice
+        options:
+          - quic
+          - gut
+          - sip
+          - syslog
+          - all
+        default: 'all'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build gutd (x86_64)
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache Rust toolchain
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: compat-build-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+    - name: Build gutd Docker image
+      run: |
+        docker build -t gutd-build -f docker/Dockerfile.x86_64 .
+        mkdir -p dist
+        CID=$(docker create gutd-build)
+        docker cp "$CID:/gutd" dist/gutd-amd64
+        docker rm "$CID"
+        chmod +x dist/gutd-amd64
+        dist/gutd-amd64 --version
+
+    - name: Build runtime image
+      run: |
+        docker build \
+          --build-arg TARGETARCH=amd64 \
+          --platform linux/amd64 \
+          -t gutd:compat-test \
+          -f docker/Dockerfile.relay-test .
+        docker save gutd:compat-test | gzip > /tmp/gutd-compat-test.tar.gz
+
+    - name: Upload image artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: gutd-compat-image
+        path: /tmp/gutd-compat-test.tar.gz
+        retention-days: 1
+
+  ndpi-build:
+    name: Build nDPI
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Cache nDPI build
+      id: cache-ndpi
+      uses: actions/cache@v4
+      with:
+        path: /tmp/nDPI
+        key: ndpi-${{ runner.os }}-compat-v1
+
+    - name: Build nDPI from source
+      if: steps.cache-ndpi.outputs.cache-hit != 'true'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libnuma-dev librrd-dev libpcap-dev libtool-bin \
+          autoconf automake make gcc pkg-config git
+        git clone --depth 1 https://github.com/ntop/nDPI.git /tmp/nDPI
+        cd /tmp/nDPI
+        ./autogen.sh
+        ./configure
+        make -j$(nproc)
+
+    - name: Verify ndpiReader
+      run: /tmp/nDPI/example/ndpiReader 2>&1 | grep -m1 "Welcome to nDPI"
+
+    - name: Upload ndpiReader
+      uses: actions/upload-artifact@v4
+      with:
+        name: ndpiReader-compat
+        path: /tmp/nDPI/example/ndpiReader
+        retention-days: 1
+
+  compat-test:
+    name: "compat-${{ matrix.scenario }}-${{ matrix.obfs }}"
+    needs: [build, ndpi-build]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: ${{ fromJSON(
+            inputs.scenario == 'all'
+              && '["bpf-us","us-bpf","us-us"]'
+              || format('["{0}"]', inputs.scenario)
+          ) }}
+        obfs: ${{ fromJSON(
+            inputs.obfs == 'all'
+              && '["quic","gut","sip","syslog"]'
+              || format('["{0}"]', inputs.obfs)
+          ) }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          wireguard-tools xxd iperf3 iptables libpcap-dev
+        sudo modprobe wireguard || true
+        sudo mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
+
+    - name: Download image
+      uses: actions/download-artifact@v4
+      with:
+        name: gutd-compat-image
+        path: /tmp
+
+    - name: Download ndpiReader
+      uses: actions/download-artifact@v4
+      with:
+        name: ndpiReader-compat
+        path: /tmp/ndpi-bin
+
+    - name: Prepare tools
+      run: |
+        docker load < /tmp/gutd-compat-test.tar.gz
+        # Rename to the tag the script expects
+        docker tag gutd:compat-test gutd:relay-test
+        chmod +x /tmp/ndpi-bin/ndpiReader
+
+    - name: Run compat test (${{ matrix.scenario }} / ${{ matrix.obfs }})
+      run: |
+        sudo bash tests/docker-compat-test.sh \
+          --scenario ${{ matrix.scenario }} \
+          --obfs     ${{ matrix.obfs }} \
+          --ci
+
+    - name: Upload logs
+      if: always()
+      run: |
+        mkdir -p /tmp/compat-logs
+        docker logs gutd_relay  > /tmp/compat-logs/gutd_relay.log  2>&1 || true
+        docker logs gutd_server > /tmp/compat-logs/gutd_server.log 2>&1 || true
+        docker logs ndpi_router > /tmp/compat-logs/ndpi_router.log 2>&1 || true
+        docker logs wg_client   > /tmp/compat-logs/wg_client.log   2>&1 || true
+        docker logs wg_server   > /tmp/compat-logs/wg_server.log   2>&1 || true
+        cp /tmp/ndpi_compat.pcap         /tmp/compat-logs/ 2>/dev/null || true
+        cp /tmp/ndpi-compat-report.txt   /tmp/compat-logs/ 2>/dev/null || true
+
+    - name: Upload logs artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: compat-logs-${{ matrix.scenario }}-${{ matrix.obfs }}
+        path: /tmp/compat-logs/
+        retention-days: 3
