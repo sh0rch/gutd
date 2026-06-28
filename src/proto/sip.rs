@@ -173,13 +173,35 @@ pub fn parse_timestamp_from_date_header(buf: &[u8]) -> Option<u64> {
     Some(result)
 }
 
-/// Generates authentication token using Feistel cipher from timestamp (microseconds)
-/// Uses 100ms granularity for efficiency while maintaining tight security
+/// Compute date_numeric by concatenating all decimal digits from the SIP Date header,
+/// identical to BPF sip_date_extract_cb in xdp_gut_ingress.bpf.c.
+/// Format: "Mon, DD Mon YYYY HH:MM:SS.uuuuuu GMT"
+/// Digits extracted: DD + YYYY + HH + MM + SS + uuuuuu
+/// Result = DD * 10^16 + YYYY * 10^12 + HH * 10^10 + MM * 10^8 + SS * 10^6 + uuuuuu
 #[inline]
-fn generate_auth_token(timestamp_us: u64, feistel_key: &[u32; 4]) -> u32 {
-    // Round to 100ms granularity (100,000 microseconds)
-    // This gives 10 unique tokens per second, tight enough for security
-    let ts_100ms = (timestamp_us / 100_000) as u32;
+fn date_to_numeric(day: u8, year: u16, hour: u64, min: u64, sec: u64, usec: u64) -> u64 {
+    day as u64 * 10_000_000_000_000_000
+        + year as u64 * 1_000_000_000_000
+        + hour * 100_000_000
+        + min * 1_000_000
+        + sec * 10_000
+        + usec
+}
+
+/// Generate auth_token compatible with BPF anti-probing check.
+/// Uses date_numeric / 10_000 as ts — same as BPF's sip_hash32(date_numeric/10000, key).
+#[inline]
+fn generate_auth_token(
+    day: u8,
+    year: u16,
+    hour: u64,
+    min: u64,
+    sec: u64,
+    usec: u64,
+    feistel_key: &[u32; 4],
+) -> u32 {
+    let date_numeric = date_to_numeric(day, year, hour, min, sec, usec);
+    let ts_100ms = (date_numeric / 10_000) as u32;
     crate::proto::feistel::sip_hash32(ts_100ms, feistel_key)
 }
 
@@ -237,7 +259,6 @@ fn write_options_keepalive(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_micros() as u64;
-    let auth_token = generate_auth_token(timestamp_us, feistel_key);
     let from_tag_val = crate::proto::feistel::sip_hash32(
         ((timestamp_us / 1000) ^ sport as u64) as u32,
         feistel_key,
@@ -248,6 +269,19 @@ fn write_options_keepalive(
     let minute = ((time_of_day_us % 3_600_000_000) / 60_000_000) as u8;
     let second = ((time_of_day_us % 60_000_000) / 1_000_000) as u8;
     let microsecond = (time_of_day_us % 1_000_000) as u32;
+    // Derive auth_token from date_numeric (same formula as BPF sip_date_extract_cb)
+    let packed = CACHED_DATE.load(Ordering::Relaxed);
+    let day = ((packed >> 20) & 0x1F) as u8;
+    let year = (packed & 0xFFFF) as u16;
+    let auth_token = generate_auth_token(
+        day,
+        year,
+        hour as u64,
+        minute as u64,
+        second as u64,
+        microsecond as u64,
+        feistel_key,
+    );
 
     let mut cursor = std::io::Cursor::new(buf);
     write!(
@@ -300,12 +334,11 @@ pub fn write_header(
 
     let mut cursor = std::io::Cursor::new(buf);
 
-    // Generate timestamp-based authentication (microseconds for Feistel)
+    // Generate timestamp-based authentication
     let timestamp_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_micros() as u64;
-    let auth_token = generate_auth_token(timestamp_us, feistel_key);
 
     // Generate dynamic identifiers
     let session_id = timestamp_us / 1000; // milliseconds for session ID
@@ -317,6 +350,18 @@ pub fn write_header(
         ((timestamp_us / 1000) ^ dport as u64) as u32,
         feistel_key,
     );
+
+    // Compute time components first so auth_token uses the same Date digits as BPF
+    let time_of_day_us = timestamp_us % 86_400_000_000;
+    let hour = time_of_day_us / 3_600_000_000;
+    let minute = (time_of_day_us % 3_600_000_000) / 60_000_000;
+    let second = (time_of_day_us % 60_000_000) / 1_000_000;
+    let microsecond = time_of_day_us % 1_000_000;
+    let packed = CACHED_DATE.load(Ordering::Relaxed);
+    let day = ((packed >> 20) & 0x1F) as u8;
+    let year = (packed & 0xFFFF) as u16;
+    // auth_token uses date_numeric/10000 — same formula as BPF sip_date_extract_cb
+    let auth_token = generate_auth_token(day, year, hour, minute, second, microsecond, feistel_key);
 
     match kind {
         SipKind::Register => {
@@ -415,12 +460,7 @@ pub fn write_header(
     )
     .unwrap();
 
-    // Add Date header: date_str + time (HH:MM:SS.uuuuuu GMT) with microseconds for Feistel verification
-    let time_of_day_us = timestamp_us % 86_400_000_000;
-    let hour = time_of_day_us / 3_600_000_000;
-    let minute = (time_of_day_us % 3_600_000_000) / 60_000_000;
-    let second = (time_of_day_us % 60_000_000) / 1_000_000;
-    let microsecond = time_of_day_us % 1_000_000;
+    // Add Date header (time components already computed above for auth_token)
     write!(
         cursor,
         "Date: {} {:02}:{:02}:{:02}.{:06} GMT\r\n",
