@@ -1580,14 +1580,15 @@ static __attribute__((noinline)) void gcm_ghash_tag_128(
 
 #endif /* __GUT_COMMON_H__ */
 
-static __always_inline void write_gut_header(__u8 *quic, void *data_end, __u32 ppn, __u32 enc_ports, __u32 pad_len)
+static __always_inline void write_gut_header(__u8 *quic, void *data_end, __u32 ppn, __u32 enc_ports, __u32 pad_len, __u8 noise_byte)
 {
     if ((__u8 *)quic + GUT_HEADER_SIZE > (__u8 *)data_end)
         return;
     __builtin_memcpy((__u8 *)quic + 0, &ppn, 4);
     __builtin_memcpy((__u8 *)quic + 4, &enc_ports, 4);
     quic[8] = 0x00;
-    quic[9] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
+    /* byte 9: random key-derived noise — ingress recovers length from wg_type, not this byte */
+    quic[9] = noise_byte;
 }
 
 /* ── Base64 encode/decode for Syslog / SIP BPF modes ──────────────────

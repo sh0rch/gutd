@@ -493,7 +493,7 @@ pub fn obfs_encap(
     let dcid = ks47[9];
 
     if quic_hdr_len == GUT_HEADER_SIZE {
-        write_gut_header(buf, ppn, enc_ports, pad_len);
+        write_gut_header(buf, ppn, enc_ports, pad_len, pad_block[0]);
     } else if quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
         write_quic_short_header(buf, dcid, ppn, enc_ports, pad_len);
     } else {
@@ -510,15 +510,13 @@ pub fn obfs_encap(
 /// In gut mode, unmasking is applied to the first 6 bytes in-place on success;
 /// on failure, the original bytes are restored.
 #[inline]
-fn write_gut_header(buf: &mut [u8], ppn: u32, enc_ports: u32, pad_len: usize) {
+fn write_gut_header(buf: &mut [u8], ppn: u32, enc_ports: u32, pad_len: usize, noise_byte: u8) {
     buf[0..4].copy_from_slice(&ppn.to_le_bytes());
     buf[4..8].copy_from_slice(&enc_ports.to_le_bytes());
     buf[8] = 0x00;
-    buf[9] = if pad_len > 0 {
-        0x40 | ((pad_len as u8 - 1) & 0x3F)
-    } else {
-        0
-    };
+    // byte 9: random key-derived noise — ingress recovers length from wg_type, not this byte
+    let _ = pad_len;
+    buf[9] = noise_byte;
 }
 
 #[inline]
@@ -790,19 +788,24 @@ pub fn obfs_verify(
         return false;
     }
 
-    let pad_byte = buf[hdr_len - 1];
-    let ballast_len = if (pad_byte & 0x40) != 0 {
-        ((pad_byte & 0x3F) as usize) + 1
-    } else {
-        0
-    };
-
     let wg_off = hdr_len;
     let wg_len = orig_len - hdr_len;
-    if ballast_len > wg_len {
-        return false;
-    }
-    let actual_wg_len = wg_len - ballast_len;
+    // GUT mode: byte 9 is random noise; nonce only reads bytes [16..32], length >= 32 is enough.
+    // Other modes: read ballast from pad_byte.
+    let actual_wg_len = if obfs == crate::config::ObfsMode::Gut {
+        wg_len
+    } else {
+        let pad_byte = buf[hdr_len - 1];
+        let ballast_len = if (pad_byte & 0x40) != 0 {
+            ((pad_byte & 0x3F) as usize) + 1
+        } else {
+            0
+        };
+        if ballast_len > wg_len {
+            return false;
+        }
+        wg_len - ballast_len
+    };
     if actual_wg_len < 32 {
         return false;
     }
@@ -875,19 +878,24 @@ pub fn obfs_decap(
         return None;
     }
 
-    let pad_byte = buf[hdr_len - 1];
-    let ballast_len = if (pad_byte & 0x40) != 0 {
-        ((pad_byte & 0x3F) as usize) + 1
-    } else {
-        0
-    };
-
     let wg_off = hdr_len;
     let wg_len = orig_len - hdr_len;
-    if ballast_len > wg_len {
-        return None;
-    }
-    let actual_wg_len = wg_len - ballast_len;
+    // GUT mode: byte 9 is random noise; actual_wg_len is refined below after decryption reveals wg_type.
+    // Other modes: read ballast from pad_byte.
+    let mut actual_wg_len = if obfs == crate::config::ObfsMode::Gut {
+        wg_len
+    } else {
+        let pad_byte = buf[hdr_len - 1];
+        let ballast_len = if (pad_byte & 0x40) != 0 {
+            ((pad_byte & 0x3F) as usize) + 1
+        } else {
+            0
+        };
+        if ballast_len > wg_len {
+            return None;
+        }
+        wg_len - ballast_len
+    };
 
     let enc_ports = if hdr_len == GUT_HEADER_SIZE {
         u32::from_le_bytes(buf[4..8].try_into().unwrap())
@@ -907,6 +915,41 @@ pub fn obfs_decap(
 
     xor16(&mut buf[wg_off..wg_off + 16], &ks47_b[0..16]);
     let wg_type = buf[wg_off] & 0x1F;
+
+    // GUT mode: now that wg_type is known, set actual_wg_len precisely (byte 9 was random noise)
+    if obfs == crate::config::ObfsMode::Gut {
+        actual_wg_len = match wg_type {
+            1 => {
+                if wg_len < 148 {
+                    return None;
+                }
+                148
+            }
+            2 => {
+                if wg_len < 92 {
+                    return None;
+                }
+                92
+            }
+            3 => {
+                if wg_len < 64 {
+                    return None;
+                }
+                64
+            }
+            4 => {
+                if wg_len < 32 {
+                    return None;
+                }
+                let restored = 32 + ((wg_len - 32) & !0x0F);
+                if wg_len - restored > 15 {
+                    return None;
+                }
+                restored
+            }
+            _ => return None,
+        };
+    }
 
     if wg_type == 1 && actual_wg_len >= 148 {
         xor16(&mut buf[wg_off + 132..wg_off + 148], &ks47_b[16..32]);

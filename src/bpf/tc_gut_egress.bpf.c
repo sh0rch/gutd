@@ -596,7 +596,7 @@ int gut_egress(struct __sk_buff *skb)
     }
 #elif defined(GUT_MODE_GUT)
     __u8 *quic = (__u8 *)data + new_quic_off;
-    write_gut_header(quic, data_end, ppn, enc_ports, pad_len);
+    write_gut_header(quic, data_end, ppn, enc_ports, pad_len, pad_block[0]);
 #else  /* GUT_MODE_QUIC */
     __u8 *quic = (__u8 *)data + new_quic_off;
     if (outer_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
