@@ -388,4 +388,4 @@ jobs:
         git config --global user.email "github-actions[bot]@users.noreply.github.com"
         git add README.md
         git diff --staged --quiet || git commit -m "docs: Update benchmark results in README"
-        git push origin HEAD:${{ github.ref_name }}
+        git push origin HEAD:${{ github.event.repository.default_branch }}
