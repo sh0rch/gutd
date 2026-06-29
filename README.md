@@ -7,10 +7,10 @@
 ### Benchmark: gutd vs wg-obfuscator
 | Tool | TCP Bandwidth | UDP Bandwidth | UDP Loss |
 |---|---|---|---|
-| **gutd (eBPF)** ([v3.0.15](https://github.com/sh0rch/packetveil/releases/tag/v3.0.15)) | 977 Mbits/sec | 805 Mbits/sec | 1.4% |
-| **gutd (Userspace)** ([v3.0.15](https://github.com/sh0rch/packetveil/releases/tag/v3.0.15)) | 560 Mbits/sec | 487 Mbits/sec | 47% |
-| **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | 249 Mbits/sec | 172 Mbits/sec | 84% |
-<sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. [See test logic and full logs](https://github.com/sh0rch/packetveil/actions/runs/28400791765). Last updated: 2026-06-29 20:34</i></sub>
+| **gutd (eBPF)** ([v3.0.15](https://github.com/sh0rch/packetveil/releases/tag/v3.0.15)) | 988 Mbits/sec | 868 Mbits/sec | 1.9% |
+| **gutd (Userspace)** ([v3.0.15](https://github.com/sh0rch/packetveil/releases/tag/v3.0.15)) | 643 Mbits/sec | 517 Mbits/sec | 47% |
+| **wg-obfuscator** ([v1.5](https://github.com/ClusterM/wg-obfuscator/releases)) | 245 Mbits/sec | 190 Mbits/sec | 83% |
+<sub><i>* Performance measured using `iperf3` between 2 isolated network namespaces on GitHub Actions Ubuntu 22.04 runners. [See test logic and full logs](https://github.com/sh0rch/packetveil/actions/runs/28401027005). Last updated: 2026-06-29 20:38</i></sub>
 <!-- INTEGRATION_TEST_RESULTS_END -->
 
 **gutd v3** transparently obfuscates WireGuard UDP traffic using a Linux TC/XDP eBPF datapath. On egress the TC BPF program wraps each WireGuard packet in a chosen obfuscation envelope, masks the payload with a ChaCha keystream and optionally pads it. On ingress the XDP program validates, strips the envelope and restores the original packet before WireGuard sees it. WireGuard is completely unaware of gutd. A **pure userspace mode** (wire-compatible with the eBPF path) is available for older kernels, unprivileged containers, MikroTik RouterOS, and **Windows**.
