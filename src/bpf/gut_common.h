@@ -45,7 +45,7 @@
 #define GUT_SYSLOG_HDR_BASE 36 /* "<165>1 YYYY-MM-DDTHH:MM:SSZ " + " - - -  " = 28 + 8 */
 #define GUT_SYSLOG_HDR_MAX 68  /* 36 + max sni_domain_len(32) */
 #define GUT_SIP_HDR_BASE 182   /* Fixed bytes in write_sip_header() (excl. 2 × sni_domain) */
-#define GUT_SIP_HDR_MAX 256    /* Max SIP header: GUT_SIP_HDR_BASE + 2*32 + margin */
+#define GUT_SIP_HDR_MAX 1024   /* Max SIP header offset (matches userspace MAX_SIP_HEADER_LEN) */
 #define GUT_RTP_HEADER_SIZE 12 /* RTP header: V(1)+PT(1)+seq(2)+ts(4)+SSRC(4) */
 #define GUT_B64_MAX_INNER 896  /* max inner before b64: GUT_HDR(10) + wg(800) + pad(64) */
 #define GUT_B64_MAX_OUT 1200   /* ceil(896/3)*4 = 1200 */

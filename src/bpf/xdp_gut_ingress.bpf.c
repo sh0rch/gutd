@@ -447,7 +447,10 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         bpf_loop(1024, sip_marker_scan_cb, &sctx, 0);
         __u32 sip_hdr_len = sctx.result;
         if (sip_hdr_len == 0 || sip_hdr_len > GUT_SIP_HDR_MAX || sip_hdr_len >= wg_len)
+        {
+            bpf_debug("SIP: bad marker hlen=%u (max=%u wg=%u)", sip_hdr_len, GUT_SIP_HDR_MAX, wg_len);
             return -1;
+        }
 
         __u32 b64_data_len = wg_len - (sip_hdr_len & 0x7FF);
         b64_data_len &= 0x7FF;
