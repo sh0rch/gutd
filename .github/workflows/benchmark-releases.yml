@@ -387,5 +387,26 @@ jobs:
         git config --global user.name "github-actions[bot]"
         git config --global user.email "github-actions[bot]@users.noreply.github.com"
         git add README.md
-        git diff --staged --quiet || git commit -m "docs: Update benchmark results in README"
-        git push origin HEAD:${{ github.event.repository.default_branch }}
+        if git diff --staged --quiet; then
+          echo "README benchmark section unchanged; skipping commit/push."
+          exit 0
+        fi
+
+        git commit -m "docs: Update benchmark results in README"
+
+        for attempt in 1 2 3; do
+          if ! git pull --rebase origin "${{ github.event.repository.default_branch }}"; then
+            echo "Rebase failed on attempt $attempt; retrying."
+            git rebase --abort 2>/dev/null || true
+          elif git push origin HEAD:${{ github.event.repository.default_branch }}; then
+            echo "Successfully pushed benchmark update on attempt $attempt."
+            break
+          fi
+
+          if [ "$attempt" -eq 3 ]; then
+            echo "Failed to push benchmark update after $attempt attempts."
+            exit 1
+          fi
+
+          sleep $((2 ** attempt))
+        done
