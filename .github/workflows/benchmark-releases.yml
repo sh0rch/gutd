@@ -396,8 +396,10 @@ jobs:
 
         for attempt in 1 2 3; do
           if ! git pull --rebase origin "${{ github.event.repository.default_branch }}"; then
+            echo "Rebase failed on attempt $attempt; retrying."
             git rebase --abort 2>/dev/null || true
           elif git push origin HEAD:${{ github.event.repository.default_branch }}; then
+            echo "Successfully pushed benchmark update on attempt $attempt."
             break
           fi
 
