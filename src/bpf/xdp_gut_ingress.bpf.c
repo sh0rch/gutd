@@ -647,8 +647,11 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
      *   Type 4 (data):  receiver_index [4..8] = S_idx → bridge via session_map → C_idx
      *
      * Note: wg_idx reads bytes[8..12] for non-Type-1 (correct for DCID matching),
-     * but receiver_index for Type 4 lives at bytes[4..8].  We extract separately. */
-#if !defined(GUT_MODE_B64) /* dynamic peer inline; b64 modes use helper-based save/restore */
+     * but receiver_index for Type 4 lives at bytes[4..8].  We extract separately.
+     *
+     * All modes (QUIC, GUT, SYSLOG, SIP) use this same path.  B64 modes execute it
+     * here — after b64_decode and packet-pointer refresh — where udph, ip_off, wg_type,
+     * and wg_idx are all valid regardless of protocol. */
     if (cfg->dynamic_peer)
     {
         __u32 client_idx = 0;
@@ -693,11 +696,20 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             ep.server_port = bpf_ntohs(udph->dest);
             ep.valid = 1;
             ep.obfs_gut = 0;
-            bpf_map_update_elem(&client_map, &client_idx, &ep, BPF_ANY);
-            bpf_debug("XDP: client_map[%u] updated wg_type=%u port=%u", client_idx, wg_type, ep.port);
+            /* Type 1 (WG Init from client): use BPF_NOEXIST so we never overwrite a
+             * server-learned entry with the client's IP.  Without this, a brief race
+             * window exists between the client's Init arriving (XDP writes ip4=client_IP)
+             * and the server sending its first data packet (XDP writes ip4=server_IP).
+             * During that window TC egress reads client_IP and puts it in iph->daddr of
+             * the outbound GUT packet, leaking the client's real IP on the wire.
+             * Type 3/4 from the server side (via session_map bridge) always use BPF_ANY
+             * so they reliably overwrite stale entries with the correct server endpoint. */
+            __u64 update_flag = (wg_type == 1) ? BPF_NOEXIST : BPF_ANY;
+            bpf_map_update_elem(&client_map, &client_idx, &ep, update_flag);
+            bpf_debug("XDP: client_map[%u] updated wg_type=%u port=%u flag=%llu",
+                      client_idx, wg_type, ep.port, update_flag);
         }
     }
-#endif /* !GUT_MODE_B64 */
 
     /* Read XOR-encrypted ports from the outer header (4 bytes, stored by TC egress).
      * Decrypt: enc_ports ^ ks47[11] -> (sport<<16)|dport host-order. */
