@@ -700,19 +700,31 @@ int gut_egress(struct __sk_buff *skb)
         __u64 ip_csum = bpf_csum_diff(0, 0, (__be32 *)iph, sizeof(struct iphdr), 0);
         iph->check = csum_fold(ip_csum);
 
-        /* Kernel's udp_set_csum() forces skb->ip_summed = CHECKSUM_PARTIAL
-         * for locally-generated UDP-encapsulated traffic (WireGuard). In that
-         * mode the NIC offload (or skb_checksum_help() when offload is off)
-         * finalises the checksum by adding the payload sum. We must therefore
-         * write ONLY the pseudo-header fold into udph->check (matching what
-         * udp_set_csum() does). Writing the full checksum here causes HW
-         * offload to add the payload sum a second time and corrupts the
-         * value on the wire. */
+        /* Write pseudo-header checksum and force ip_summed = CHECKSUM_PARTIAL so
+         * the NIC / skb_checksum_help() adds the payload sum.
+         *
+         * Server path: WireGuard sets ip_summed = CHECKSUM_PARTIAL; the NIC
+         * offload or skb_checksum_help() finalises the checksum correctly.
+         *
+         * Relay path (no local WireGuard, nftables DNAT): the packet was received
+         * from the network so ip_summed = CHECKSUM_NONE/UNNECESSARY — nothing
+         * would add the payload sum, leaving an incomplete checksum on the wire.
+         *
+         * bpf_l4_csum_replace(BPF_F_MARK_ENFORCE) forces ip_summed |= CHECKSUM_PARTIAL;
+         * with diff=0 and udph->check=0 the field is unchanged.  NIC offload with
+         * NETIF_F_IP_CSUM computes from the IP header (ignores csum_start) and adds
+         * the full payload sum, yielding the correct checksum on the wire. */
         udph->check = 0;
         __u32 pseudo = 0;
         pseudo = bpf_csum_diff(0, 0, &iph->saddr, 8, pseudo); // saddr and daddr are contiguous
         __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
         pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
+        bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, 0, BPF_F_MARK_ENFORCE);
+        data = (void *)(long)skb->data;
+        data_end = (void *)(long)skb->data_end;
+        udph = (void *)((__u8 *)data + 14 + 20);
+        if ((void *)(udph + 1) > data_end)
+            return TC_ACT_OK;
         udph->check = (__u16)~csum_fold(pseudo); // pseudo-only; NIC/kernel adds payload
     }
     else if (ipver == 6)
@@ -771,12 +783,18 @@ int gut_egress(struct __sk_buff *skb)
             __builtin_memcpy(&ip6h->daddr, cfg->peer_ip6, 16);
         }
 
-        /* See IPv4 branch above: write pseudo-only, NIC/kernel adds payload. */
+        /* See IPv4 branch above: force ip_summed=CHECKSUM_PARTIAL, pseudo-only. */
         udph->check = 0;
         __u32 pseudo = 0;
         pseudo = bpf_csum_diff(0, 0, (__be32 *)&ip6h->saddr, 32, pseudo); // saddr and daddr are contiguous
         __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
         pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
+        bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, 0, BPF_F_MARK_ENFORCE);
+        data = (void *)(long)skb->data;
+        data_end = (void *)(long)skb->data_end;
+        udph = (void *)((__u8 *)data + 14 + 40);
+        if ((void *)(udph + 1) > data_end)
+            return TC_ACT_OK;
         udph->check = (__u16)~csum_fold(pseudo); // pseudo-only; NIC/kernel adds payload
     }
 
@@ -1008,14 +1026,19 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
         __u64 ip_csum = bpf_csum_diff(0, 0, (__be32 *)iph, sizeof(struct iphdr), 0);
         iph->check = csum_fold(ip_csum);
 
-        /* See gut_egress() for rationale: write only pseudo-header fold into
-         * udph->check; NIC offload / skb_checksum_help() finalises payload sum.
-         * This matches kernel's udp_set_csum() for CHECKSUM_PARTIAL packets. */
+        /* See gut_egress() IPv4 branch: force ip_summed=CHECKSUM_PARTIAL so
+         * NIC / skb_checksum_help() adds payload sum (fixes relay DNAT path). */
         udph->check = 0;
         __u32 pseudo = 0;
         pseudo = bpf_csum_diff(0, 0, &iph->saddr, 8, pseudo);
         __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
         pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
+        bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, 0, BPF_F_MARK_ENFORCE);
+        data = (void *)(long)skb->data;
+        data_end = (void *)(long)skb->data_end;
+        udph = (void *)((__u8 *)data + 14 + 20);
+        if ((void *)(udph + 1) > data_end)
+            return TC_ACT_OK;
         udph->check = (__u16)~csum_fold(pseudo); // pseudo-only; NIC/kernel adds payload
     }
     else if (ipver == 6)
@@ -1053,12 +1076,18 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
             __builtin_memcpy(&ip6h->daddr, cfg->peer_ip6, 16);
         }
 
-        /* See IPv4 branch above: pseudo-only csum, NIC/kernel adds payload. */
+        /* See IPv4 branch: force ip_summed=CHECKSUM_PARTIAL, pseudo-only. */
         udph->check = 0;
         __u32 pseudo = 0;
         pseudo = bpf_csum_diff(0, 0, (__be32 *)&ip6h->saddr, 32, pseudo);
         __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
         pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
+        bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, 0, BPF_F_MARK_ENFORCE);
+        data = (void *)(long)skb->data;
+        data_end = (void *)(long)skb->data_end;
+        udph = (void *)((__u8 *)data + 14 + 40);
+        if ((void *)(udph + 1) > data_end)
+            return TC_ACT_OK;
         udph->check = (__u16)~csum_fold(pseudo); // pseudo-only; NIC/kernel adds payload
     }
     else
@@ -1193,13 +1222,19 @@ int gut_egress_quic_long(struct __sk_buff *skb)
         __u64 ip_csum = bpf_csum_diff(0, 0, (__be32 *)iph, sizeof(struct iphdr), 0);
         iph->check = csum_fold(ip_csum);
 
-        /* See gut_egress() for rationale: write only pseudo-header fold into
-         * udph->check; NIC/kernel will add payload sum for CHECKSUM_PARTIAL. */
+        /* See gut_egress() IPv4 branch: force ip_summed=CHECKSUM_PARTIAL so
+         * NIC / skb_checksum_help() adds payload sum (fixes relay DNAT path). */
         udph->check = 0;
         __u32 pseudo = 0;
         pseudo = bpf_csum_diff(0, 0, &iph->saddr, 8, pseudo);
         __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
         pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
+        bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, 0, BPF_F_MARK_ENFORCE);
+        data = (void *)(long)skb->data;
+        data_end = (void *)(long)skb->data_end;
+        udph = (void *)((__u8 *)data + 14 + 20);
+        if ((void *)(udph + 1) > data_end)
+            return TC_ACT_OK;
         udph->check = (__u16)~csum_fold(pseudo); // pseudo-only; NIC/kernel adds payload
     }
     else if (ipver == 6)
@@ -1237,12 +1272,18 @@ int gut_egress_quic_long(struct __sk_buff *skb)
             __builtin_memcpy(&ip6h->daddr, cfg->peer_ip6, 16);
         }
 
-        /* See IPv4 branch above: pseudo-only csum, NIC/kernel adds payload. */
+        /* See IPv4 branch: force ip_summed=CHECKSUM_PARTIAL, pseudo-only. */
         udph->check = 0;
         __u32 pseudo = 0;
         pseudo = bpf_csum_diff(0, 0, (__be32 *)&ip6h->saddr, 32, pseudo);
         __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
         pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
+        bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, 0, BPF_F_MARK_ENFORCE);
+        data = (void *)(long)skb->data;
+        data_end = (void *)(long)skb->data_end;
+        udph = (void *)((__u8 *)data + 14 + 40);
+        if ((void *)(udph + 1) > data_end)
+            return TC_ACT_OK;
         udph->check = (__u16)~csum_fold(pseudo); // pseudo-only; NIC/kernel adds payload
     }
     else
