@@ -486,18 +486,59 @@ pub fn link_disable_offloads(name: &str) {
         data: u32,
     }
 
+    /// One word of ETHTOOL_SFEATURES (covers feature bits 0..31).
+    /// `valid` = which bits to change; `requested` = desired values (0 = off).
+    #[repr(C)]
+    struct EthtoolSfeatures1 {
+        cmd: u32,  // ETHTOOL_SFEATURES = 0x27
+        size: u32, // 1 word (bits 0..31)
+        valid: u32,
+        requested: u32,
+    }
+
+    // Feature bits we want to clear (all in word-0, bits 0..31):
+    //   NETIF_F_IP_CSUM(1) | NETIF_F_HW_CSUM(3) | NETIF_F_IPV6_CSUM(4)
+    //   | NETIF_F_TSO(16)  | NETIF_F_TSO_ECN(18)| NETIF_F_TSO_MANGLEID(19)
+    //   | NETIF_F_TSO6(20)
+    const CSUM_TSO_BITS: u32 =
+        (1 << 1) | (1 << 3) | (1 << 4) | (1 << 16) | (1 << 18) | (1 << 19) | (1 << 20);
+    const ETHTOOL_SFEATURES: u32 = 0x27;
+
     unsafe {
         let sock = ioctl_sock();
         if sock < 0 {
             return;
         }
         let _g = FdGuard(sock);
+
+        // Legacy API (ETHTOOL_STXCSUM / ETHTOOL_STSO): works on older kernels.
+        // May return EOPNOTSUPP on newer kernels for veth — that's fine, SFEATURES handles it.
         for cmd in [ETHTOOL_STXCSUM, ETHTOOL_STSO] {
             let mut ev = EthtoolValue { cmd, data: 0 };
             let mut ifr: libc::ifreq = std::mem::zeroed();
             fill_ifname(&mut ifr.ifr_name, name);
             ifr.ifr_ifru.ifru_data = &mut ev as *mut EthtoolValue as *mut libc::c_char;
             libc::ioctl(sock, SIOCETHTOOL as _, &ifr);
+        }
+
+        // Modern API (ETHTOOL_SFEATURES): required on kernels where legacy ioctls are no-ops
+        // for veth (EOPNOTSUPP).  Clears the same checksum + TSO bits atomically.
+        let mut sf = EthtoolSfeatures1 {
+            cmd: ETHTOOL_SFEATURES,
+            size: 1,
+            valid: CSUM_TSO_BITS,
+            requested: 0, // 0 = disable
+        };
+        let mut ifr: libc::ifreq = std::mem::zeroed();
+        fill_ifname(&mut ifr.ifr_name, name);
+        ifr.ifr_ifru.ifru_data = &mut sf as *mut EthtoolSfeatures1 as *mut libc::c_char;
+        let ret = libc::ioctl(sock, SIOCETHTOOL as _, &ifr);
+        if ret < 0 {
+            eprintln!(
+                "  offloads: {name} ETHTOOL_SFEATURES failed (errno {}); \
+                 TX csum/TSO may remain enabled",
+                *libc::__errno_location()
+            );
         }
     }
 }

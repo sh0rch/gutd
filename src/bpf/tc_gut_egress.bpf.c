@@ -704,9 +704,10 @@ int gut_egress(struct __sk_buff *skb)
          * GUT_FLAG_HW_IP4_CSUM: NIC derives L4 from IP header — safe after
          *   adjust_room_mac (ignores stale csum_start).  bpf_l4_csum_replace
          *   writes ~fold(pseudo) as seed and sets CHECKSUM_PARTIAL.
-         * Fallback: gut_csum_range + bpf_csum_level(RESET) for all other NICs.
-         * Both paths: gut0 TX offload disabled → skb_checksum_help ran before TC
-         *   → csum_offset=6 preserved from WireGuard so csum_start=headroom+34. */
+         * Fallback: gut_csum_range + bpf_skb_adjust_room(0,NET,0) for all other NICs.
+         *   bpf_skb_adjust_room(0,NET,0) unconditionally sets ip_summed=CHECKSUM_NONE
+         *   even for CHECKSUM_PARTIAL (unlike bpf_csum_level(RESET) which only resets
+         *   CHECKSUM_UNNECESSARY).  Required when gut0 TX offload disable is skipped. */
         {
             __u32 ulen = bpf_ntohs(udph->len);
             __u64 csum = bpf_csum_diff(0, 0, &iph->saddr, 8, 0);
@@ -722,7 +723,7 @@ int gut_egress(struct __sk_buff *skb)
             else
             {
                 csum = gut_csum_range(skb, scratch + 320, 14 + 20, ulen, csum);
-                bpf_csum_level(skb, BPF_CSUM_LEVEL_RESET); /* ip_summed = CHECKSUM_NONE */
+                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0); /* ip_summed = CHECKSUM_NONE (also clears PARTIAL) */
             }
             data = (void *)(long)skb->data;
             data_end = (void *)(long)skb->data_end;
@@ -804,7 +805,7 @@ int gut_egress(struct __sk_buff *skb)
             else
             {
                 csum = gut_csum_range(skb, scratch + 320, 14 + 40, ulen, csum);
-                bpf_csum_level(skb, BPF_CSUM_LEVEL_RESET);
+                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0); /* ip_summed = CHECKSUM_NONE (works for PARTIAL too, unlike bpf_csum_level) */
             }
             data = (void *)(long)skb->data;
             data_end = (void *)(long)skb->data_end;
@@ -1059,7 +1060,7 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
             else
             {
                 csum = gut_csum_range(skb, scratch + 320, 14 + 20, ulen, csum);
-                bpf_csum_level(skb, BPF_CSUM_LEVEL_RESET);
+                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0); /* ip_summed = CHECKSUM_NONE (works for PARTIAL too, unlike bpf_csum_level) */
             }
             data = (void *)(long)skb->data;
             data_end = (void *)(long)skb->data_end;
@@ -1120,7 +1121,7 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
             else
             {
                 csum = gut_csum_range(skb, scratch + 320, 14 + 40, ulen, csum);
-                bpf_csum_level(skb, BPF_CSUM_LEVEL_RESET);
+                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0); /* ip_summed = CHECKSUM_NONE (works for PARTIAL too, unlike bpf_csum_level) */
             }
             data = (void *)(long)skb->data;
             data_end = (void *)(long)skb->data_end;
@@ -1278,7 +1279,7 @@ int gut_egress_quic_long(struct __sk_buff *skb)
             else
             {
                 csum = gut_csum_range(skb, scratch + 320, 14 + 20, ulen, csum);
-                bpf_csum_level(skb, BPF_CSUM_LEVEL_RESET);
+                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0); /* ip_summed = CHECKSUM_NONE (works for PARTIAL too, unlike bpf_csum_level) */
             }
             data = (void *)(long)skb->data;
             data_end = (void *)(long)skb->data_end;
@@ -1339,7 +1340,7 @@ int gut_egress_quic_long(struct __sk_buff *skb)
             else
             {
                 csum = gut_csum_range(skb, scratch + 320, 14 + 40, ulen, csum);
-                bpf_csum_level(skb, BPF_CSUM_LEVEL_RESET);
+                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0); /* ip_summed = CHECKSUM_NONE (works for PARTIAL too, unlike bpf_csum_level) */
             }
             data = (void *)(long)skb->data;
             data_end = (void *)(long)skb->data_end;
