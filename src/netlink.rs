@@ -486,22 +486,12 @@ pub fn link_disable_offloads(name: &str) {
         data: u32,
     }
 
-    /// One word of ETHTOOL_SFEATURES (covers feature bits 0..31).
-    /// `valid` = which bits to change; `requested` = desired values (0 = off).
-    #[repr(C)]
-    struct EthtoolSfeatures1 {
-        cmd: u32,  // ETHTOOL_SFEATURES = 0x27
-        size: u32, // 1 word (bits 0..31)
-        valid: u32,
-        requested: u32,
-    }
-
-    // Feature bits we want to clear (all in word-0, bits 0..31):
-    //   NETIF_F_IP_CSUM(1) | NETIF_F_HW_CSUM(3) | NETIF_F_IPV6_CSUM(4)
-    //   | NETIF_F_TSO(16)  | NETIF_F_TSO_ECN(18)| NETIF_F_TSO_MANGLEID(19)
-    //   | NETIF_F_TSO6(20)
+    // Feature bits to clear (word-0, bits 0..31):
+    //   NETIF_F_IP_CSUM(1)|NETIF_F_HW_CSUM(3)|NETIF_F_IPV6_CSUM(4)
+    //   |NETIF_F_TSO(16)|NETIF_F_TSO_ECN(18)|NETIF_F_TSO_MANGLEID(19)|NETIF_F_TSO6(20)
     const CSUM_TSO_BITS: u32 =
         (1 << 1) | (1 << 3) | (1 << 4) | (1 << 16) | (1 << 18) | (1 << 19) | (1 << 20);
+    const ETHTOOL_GFEATURES: u32 = 0x26;
     const ETHTOOL_SFEATURES: u32 = 0x27;
 
     unsafe {
@@ -511,8 +501,8 @@ pub fn link_disable_offloads(name: &str) {
         }
         let _g = FdGuard(sock);
 
-        // Legacy API (ETHTOOL_STXCSUM / ETHTOOL_STSO): works on older kernels.
-        // May return EOPNOTSUPP on newer kernels for veth — that's fine, SFEATURES handles it.
+        // 1. Legacy API (ETHTOOL_STXCSUM / ETHTOOL_STSO).
+        //    Works on older kernels; may silently no-op on modern veth — that's ok.
         for cmd in [ETHTOOL_STXCSUM, ETHTOOL_STSO] {
             let mut ev = EthtoolValue { cmd, data: 0 };
             let mut ifr: libc::ifreq = std::mem::zeroed();
@@ -521,22 +511,44 @@ pub fn link_disable_offloads(name: &str) {
             libc::ioctl(sock, SIOCETHTOOL as _, &ifr);
         }
 
-        // Modern API (ETHTOOL_SFEATURES): required on kernels where legacy ioctls are no-ops
-        // for veth (EOPNOTSUPP).  Clears the same checksum + TSO bits atomically.
-        let mut sf = EthtoolSfeatures1 {
-            cmd: ETHTOOL_SFEATURES,
-            size: 1,
-            valid: CSUM_TSO_BITS,
-            requested: 0, // 0 = disable
-        };
+        // 2. Modern API: ETHTOOL_SFEATURES.
+        //    Kernel requires size == ETHTOOL_DEV_FEATURE_WORDS exactly (EINVAL otherwise).
+        //    On Linux 6.x this is 2; on 5.x it may be 1 or 2.
+        //    Query the correct value via ETHTOOL_GFEATURES(size=0): kernel fills in the
+        //    real word count and returns 0 (writing only the 8-byte header back, safe).
+
+        // Query word count
+        let mut gf_hdr = [ETHTOOL_GFEATURES, 0u32]; // [cmd, size]
         let mut ifr: libc::ifreq = std::mem::zeroed();
         fill_ifname(&mut ifr.ifr_name, name);
-        ifr.ifr_ifru.ifru_data = &mut sf as *mut EthtoolSfeatures1 as *mut libc::c_char;
+        ifr.ifr_ifru.ifru_data = gf_hdr.as_mut_ptr() as *mut libc::c_char;
+        libc::ioctl(sock, SIOCETHTOOL as _, &ifr);
+        // gf_hdr[1] = ETHTOOL_DEV_FEATURE_WORDS after the call (0 if unsupported)
+        let nwords = {
+            let n = gf_hdr[1] as usize;
+            if n == 0 || n > 32 {
+                2
+            } else {
+                n
+            } // fallback to 2 if query fails
+        };
+
+        // Build SFEATURES buffer: [cmd, size, (valid, requested) × nwords]
+        let mut sf = vec![0u32; 2 + nwords * 2];
+        sf[0] = ETHTOOL_SFEATURES;
+        sf[1] = nwords as u32;
+        sf[2] = CSUM_TSO_BITS; // word-0 valid mask: which bits to change
+        sf[3] = 0; // word-0 requested: 0 = disable all masked bits
+                   // words 1..nwords-1: valid=0 → don't touch
+
+        let mut ifr: libc::ifreq = std::mem::zeroed();
+        fill_ifname(&mut ifr.ifr_name, name);
+        ifr.ifr_ifru.ifru_data = sf.as_mut_ptr() as *mut libc::c_char;
         let ret = libc::ioctl(sock, SIOCETHTOOL as _, &ifr);
         if ret < 0 {
             eprintln!(
-                "  offloads: {name} ETHTOOL_SFEATURES failed (errno {}); \
-                 TX csum/TSO may remain enabled",
+                "  offloads: {name} ETHTOOL_SFEATURES failed \
+                 (nwords={nwords}, errno={}); TX csum/TSO may remain enabled",
                 *libc::__errno_location()
             );
         }
