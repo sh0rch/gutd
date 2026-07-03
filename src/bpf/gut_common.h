@@ -656,6 +656,87 @@ static __always_inline __u16 csum_fold(__u64 csum)
     return (__u16)(~csum);
 }
 
+/* Accumulate the one's-complement checksum of skb bytes [off, off+len).
+ * All bpf_skb_load_bytes / bpf_csum_diff calls use LITERAL constant sizes
+ * (64, 32, 16, 8, 4, 1-3) so the BPF verifier never needs to infer a
+ * scalar range for the size argument.  buf64 must be a ≥64-byte scratch
+ * region in map-value or stack memory (not packet data). */
+static __always_inline __u64
+gut_csum_range(struct __sk_buff *skb, __u8 *buf64,
+               __u32 off, __u32 len, __u64 acc)
+{
+    __u32 end = off + len;
+    if (end > off + 1664)
+        end = off + 1664; /* 26×64 — verifier scalar clamp */
+
+    /* 64-byte blocks — constant literal size, no range inference needed */
+#pragma unroll
+    for (int i = 0; i < 26; i++)
+    {
+        if (off + 64 > end)
+            break;
+        if (bpf_skb_load_bytes(skb, off, buf64, 64) < 0)
+            break;
+        acc = bpf_csum_diff(0, 0, (__be32 *)buf64, 64, acc);
+        off += 64;
+    }
+
+    /* Sub-64 remainder handled with successive power-of-2 constant reads */
+    if (off + 32 <= end)
+    {
+        if (bpf_skb_load_bytes(skb, off, buf64, 32) == 0)
+            acc = bpf_csum_diff(0, 0, (__be32 *)buf64, 32, acc);
+        off += 32;
+    }
+    if (off + 16 <= end)
+    {
+        if (bpf_skb_load_bytes(skb, off, buf64, 16) == 0)
+            acc = bpf_csum_diff(0, 0, (__be32 *)buf64, 16, acc);
+        off += 16;
+    }
+    if (off + 8 <= end)
+    {
+        if (bpf_skb_load_bytes(skb, off, buf64, 8) == 0)
+            acc = bpf_csum_diff(0, 0, (__be32 *)buf64, 8, acc);
+        off += 8;
+    }
+    if (off + 4 <= end)
+    {
+        if (bpf_skb_load_bytes(skb, off, buf64, 4) == 0)
+            acc = bpf_csum_diff(0, 0, (__be32 *)buf64, 4, acc);
+        off += 4;
+    }
+
+    /* Trailing 1–3 bytes: RFC 768 zero-pad to 4 bytes */
+    {
+        __u8 tbuf[4] = {0, 0, 0, 0};
+        __be32 word = 0;
+        __u32 tail = end - off;
+        if (tail >= 1 && tail <= 3)
+        {
+            if (tail == 1)
+            {
+                bpf_skb_load_bytes(skb, off, tbuf, 1);
+                word = bpf_htonl(((__u32)tbuf[0]) << 24);
+            }
+            else if (tail == 2)
+            {
+                bpf_skb_load_bytes(skb, off, tbuf, 2);
+                word = bpf_htonl((((__u32)tbuf[0]) << 24) | (((__u32)tbuf[1]) << 16));
+            }
+            else
+            {
+                bpf_skb_load_bytes(skb, off, tbuf, 3);
+                word = bpf_htonl((((__u32)tbuf[0]) << 24) | (((__u32)tbuf[1]) << 16) |
+                                 (((__u32)tbuf[2]) << 8));
+            }
+            acc = bpf_csum_diff(0, 0, &word, 4, acc);
+        }
+    }
+
+    return acc;
+}
+
 static __always_inline void fix_ipv4_header_checksum(__u8 *scratch, __u32 inner_len)
 {
     const __u32 B = 0;
