@@ -13,7 +13,7 @@
 //!                       `link_set_gso_max_segs`
 //!   Address / neighbor: `addr_add_p2p_v4`, `neigh_add_v4_permanent`
 //!   Neighbor lookup   : `lookup_arp_cache`, `lookup_ndp_cache`
-//!   Utilities         : `parse_mac`
+//!   Utilities         : `parse_mac`, `probe_tx_csum_features`
 
 use crate::Result;
 
@@ -454,6 +454,31 @@ pub fn link_set_noarp(name: &str) {
 /// This ensures that packets arriving at the TC BPF egress hook always carry a
 /// complete L4 checksum and are not coalesced by GSO, which would confuse the
 /// BPF datapath on some kernels / veth configurations.
+/// Read NIC TX checksum offload capabilities from sysfs.
+///
+/// Returns `(has_ip4_csum, has_ip6_csum)` where:
+/// - `has_ip4_csum` = `NETIF_F_IP_CSUM` (bit 1): NIC can compute UDP/TCP checksum
+///   over IPv4 from IP header fields — ignores `csum_start`, so safe after
+///   `bpf_skb_adjust_room_mac`.
+/// - `has_ip6_csum` = `NETIF_F_IPV6_CSUM` (bit 4): same for IPv6.
+///
+/// `NETIF_F_HW_CSUM` (bit 3, e.g. virtio) uses `csum_start`/`csum_offset` from
+/// the TX descriptor.  After `adjust_room_mac` the seed `csum_start` is stale
+/// so HW_CSUM-only NICs cannot be used for hardware offload here.
+pub fn probe_tx_csum_features(name: &str) -> (bool, bool) {
+    const IP4_BIT: u64 = 1 << 1; /* NETIF_F_IP_CSUM */
+    const IP6_BIT: u64 = 1 << 4; /* NETIF_F_IPV6_CSUM */
+    let path = format!("/sys/class/net/{name}/features");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return (false, false);
+    };
+    let hex = content.trim().trim_start_matches("0x");
+    let Ok(features) = u64::from_str_radix(hex, 16) else {
+        return (false, false);
+    };
+    (features & IP4_BIT != 0, features & IP6_BIT != 0)
+}
+
 pub fn link_disable_offloads(name: &str) {
     #[repr(C)]
     struct EthtoolValue {

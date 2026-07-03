@@ -94,8 +94,10 @@
 #define CHECKSUM_COMPLETE 2    /* HW-computed full csum in skb->csum */
 #define CHECKSUM_PARTIAL 3     /* pseudo-header only in field; data portion missing */
 
-/* Offload capability flags (set by loader) */
+/* Offload capability flags (set by loader, mirrors maps.rs GUT_FLAG_*) */
 #define GUT_FLAG_NEED_L4_CSUM (1U << 0) /* finalize inner L4 csum when ip_summed==CHECKSUM_PARTIAL */
+#define GUT_FLAG_HW_IP4_CSUM (1U << 1)  /* NETIF_F_IP_CSUM: NIC derives L4 from IP hdr → safe after adjust_room_mac */
+#define GUT_FLAG_HW_IP6_CSUM (1U << 2)  /* NETIF_F_IPV6_CSUM: same for IPv6 */
 
 /* GUT protocol configuration (shared between Rust loader and eBPF) */
 struct gut_config

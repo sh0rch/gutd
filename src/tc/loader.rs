@@ -31,8 +31,8 @@ use crate::netlink::{
     probe_neighbor_udp, read_gso_max_size, read_mac, read_mtu,
 };
 use crate::tc::maps::{
-    GutConfig, GutStats, DEFAULT_INNER_MTU, GUT_FLAG_NEED_L4_CSUM, OUTER_OVERHEAD_IPV4,
-    OUTER_OVERHEAD_IPV6,
+    GutConfig, GutStats, DEFAULT_INNER_MTU, GUT_FLAG_HW_IP4_CSUM, GUT_FLAG_HW_IP6_CSUM,
+    GUT_FLAG_NEED_L4_CSUM, OUTER_OVERHEAD_IPV4, OUTER_OVERHEAD_IPV6,
 };
 use crate::Result;
 use std::sync::atomic::Ordering;
@@ -1858,7 +1858,7 @@ impl TcBpfManager {
             wg_rec_v4, wg_rec_v6
         );
 
-        gut_config.offload_flags = Self::probe_offload_flags(tun_ifname);
+        gut_config.offload_flags = Self::probe_offload_flags(tun_ifname, ingress_ifname);
 
         // Partial IP checksum only meaningful for outer IPv4
         if config.peer().peer_ip.is_ipv4() {
@@ -1969,24 +1969,37 @@ impl TcBpfManager {
     }
 
     #[cfg(target_os = "linux")]
-    fn probe_offload_flags(ifname: &str) -> u16 {
+    fn probe_offload_flags(ifname: &str, egress_ifname: &str) -> u16 {
+        use crate::netlink::probe_tx_csum_features;
+
         let disable_l4_csum = std::env::var("GUTD_FORCE_L4_CSUM")
             .ok()
             .map(|v| matches!(v.as_str(), "0" | "false" | "no" | "off"))
             .unwrap_or(false);
 
-        if disable_l4_csum {
+        let mut flags: u16 = if disable_l4_csum {
             eprintln!(
                 "  offloads: {ifname} \u{2192} forced inner L4 finalize disabled (GUTD_FORCE_L4_CSUM=0)"
             );
             0
         } else {
-            eprintln!(
-                "  offloads: {ifname} \u{2192} BPF finalizes inner L4 checksum (default); \
-                 set GUTD_FORCE_L4_CSUM=0 only for troubleshooting"
-            );
             GUT_FLAG_NEED_L4_CSUM
+        };
+
+        let (ip4, ip6) = probe_tx_csum_features(egress_ifname);
+        if ip4 {
+            flags |= GUT_FLAG_HW_IP4_CSUM;
         }
+        if ip6 {
+            flags |= GUT_FLAG_HW_IP6_CSUM;
+        }
+
+        eprintln!(
+            "  offloads: {egress_ifname} \u{2192} ip4_csum_hw={ip4} ip6_csum_hw={ip6} \
+             (NETIF_F_IP_CSUM / NETIF_F_IPV6_CSUM; 0=BPF full csum, 1=NIC offload)"
+        );
+
+        flags
     }
 
     #[cfg(all(target_os = "linux", feature = "tc_ebpf"))]
