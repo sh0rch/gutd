@@ -1669,12 +1669,11 @@ static __always_inline void write_gut_header(__u8 *quic, void *data_end, __u32 p
         return;
     __builtin_memcpy((__u8 *)quic + 0, &ppn, 4);
     __builtin_memcpy((__u8 *)quic + 4, &enc_ports, 4);
-    quic[8] = 0x00;
+    quic[8] = noise_byte; /* random ChaCha-derived byte; prevents static 0x00 pattern at WG nonce offset */
     /* byte 9: ballast length encoding (same as SIP/Syslog/QUIC):
      *   0x40 | (pad_len-1)  — has ballast, length = (byte9 & 0x3F) + 1 ∈ [1..64]
      *   0x00                — no ballast (large packet) */
     quic[9] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
-    (void)noise_byte;
 }
 
 /* ── Base64 encode/decode for Syslog / SIP BPF modes ──────────────────
@@ -2526,7 +2525,7 @@ static __always_inline void write_quic_short_header(__u8 *quic, void *data_end, 
     quic[5] = 0x01; // DCID Length 1 (RFC compliant)
     __builtin_memcpy((__u8 *)quic + 6, &ppn, 4);
     __builtin_memcpy((__u8 *)quic + 10, &enc_ports, 4);
-    quic[14] = 0x00;
+    quic[14] = ((__u8 *)&ppn)[0] ^ ((__u8 *)&dcid)[3]; /* anti-fingerprint: keyed non-zero */
     quic[15] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
 }
 

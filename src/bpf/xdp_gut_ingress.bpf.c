@@ -803,7 +803,8 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
     else if (wg_type == 4)
     {
         /* GUT_MODE_GUT: ballast length is encoded in byte 9 of the GUT header
-         * (same 0x40|(pad_len-1) scheme as SIP/Syslog/QUIC).  Strip it directly. */
+         * (0x40|(pad_len-1) scheme). Byte 8 is a random anti-fingerprint byte
+         * (ChaCha-derived) and is intentionally ignored here. */
         if (ballast_len > 63 || ballast_len > wg_len)
             return -2;
         if (wg_len < WG_MIN_PACKET)

@@ -479,7 +479,11 @@ int gut_egress(struct __sk_buff *skb)
     __u32 room = outer_hdr_len;
 #endif
 
-    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, 0) < 0)
+    /* ENCAP flags: tell the kernel this is a new encapsulation (L3+L4), fixing
+     * csum_start/offsets for the outer UDP, and pin GSO size (FIXED_GSO). */
+    __u64 adj_flags = BPF_F_ADJ_ROOM_ENCAP_L4_UDP | BPF_F_ADJ_ROOM_FIXED_GSO;
+    adj_flags |= (ipver == 6) ? BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 : BPF_F_ADJ_ROOM_ENCAP_L3_IPV4;
+    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, adj_flags) < 0)
         return TC_ACT_OK;
 
     if (bpf_skb_pull_data(skb, skb->len) < 0)
@@ -934,7 +938,9 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
     }
 
     /* ── Adjust packet size and shift IP/UDP headers ── */
-    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, 0) < 0)
+    __u64 adj_flags2 = BPF_F_ADJ_ROOM_ENCAP_L4_UDP | BPF_F_ADJ_ROOM_FIXED_GSO;
+    adj_flags2 |= (ipver == 6) ? BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 : BPF_F_ADJ_ROOM_ENCAP_L3_IPV4;
+    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, adj_flags2) < 0)
         return TC_ACT_OK;
 
     if (bpf_skb_pull_data(skb, skb->len) < 0)
