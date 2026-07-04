@@ -522,7 +522,11 @@ fn write_gut_header(buf: &mut [u8], ppn: u32, enc_ports: u32, pad_len: usize, no
     buf[4..8].copy_from_slice(&enc_ports.to_le_bytes());
     buf[8] = noise_byte;
     // byte 9: pad_len directly (1..63), or noise_byte|0x40 for no-ballast
-    buf[9] = if pad_len > 0 { (pad_len as u8).min(63) } else { noise_byte | 0x40 };
+    buf[9] = if pad_len > 0 {
+        (pad_len as u8).min(63)
+    } else {
+        noise_byte | 0x40
+    };
 }
 
 #[inline]
