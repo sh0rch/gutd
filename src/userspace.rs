@@ -482,12 +482,11 @@ pub fn obfs_encap(
     }
 
     if pad_len > 0 {
-        let raw = (pad_len - 1) as u8;
         // copy padding to the end
         for i in 0..pad_len {
             buf[wg_off + orig_len + i] = pad_block[i & 0x3F];
         }
-        buf[quic_hdr_len - 1] = 0x40 | raw;
+        buf[quic_hdr_len - 1] = (pad_len as u8).min(63);
     } else {
         buf[quic_hdr_len - 1] = 0x00;
     }
@@ -496,12 +495,11 @@ pub fn obfs_encap(
 
     if quic_hdr_len == GUT_HEADER_SIZE {
         write_gut_header(buf, ppn, enc_ports, pad_len, pad_block[0]);
-        // All modes (including GUT) encode pad_len in byte 9:
-        //   0x40 | (pad_len-1)  or  0x00 if no padding.
+        // All modes: byte 9 = pad_len directly (1..63), or noise|0x40 if no padding.
         buf[9] = if pad_len > 0 {
-            0x40 | ((pad_len - 1) as u8 & 0x3F)
+            (pad_len as u8).min(63)
         } else {
-            0x00
+            pad_block[0] | 0x40
         };
     } else if quic_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE {
         write_quic_short_header(buf, dcid, ppn, enc_ports, pad_len);
@@ -522,11 +520,9 @@ pub fn obfs_encap(
 fn write_gut_header(buf: &mut [u8], ppn: u32, enc_ports: u32, pad_len: usize, noise_byte: u8) {
     buf[0..4].copy_from_slice(&ppn.to_le_bytes());
     buf[4..8].copy_from_slice(&enc_ports.to_le_bytes());
-    buf[8] = 0x00;
-    // byte 9: overridden by caller with 0x40|(pad_len-1) encoding (or 0x00 if no padding)
-    let _ = pad_len;
-    let _ = noise_byte;
-    buf[9] = 0x00; // placeholder; caller writes the real value
+    buf[8] = noise_byte;
+    // byte 9: pad_len directly (1..63), or noise_byte|0x40 for no-ballast
+    buf[9] = if pad_len > 0 { (pad_len as u8).min(63) } else { noise_byte | 0x40 };
 }
 
 #[inline]
@@ -538,9 +534,10 @@ fn write_quic_short_header(buf: &mut [u8], dcid: u32, ppn: u32, enc_ports: u32, 
     buf[10..14].copy_from_slice(&enc_ports.to_le_bytes());
     buf[14] = 0x00; // Reserved
     buf[15] = if pad_len > 0 {
-        0x40 | ((pad_len as u8 - 1) & 0x3F)
+        (pad_len as u8).min(63)
     } else {
-        0
+        // use ppn byte as noise so no-ballast isn't a constant 0x00
+        buf[6] | 0x40
     };
 }
 
@@ -761,9 +758,9 @@ fn write_quic_long_header(
     }
 
     buf[GUT_QUIC_LONG_HEADER_SIZE - 1] = if pad_len > 0 {
-        0x40 | ((pad_len as u8 - 1) & 0x3F)
+        (pad_len as u8).min(63)
     } else {
-        0
+        pad_block[0] | 0x40
     };
 }
 
@@ -802,8 +799,8 @@ pub fn obfs_verify(
     let wg_len = orig_len - hdr_len;
     // All modes encode ballast in buf[hdr_len-1] (GUT byte 9, QUIC pad byte, etc.).
     let pad_byte = buf[hdr_len - 1];
-    let ballast_len = if (pad_byte & 0x40) != 0 {
-        ((pad_byte & 0x3F) as usize) + 1
+    let ballast_len = if pad_byte != 0 && (pad_byte & 0xC0) == 0 {
+        pad_byte as usize
     } else {
         0
     };
@@ -887,8 +884,8 @@ pub fn obfs_decap(
     let wg_len = orig_len - hdr_len;
     // All modes encode ballast in buf[hdr_len-1] (GUT byte 9, QUIC pad byte, etc.).
     let pad_byte = buf[hdr_len - 1];
-    let ballast_len = if (pad_byte & 0x40) != 0 {
-        ((pad_byte & 0x3F) as usize) + 1
+    let ballast_len = if pad_byte != 0 && (pad_byte & 0xC0) == 0 {
+        pad_byte as usize
     } else {
         0
     };
