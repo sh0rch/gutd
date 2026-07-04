@@ -28,14 +28,16 @@ jobs:
     with:
       update_readme: false
 
-  ndpi-evasion:
+  compat-test:
     needs: build
-    uses: ./.github/workflows/ndpi-evasion.yml
+    uses: ./.github/workflows/compat-test.yml
     with:
       skip_build: true
+      scenario: 'all'
+      obfs: 'all'
 
   verify_and_prepare:
-    needs: [build, integration-test, ndpi-evasion]
+    needs: [build, integration-test, compat-test]
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v4

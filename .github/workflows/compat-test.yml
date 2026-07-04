@@ -25,6 +25,23 @@ on:
           - syslog
           - all
         default: 'all'
+  workflow_call:
+    inputs:
+      skip_build:
+        description: 'Skip gutd source build (reuse gutd-x86_64 artifact from caller)'
+        type: boolean
+        required: false
+        default: false
+      scenario:
+        description: 'Compatibility scenario (all or specific)'
+        type: string
+        required: false
+        default: 'all'
+      obfs:
+        description: 'Obfuscation mode (all or specific)'
+        type: string
+        required: false
+        default: 'all'
 
 permissions:
   contents: read
@@ -36,7 +53,24 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    # --- skip_build=true: reuse pre-built artifact from calling workflow ---
+    - name: Download pre-built gutd binary
+      if: ${{ inputs.skip_build }}
+      uses: actions/download-artifact@v4
+      with:
+        name: gutd-x86_64
+        path: dist
+
+    - name: Prepare pre-built binary
+      if: ${{ inputs.skip_build }}
+      run: |
+        mv dist/gutd-x86_64 dist/gutd-amd64
+        chmod +x dist/gutd-amd64
+        dist/gutd-amd64 --version
+
+    # --- skip_build=false: build from source ---
     - name: Cache Rust toolchain
+      if: ${{ !inputs.skip_build }}
       uses: actions/cache@v4
       with:
         path: |
@@ -46,6 +80,7 @@ jobs:
         key: compat-build-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
     - name: Build gutd Docker image
+      if: ${{ !inputs.skip_build }}
       run: |
         docker build -t gutd-build -f docker/Dockerfile.x86_64 .
         mkdir -p dist
@@ -55,6 +90,7 @@ jobs:
         chmod +x dist/gutd-amd64
         dist/gutd-amd64 --version
 
+    # --- always: build runtime test image from whichever binary we have ---
     - name: Build runtime image
       run: |
         docker build \
@@ -80,7 +116,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: /tmp/nDPI
-        key: ndpi-${{ runner.os }}-compat-v1
+        key: ndpi-${{ runner.os }}-v1
 
     - name: Build nDPI from source
       if: steps.cache-ndpi.outputs.cache-hit != 'true'
@@ -101,7 +137,7 @@ jobs:
     - name: Upload ndpiReader
       uses: actions/upload-artifact@v4
       with:
-        name: ndpiReader-compat
+        name: ndpiReader
         path: /tmp/nDPI/example/ndpiReader
         retention-days: 1
 
@@ -143,7 +179,7 @@ jobs:
     - name: Download ndpiReader
       uses: actions/download-artifact@v4
       with:
-        name: ndpiReader-compat
+        name: ndpiReader
         path: /tmp/ndpi-bin
 
     - name: Prepare tools
