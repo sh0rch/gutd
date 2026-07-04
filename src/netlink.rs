@@ -463,6 +463,7 @@ pub fn link_set_noarp(name: &str) {
 ///   HW_CSUM uses csum_start/csum_offset from TX descriptor; works when
 ///   bpf_l4_csum_replace(BPF_F_MARK_ENFORCE) sets csum_start correctly.
 /// - `has_ip6_csum` = `NETIF_F_IPV6_CSUM` (bit 4): same for IPv6.
+///
 /// Check if NIC TX checksum offload is still active (any csum bit set).
 ///
 /// Used after `link_disable_offloads` to detect if the disable was ignored

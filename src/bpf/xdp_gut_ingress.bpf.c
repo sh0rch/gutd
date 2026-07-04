@@ -284,7 +284,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
          * to the packet and need a single bpf_xdp_adjust_tail. */
         __u32 pad_off = (B64_INNER_OFF + 9) & (SCRATCH_SIZE - 1);
         __u8 pad_byte_s = scratch[pad_off];
-        __u32 ballast_s = (pad_byte_s & 0x40) ? ((__u32)(pad_byte_s & 0x3F) + 1) : 0;
+        __u32 ballast_s = (pad_byte_s != 0 && (pad_byte_s & 0xC0) == 0) ? (__u32)pad_byte_s : 0;
         if (ballast_s >= decoded_len - GUT_HEADER_SIZE)
             return -1;
         decoded_len -= ballast_s;
@@ -292,7 +292,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         decoded_len &= 0x3FF;
         if (decoded_len < GUT_HEADER_SIZE + WG_MIN_PACKET || decoded_len > 1023)
             return -1;
-        scratch[pad_off] = 0x00; /* clear ballast flag for shared GUT code */
+        scratch[pad_off] = 0x00; /* clear ballast byte */
 
         /* Verifier-safe clamp (same pattern as SIP path for 6.1 compat) */
         __u32 slen = decoded_len;
@@ -486,7 +486,7 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         /* Strip ballast from decoded GUT inner */
         __u32 pad_off = (B64_INNER_OFF + 9) & (SCRATCH_SIZE - 1);
         __u8 pad_byte_s = scratch[pad_off];
-        __u32 ballast_s = (pad_byte_s & 0x40) ? ((__u32)(pad_byte_s & 0x3F) + 1) : 0;
+        __u32 ballast_s = (pad_byte_s != 0 && (pad_byte_s & 0xC0) == 0) ? (__u32)pad_byte_s : 0;
         if (ballast_s >= decoded_len - GUT_HEADER_SIZE)
             return -1;
         decoded_len -= ballast_s;
@@ -555,14 +555,14 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
 #endif
 
     /* All modes encode ballast in the last byte of the outer protocol header:
-     *   0x40 | (pad_len-1)  — has ballast, length = (byte & 0x3F) + 1 ∈ [1..64]
-     *   0x00                — no ballast
-     * GUT_MODE_GUT previously used an alignment formula; now uses the same
-     * byte-9 encoding so the receiver just reads pad_len directly. */
+     *   0          — no ballast
+     *   1..63      — ballast present, length = byte value (bits 6,7 must be 0)
+     *   >= 64      — invalid / hardware-corrupted; bits 6 or 7 set — treat as 0 */
+    if (wg + outer_hdr_len > (__u8 *)data_end)
+        return -1;
     __u8 pad_byte = wg[outer_hdr_len - 1];
-    /* bit6 (0x40) = has-ballast flag; bits[0:5]+1 = actual ballast len [1..64].
-     * 0x00 = no ballast (large packet — skip tail trimming). */
-    __u32 ballast_len = (pad_byte & 0x40) ? ((__u32)(pad_byte & 0x3F) + 1) : 0;
+    /* bits 6,7 == 0 && != 0  →  1..63 = valid ballast length */
+    __u32 ballast_len = (pad_byte != 0 && (pad_byte & 0xC0) == 0) ? (__u32)pad_byte : 0;
 
     wg += outer_hdr_len;
     wg_len -= outer_hdr_len;

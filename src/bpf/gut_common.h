@@ -1670,17 +1670,18 @@ static __attribute__((noinline)) void gcm_ghash_tag_128(
 
 #endif /* __GUT_COMMON_H__ */
 
-static __always_inline void write_gut_header(__u8 *quic, void *data_end, __u32 ppn, __u32 enc_ports, __u32 pad_len, __u8 noise_byte, __u8 noise9)
+static __always_inline void write_gut_header(__u8 *quic, void *data_end, __u32 ppn, __u32 enc_ports, __u32 pad_len, __u8 noise_byte)
 {
     if ((__u8 *)quic + GUT_HEADER_SIZE > (__u8 *)data_end)
         return;
     __builtin_memcpy((__u8 *)quic + 0, &ppn, 4);
     __builtin_memcpy((__u8 *)quic + 4, &enc_ports, 4);
     quic[8] = noise_byte; /* random ChaCha-derived byte; prevents static 0x00 pattern at WG nonce offset */
-    /* byte 9: ballast length encoding (same as SIP/Syslog/QUIC):
-     *   0x40 | (pad_len-1)  — has ballast, length = (byte9 & 0x3F) + 1 ∈ [1..64]
-     *   noise & 0x3F        — no ballast; value < 64 (bit6=0); XDP checks only bit6 */
-    quic[9] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : (noise9 & 0x3F);
+    /* byte 9: ballast length encoding:
+     *   0        — no ballast
+     *   1..63    — ballast = byte value (bits 6,7 must be 0)
+     * XDP rejects >= 64 (bits 6 or 7 set) as invalid/corrupted. */
+    quic[9] = (pad_len > 0 && pad_len < 64) ? (__u8)pad_len : 0;
 }
 
 /* ── Base64 encode/decode for Syslog / SIP BPF modes ──────────────────
@@ -2533,7 +2534,7 @@ static __always_inline void write_quic_short_header(__u8 *quic, void *data_end, 
     __builtin_memcpy((__u8 *)quic + 6, &ppn, 4);
     __builtin_memcpy((__u8 *)quic + 10, &enc_ports, 4);
     quic[14] = ((__u8 *)&ppn)[0] ^ ((__u8 *)&dcid)[3]; /* anti-fingerprint: keyed non-zero */
-    quic[15] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
+    quic[15] = (pad_len > 0 && pad_len < 64) ? (__u8)pad_len : 0x00;
 }
 
 #if defined(GUT_MODE_QUIC)
@@ -2749,7 +2750,7 @@ static __always_inline void write_quic_long_header(__u8 *quic, void *data_end, _
     for (__u32 i = 178; i < GUT_QUIC_LONG_HEADER_SIZE - 1 && i < 1199; i++)
         quic[i] = pad_block[(i * 7) & 0x3F] ^ gut_bytes[i & 3];
 
-    /* Ballast encoding in last byte (outside AEAD region) */
-    quic[GUT_QUIC_LONG_HEADER_SIZE - 1] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
+    /* Ballast encoding in last byte (outside AEAD region): 0=none, 1..63=length */
+    quic[GUT_QUIC_LONG_HEADER_SIZE - 1] = (pad_len > 0 && pad_len < 64) ? (__u8)pad_len : 0x00;
 }
 #endif /* GUT_MODE_QUIC — write_quic_long_header */

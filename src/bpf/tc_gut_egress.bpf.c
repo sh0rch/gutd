@@ -437,7 +437,7 @@ int gut_egress(struct __sk_buff *skb)
         __builtin_memcpy(inner, &ppn, 4);
         __builtin_memcpy(inner + 4, &enc_ports, 4);
         inner[8] = 0x00;
-        inner[9] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
+        inner[9] = (pad_len > 0 && pad_len < 64) ? (__u8)pad_len : 0x00;
 
         {
             __u32 load_len;
@@ -597,7 +597,7 @@ int gut_egress(struct __sk_buff *skb)
         __builtin_memcpy(rtp_gut + 12, &ppn, 4);
         __builtin_memcpy(rtp_gut + 16, &enc_ports, 4);
         rtp_gut[20] = 0x00;
-        rtp_gut[21] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
+        rtp_gut[21] = (pad_len > 0 && pad_len < 64) ? (__u8)pad_len : 0x00;
 
         /* Write updated WG headers (XOR'd) and mac2 to RTP payload */
         /* RTP payload starts at new_quic_off + 22.
@@ -611,7 +611,7 @@ int gut_egress(struct __sk_buff *skb)
     }
 #elif defined(GUT_MODE_GUT)
     __u8 *quic = (__u8 *)data + new_quic_off;
-    write_gut_header(quic, data_end, ppn, enc_ports, pad_len, pad_block[0], pad_block[1]);
+    write_gut_header(quic, data_end, ppn, enc_ports, pad_len, pad_block[0]);
 #else  /* GUT_MODE_QUIC */
     __u8 *quic = (__u8 *)data + new_quic_off;
     if (outer_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
@@ -727,11 +727,17 @@ int gut_egress(struct __sk_buff *skb)
             udph->check = 0;
             if (cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM)
             {
-                /* ~csum_fold(pseudo) = fold(pseudo): correct seed for NETIF_F_HW_CSUM.
-                 * HW computes ~fold(seed + udp_hdr + payload); seed must be fold(pseudo)
-                 * so that result equals ~fold(pseudo + udp_hdr + payload). */
-                bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, ~csum_fold(csum),
-                                    BPF_F_MARK_ENFORCE | 2);
+                if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
+                {
+                    /* ~csum_fold(pseudo) = fold(pseudo): correct seed for NETIF_F_HW_CSUM.
+                     * HW computes ~fold(seed + udp_hdr + payload); seed = fold(pseudo)
+                     * so result = ~fold(pseudo + udp_hdr + payload). */
+                    bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, ~csum_fold(csum),
+                                        BPF_F_MARK_ENFORCE | 2);
+                }
+                /* ENCAP_CSUM (old QEMU): leave udph->check=0.  virtio shifts csum_start
+                 * by +10 so QEMU writes to GUT byte 8 (noise_byte); outer UDP cksum=0
+                 * is valid per RFC 768 and ignored by relay XDP. */
             }
             else
             {
@@ -812,8 +818,10 @@ int gut_egress(struct __sk_buff *skb)
             udph->check = 0;
             if (cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM)
             {
-                bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, ~csum_fold(csum),
-                                    BPF_F_MARK_ENFORCE | 2);
+                if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
+                    bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, ~csum_fold(csum),
+                                        BPF_F_MARK_ENFORCE | 2);
+                /* ENCAP_CSUM: leave check=0 */
             }
             else
             {
@@ -904,7 +912,7 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
         __builtin_memcpy(inner, &ppn, 4);
         __builtin_memcpy(inner + 4, &enc_ports, 4);
         inner[8] = 0x00;
-        inner[9] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
+        inner[9] = (pad_len > 0 && pad_len < 64) ? (__u8)pad_len : 0x00;
 
         /* Load already-XOR'd WG+ballast from the packet into scratch */
         {
@@ -1073,8 +1081,10 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
             udph->check = 0;
             if (cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM)
             {
-                bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, ~csum_fold(csum),
-                                    BPF_F_MARK_ENFORCE | 2);
+                if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
+                    bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, ~csum_fold(csum),
+                                        BPF_F_MARK_ENFORCE | 2);
+                /* ENCAP_CSUM: leave check=0 */
             }
             else
             {
@@ -1134,8 +1144,10 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
             udph->check = 0;
             if (cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM)
             {
-                bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, ~csum_fold(csum),
-                                    BPF_F_MARK_ENFORCE | 2);
+                if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
+                    bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, ~csum_fold(csum),
+                                        BPF_F_MARK_ENFORCE | 2);
+                /* ENCAP_CSUM: leave check=0 */
             }
             else
             {
@@ -1292,8 +1304,10 @@ int gut_egress_quic_long(struct __sk_buff *skb)
             udph->check = 0;
             if (cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM)
             {
-                bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, ~csum_fold(csum),
-                                    BPF_F_MARK_ENFORCE | 2);
+                if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
+                    bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, ~csum_fold(csum),
+                                        BPF_F_MARK_ENFORCE | 2);
+                /* ENCAP_CSUM: leave check=0 */
             }
             else
             {
@@ -1353,8 +1367,10 @@ int gut_egress_quic_long(struct __sk_buff *skb)
             udph->check = 0;
             if (cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM)
             {
-                bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, ~csum_fold(csum),
-                                    BPF_F_MARK_ENFORCE | 2);
+                if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
+                    bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, ~csum_fold(csum),
+                                        BPF_F_MARK_ENFORCE | 2);
+                /* ENCAP_CSUM: leave check=0 */
             }
             else
             {

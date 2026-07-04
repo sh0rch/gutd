@@ -2001,15 +2001,14 @@ impl TcBpfManager {
         let encap_needed = is_qemu_legacy_cpu();
         if encap_needed {
             flags |= GUT_FLAG_ENCAP_CSUM;
-            // Old QEMU virtio cannot compute correct checksums via NEEDS_CSUM:
-            // guest kernel shifts csum_start for encapsulation, QEMU computes
-            // from wrong offset.  Force BPF software checksum (fallback path)
-            // instead — bpf_skb_adjust_room(0,NET,0) will set CHECKSUM_NONE so
-            // QEMU never recomputes, and the BPF-written value is preserved.
-            flags &= !(GUT_FLAG_HW_IP4_CSUM | GUT_FLAG_HW_IP6_CSUM) as u16;
+            // HW_IP4/6_CSUM stays set.  In the BPF egress path, when both
+            // ENCAP_CSUM and HW_*_CSUM are set we skip bpf_l4_csum_replace
+            // and leave udph->check = 0 (valid for IPv4/IPv6 per RFC 768/8200).
+            // The virtio csum_start adjustment for encapsulation shifts the
+            // write position to GUT byte 8 (noise_byte), which XDP ignores.
             eprintln!(
                 "  offloads: detected old QEMU Virtual CPU \
-                 \u{2014} enabling ENCAP_CSUM, disabling HW csum (force BPF software path)"
+                 \u{2014} enabling ENCAP_CSUM, zero outer UDP checksum (RFC 768)"
             );
         }
 
