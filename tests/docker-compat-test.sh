@@ -714,12 +714,18 @@ echo "$PING_OUT" | sed 's/^/  /'
 if echo "$PING_OUT" | grep -q "0% packet loss"; then
     ok "Ping: 0% loss"; PING_OK=1
 elif echo "$PING_OUT" | grep -qP '\d+ received'; then
-    warn "Ping: some loss"; PING_OK=1
+    RECEIVED=$(echo "$PING_OUT" | grep -oP '\d+ received' | grep -oP '\d+')
+    if [[ ${RECEIVED:-0} -gt 0 ]]; then
+        warn "Ping: partial loss (${RECEIVED}/10 received)"; PING_OK=1
+    else
+        fail "Ping: 100% loss — tunnel not passing ICMP"
+    fi
 else
     fail "Ping: 100% loss"
 fi
 
 # ── iperf3 TCP ────────────────────────────────────────────────────
+IPERF_OK=0
 IPERF_TCP_UP="N/A"; IPERF_TCP_DN="N/A"
 IPERF_TCP_UP_RETR="N/A"; IPERF_TCP_DN_RETR="N/A"
 if [[ $PING_OK -eq 1 ]]; then
@@ -741,7 +747,7 @@ if [[ $PING_OK -eq 1 ]]; then
         | grep -oP '[\d.]+\s+[GM]bits/sec\s+\K\d+') || true
     [[ -n "$IPERF_TCP_UP" ]] \
         && ok "TCP upload: $IPERF_TCP_UP  retr: ${IPERF_TCP_UP_RETR:-?}" \
-        || warn "TCP upload: could not parse"
+        || { warn "TCP upload: could not parse"; }
 
     step "iperf3 TCP download 10s"
     docker exec wg_server pkill -f 'iperf3.*5201' 2>/dev/null || true
@@ -755,7 +761,9 @@ if [[ $PING_OK -eq 1 ]]; then
         | grep -oP '[\d.]+\s+[GM]bits/sec\s+\K\d+') || true
     [[ -n "$IPERF_TCP_DN" ]] \
         && ok "TCP download: $IPERF_TCP_DN  retr: ${IPERF_TCP_DN_RETR:-?}" \
-        || warn "TCP download: could not parse"
+        || { warn "TCP download: could not parse"; }
+    # iperf3 OK only if BOTH directions got results
+    [[ -n "$IPERF_TCP_UP" && -n "$IPERF_TCP_DN" ]] && IPERF_OK=1 || true
 fi
 
 # ── iperf3 UDP ──────────────────────────────────────────────────── 
@@ -891,7 +899,16 @@ if [[ $CI_MODE -eq 1 ]]; then
             echo "| Scenario | ${SCENARIO} (relay=${RELAY_TAG}, server=${SERVER_TAG}) |"
             echo "| Obfs mode | ${OBFS_MODE} |"
             echo "| WG handshake | $([ $WG_READY -eq 1 ] && echo 'PASS ✓' || echo 'FAIL ✗') |"
-            echo "| WG ping | $([ $PING_OK -eq 1 ] && echo 'PASS' || echo 'FAIL') |"
+    if [[ $PING_OK -eq 1 ]]; then
+        echo "| WG ping | PASS |"
+    else
+        echo "| WG ping | FAIL ✗ (100% loss) |"
+    fi
+    if [[ $IPERF_OK -eq 1 ]]; then
+        echo "| iperf3 data flow | PASS |"
+    else
+        echo "| iperf3 data flow | FAIL ✗ (no response) |"
+    fi
             echo "| TCP upload | ${IPERF_TCP_UP:-N/A} retr=${IPERF_TCP_UP_RETR:-N/A} |"
             echo "| TCP download | ${IPERF_TCP_DN:-N/A} retr=${IPERF_TCP_DN_RETR:-N/A} |"
             echo "| UDP upload | ${IPERF_UDP_UP:-N/A} loss=${IPERF_UDP_LOSS_UP:-N/A} |"
@@ -901,11 +918,12 @@ if [[ $CI_MODE -eq 1 ]]; then
         } >> "$GITHUB_STEP_SUMMARY"
     fi
 
-    if [[ $PING_OK -eq 1 ]]; then
+    if [[ $PING_OK -eq 1 && $IPERF_OK -eq 1 ]]; then
         log "PASS"
         exit 0
     else
-        error "FAIL"
+        [[ $PING_OK -eq 0 ]] && error "FAIL: WG tunnel ping — 100% loss"
+        [[ $PING_OK -eq 1 && $IPERF_OK -eq 0 ]] && error "FAIL: iperf3 got no response — tunnel passes ICMP but not TCP data"
         exit 1
     fi
 fi
