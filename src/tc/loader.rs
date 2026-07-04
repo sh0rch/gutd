@@ -31,8 +31,8 @@ use crate::netlink::{
     probe_neighbor_udp, read_gso_max_size, read_mac, read_mtu,
 };
 use crate::tc::maps::{
-    GutConfig, GutStats, DEFAULT_INNER_MTU, GUT_FLAG_HW_IP4_CSUM, GUT_FLAG_HW_IP6_CSUM,
-    GUT_FLAG_NEED_L4_CSUM, OUTER_OVERHEAD_IPV4, OUTER_OVERHEAD_IPV6,
+    GutConfig, GutStats, DEFAULT_INNER_MTU, GUT_FLAG_ENCAP_CSUM, GUT_FLAG_HW_IP4_CSUM,
+    GUT_FLAG_HW_IP6_CSUM, GUT_FLAG_NEED_L4_CSUM, OUTER_OVERHEAD_IPV4, OUTER_OVERHEAD_IPV6,
 };
 use crate::Result;
 use std::sync::atomic::Ordering;
@@ -1970,7 +1970,7 @@ impl TcBpfManager {
 
     #[cfg(target_os = "linux")]
     fn probe_offload_flags(ifname: &str, egress_ifname: &str) -> u16 {
-        use crate::netlink::probe_tx_csum_features;
+        use crate::netlink::{is_qemu_legacy_cpu, probe_tx_csum_features};
 
         let disable_l4_csum = std::env::var("GUTD_FORCE_L4_CSUM")
             .ok()
@@ -1994,9 +1994,21 @@ impl TcBpfManager {
             flags |= GUT_FLAG_HW_IP6_CSUM;
         }
 
+        // Detect old QEMU 2.x virtual CPU: ignores ip_summed=CHECKSUM_NONE, always
+        // computes checksum with stale csum_start, corrupting GUT/QUIC header bytes 8-9.
+        // Detection: "QEMU Virtual CPU" in /proc/cpuinfo model name (old QEMU 2.x default).
+        // Modern QEMU uses host CPU or named CPU types — no "QEMU Virtual CPU".
+        let encap_needed = is_qemu_legacy_cpu();
+        if encap_needed {
+            flags |= GUT_FLAG_ENCAP_CSUM;
+            eprintln!(
+                "  offloads: detected old QEMU Virtual CPU \
+                 \u{2014} enabling ENCAP_CSUM to fix outer UDP csum_start"
+            );
+        }
+
         eprintln!(
-            "  offloads: {egress_ifname} \u{2192} ip4_csum_hw={ip4} ip6_csum_hw={ip6} \
-             (NETIF_F_IP_CSUM / NETIF_F_IPV6_CSUM; 0=BPF full csum, 1=NIC offload)"
+            "  offloads: {egress_ifname} \u{2192} ip4_csum_hw={ip4} ip6_csum_hw={ip6} encap_csum={encap_needed}"
         );
 
         flags

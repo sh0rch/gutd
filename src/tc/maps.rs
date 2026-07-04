@@ -202,6 +202,12 @@ pub const GUT_FLAG_NEED_L4_CSUM: u16 = 1 << 0;
 pub const GUT_FLAG_HW_IP4_CSUM: u16 = 1 << 1;
 /// NETIF_F_IPV6_CSUM: same capability for IPv6.
 pub const GUT_FLAG_HW_IP6_CSUM: u16 = 1 << 2;
+/// ENCAP_CSUM: use BPF_F_ADJ_ROOM_ENCAP_L3/L4 on adjust_room_mac.
+/// Needed on hypervisors (e.g. old QEMU virtio) that ignore ip_summed=CHECKSUM_NONE
+/// and always compute checksum using stale csum_start, which would corrupt
+/// GUT/QUIC/Syslog header bytes.  Detected at startup: if link_disable_offloads
+/// fails to turn off gut0 TX csum, the hardware will misbehave without ENCAP.
+pub const GUT_FLAG_ENCAP_CSUM: u16 = 1 << 3;
 
 fn compute_chacha_init(key: &[u8; 32]) -> [u32; 12] {
     let mut init = [0u32; 12];

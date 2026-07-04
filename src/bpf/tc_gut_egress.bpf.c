@@ -253,10 +253,10 @@ int gut_egress(struct __sk_buff *skb)
      * tnum loses umin; explicit re-check restores [1,64] before the store. */
     __u32 pad_len = 0;
 #if defined(GUT_MODE_GUT)
-    /* GUT: random padding [1..63] bytes, always 16-byte-aligned, for small packets.
-     * Structure: align_base (1..16) + extra_groups * 16 where extra_groups ∈ [0..3].
-     * Encoded in GUT header byte 9 as 0x40 | (pad_len-1) so the receiver can strip
-     * it directly — no alignment formula needed on the receive side. */
+    /* GUT: random ballast [1..63] bytes for small packets.
+     * Encoded in GUT header byte 9 as 0x40|(pad_len-1); XDP strips exactly pad_len bytes.
+     * On hardware where csum_start is corrected (ENCAP flags active), byte 9 is
+     * preserved intact and XDP can read it reliably. */
     if (wg_len < BALLAST_THRESHOLD)
     {
         __u32 base_udp = 8 + outer_hdr_len + wg_len;
@@ -296,12 +296,12 @@ int gut_egress(struct __sk_buff *skb)
             return TC_ACT_OK;
         /* Re-establish [1,64] for verifier after bpf_skb_change_tail stack spill.
          * Compiler optimizes out a plain check; asm volatile forces the bound. */
-        asm volatile("%[v] &= 127\n\t"
+        asm volatile("%[v] &= 63\n\t"
                      "if %[v] < 1 goto +0"
                      : [v] "+r"(pad_len)
                      :
                      :);
-        if (pad_len < 1 || pad_len > 64)
+        if (pad_len < 1 || pad_len > 63)
             return TC_ACT_OK;
         if (bpf_skb_store_bytes(skb, skb->len - pad_len, pad_block, pad_len, 0) < 0)
             return TC_ACT_OK;
@@ -479,11 +479,18 @@ int gut_egress(struct __sk_buff *skb)
     __u32 room = outer_hdr_len;
 #endif
 
-    /* ENCAP-aware adjust_room causes skb->encapsulation=1 side-effects that
-     * break Type-4 data forwarding on some hypervisors (e.g. BlueVPS virtio).
-     * Use plain flags=0: bpf_l4_csum_replace(BPF_F_MARK_ENFORCE) on the HW
-     * offload path provides correct csum_start independently. */
-    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, 0) < 0)
+    /* ENCAP flags: used when hardware ignores ip_summed=CHECKSUM_NONE and insists
+     * on computing checksum using csum_start (e.g. old QEMU 2.5+ virtio).
+     * With ENCAP_L4_UDP, csum_start is set to the outer UDP position so hardware
+     * writes checksum to the correct field instead of GUT header bytes 8-9.
+     * Only needed when HW offload path is active (GUT_FLAG_HW_IP4/6_CSUM set). */
+    __u64 adj_flags = 0;
+    if (cfg->offload_flags & GUT_FLAG_ENCAP_CSUM)
+    {
+        adj_flags = BPF_F_ADJ_ROOM_ENCAP_L4_UDP | BPF_F_ADJ_ROOM_FIXED_GSO;
+        adj_flags |= (ipver == 6) ? BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 : BPF_F_ADJ_ROOM_ENCAP_L3_IPV4;
+    }
+    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, adj_flags) < 0)
         return TC_ACT_OK;
 
     if (bpf_skb_pull_data(skb, skb->len) < 0)
@@ -938,7 +945,13 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
     }
 
     /* ── Adjust packet size and shift IP/UDP headers ── */
-    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, 0) < 0)
+    __u64 adj_flags2 = 0;
+    if (cfg->offload_flags & GUT_FLAG_ENCAP_CSUM)
+    {
+        adj_flags2 = BPF_F_ADJ_ROOM_ENCAP_L4_UDP | BPF_F_ADJ_ROOM_FIXED_GSO;
+        adj_flags2 |= (ipver == 6) ? BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 : BPF_F_ADJ_ROOM_ENCAP_L3_IPV4;
+    }
+    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, adj_flags2) < 0)
         return TC_ACT_OK;
 
     if (bpf_skb_pull_data(skb, skb->len) < 0)

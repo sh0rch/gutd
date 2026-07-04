@@ -463,6 +463,74 @@ pub fn link_set_noarp(name: &str) {
 ///   HW_CSUM uses csum_start/csum_offset from TX descriptor; works when
 ///   bpf_l4_csum_replace(BPF_F_MARK_ENFORCE) sets csum_start correctly.
 /// - `has_ip6_csum` = `NETIF_F_IPV6_CSUM` (bit 4): same for IPv6.
+/// Check if NIC TX checksum offload is still active (any csum bit set).
+/// Used after `link_disable_offloads` to detect if the disable was ignored
+/// (e.g. old QEMU virtio where ETHTOOL_STXCSUM/SFEATURES is a no-op).
+/// Tries sysfs first (Linux ≥ 2.6.39), falls back to ETHTOOL_GTXCSUM ioctl.
+pub fn probe_tx_csum_active(name: &str) -> bool {
+    // Try sysfs features file (Linux ≥ 2.6.39, not always present)
+    const CSUM_BITS: u64 = (1 << 1) | (1 << 3) | (1 << 4); /* IP_CSUM | HW_CSUM | IPV6_CSUM */
+    let path = format!("/sys/class/net/{name}/features");
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        let hex = content.trim().trim_start_matches("0x");
+        if let Ok(features) = u64::from_str_radix(hex, 16) {
+            return features & CSUM_BITS != 0;
+        }
+    }
+
+    // Fallback: ETHTOOL_GTXCSUM ioctl (works on all kernels with ethtool support)
+    #[repr(C)]
+    struct EthtoolValue {
+        cmd: u32,
+        data: u32,
+    }
+    const ETHTOOL_GTXCSUM: u32 = 0x16;
+
+    unsafe {
+        let sock = ioctl_sock();
+        if sock < 0 {
+            return false;
+        }
+        let _g = FdGuard(sock);
+        let mut ev = EthtoolValue {
+            cmd: ETHTOOL_GTXCSUM,
+            data: 0,
+        };
+        let mut ifr: libc::ifreq = std::mem::zeroed();
+        fill_ifname(&mut ifr.ifr_name, name);
+        ifr.ifr_ifru.ifru_data = &mut ev as *mut EthtoolValue as *mut libc::c_char;
+        if libc::ioctl(sock, SIOCETHTOOL as _, &ifr) == 0 {
+            return ev.data != 0; // 1 = TX csum enabled, 0 = disabled
+        }
+        false // ioctl failed → assume disabled (safe default)
+    }
+}
+
+/// Detect old QEMU virtual CPU that ignores ip_summed=CHECKSUM_NONE.
+/// QEMU 2.x and 3.x use "QEMU Virtual CPU version N.x" as model name.
+/// QEMU 4.x+ (e.g. "version 4.2.0") works correctly — confirmed empirically.
+/// False positives (flagging QEMU 3.x that actually works) are harmless:
+/// ENCAP + HW offload path computes correct outer UDP checksum regardless.
+pub fn is_qemu_legacy_cpu() -> bool {
+    std::fs::read_to_string("/proc/cpuinfo").map_or(false, |cpuinfo| {
+        cpuinfo.lines().any(|l| {
+            if !l.starts_with("model name") || !l.contains("QEMU Virtual CPU version ") {
+                return false;
+            }
+            // Extract major version number, flag versions < 4
+            if let Some(ver) = l.split("version ").nth(1) {
+                let major: u32 = ver
+                    .split('.')
+                    .next()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(99);
+                return major < 4;
+            }
+            false
+        })
+    })
+}
+
 pub fn probe_tx_csum_features(name: &str) -> (bool, bool) {
     const IP4_BIT: u64 = (1 << 1) | (1 << 3); /* NETIF_F_IP_CSUM | NETIF_F_HW_CSUM */
     const IP6_BIT: u64 = 1 << 4; /* NETIF_F_IPV6_CSUM */

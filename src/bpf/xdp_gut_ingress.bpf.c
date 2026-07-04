@@ -613,8 +613,10 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
             return -1;
 
         __u32 pkt_ppn = 0;
-        __builtin_memcpy(&pkt_ppn, quic + 6, 4);
-        if (pkt_ppn != expected_ppn)
+        __builtin_memcpy(&pkt_ppn, quic + 6, 2); /* bytes 6-7 only; skip bytes 8-9
+                                                  * (may be overwritten by hardware
+                                                  * checksum on old QEMU virtio) */
+        if ((pkt_ppn & 0xFFFF) != (expected_ppn & 0xFFFF))
             return -1;
     }
     else
@@ -625,11 +627,19 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
         if (quic[5] != 0x08) // DCID length 8
             return -1;
 
-        __u32 pkt_dcid = 0;
-        __builtin_memcpy(&pkt_dcid, quic + 6, 4);
-        __u32 cfg_dcid = 0;
-        __builtin_memcpy(&cfg_dcid, cfg->quic_dcid, 4);
-        if (pkt_dcid != cfg_dcid)
+        /* Check DCID bytes 6-7 and 10-13; skip bytes 8-9 which may be
+         * overwritten by hardware checksum on old QEMU virtio. */
+        __u16 pkt_dcid_hi = 0;
+        __builtin_memcpy(&pkt_dcid_hi, quic + 6, 2);
+        __u16 cfg_dcid_hi = 0;
+        __builtin_memcpy(&cfg_dcid_hi, cfg->quic_dcid, 2);
+        if (pkt_dcid_hi != cfg_dcid_hi)
+            return -1;
+        __u32 pkt_dcid_lo = 0;
+        __builtin_memcpy(&pkt_dcid_lo, quic + 10, 4);
+        __u32 cfg_dcid_lo = 0;
+        __builtin_memcpy(&cfg_dcid_lo, cfg->quic_dcid + 4, 4);
+        if (pkt_dcid_lo != cfg_dcid_lo)
             return -1;
 
         /* PPN stored unmasked in SCID[0..3] (quic+15) by egress for fast ingress path */

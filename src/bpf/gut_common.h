@@ -98,6 +98,13 @@
 #define GUT_FLAG_NEED_L4_CSUM (1U << 0) /* finalize inner L4 csum when ip_summed==CHECKSUM_PARTIAL */
 #define GUT_FLAG_HW_IP4_CSUM (1U << 1)  /* NETIF_F_IP_CSUM|HW_CSUM: NIC completes outer UDP checksum for IPv4 */
 #define GUT_FLAG_HW_IP6_CSUM (1U << 2)  /* NETIF_F_IPV6_CSUM: same for IPv6 */
+/* Wire-geometry ballast recovery for GUT mode Type-4 data packets.
+ * When set, XDP ignores GUT header byte 9 and infers ballast from wire length:
+ *   WG inner payloads are 16-byte-aligned → ballast = (wg_len-WG_MIN_PACKET)&0xF (0..15)
+ * TC egress caps GUT ballast at 15 bytes.  Required when hypervisor XOR-obfuscates
+ * UDP payload bytes 8-9 (BlueVPS etc.), corrupting byte 9 and breaking all data. */
+#define GUT_FLAG_ENCAP_CSUM (1U << 3) /* adjust_room_mac with ENCAP_L3/L4 flags; needed when \
+                                       * hw ignores ip_summed=CHECKSUM_NONE (old QEMU virtio) */
 
 /* GUT protocol configuration (shared between Rust loader and eBPF) */
 struct gut_config
@@ -1672,9 +1679,8 @@ static __always_inline void write_gut_header(__u8 *quic, void *data_end, __u32 p
     quic[8] = noise_byte; /* random ChaCha-derived byte; prevents static 0x00 pattern at WG nonce offset */
     /* byte 9: ballast length encoding (same as SIP/Syslog/QUIC):
      *   0x40 | (pad_len-1)  — has ballast, length = (byte9 & 0x3F) + 1 ∈ [1..64]
-     *   0x80 | random       — no ballast; bit7=1 signals non-zero to avoid WG nonce 0x00
-     *                         fingerprinting; XDP checks only bit6 so this is wire-compatible. */
-    quic[9] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : (0x80 | (noise9 & 0x3F));
+     *   noise & 0x3F        — no ballast; value < 64 (bit6=0); XDP checks only bit6 */
+    quic[9] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : (noise9 & 0x3F);
 }
 
 /* ── Base64 encode/decode for Syslog / SIP BPF modes ──────────────────
