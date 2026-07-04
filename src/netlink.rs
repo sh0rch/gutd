@@ -464,8 +464,10 @@ pub fn link_set_noarp(name: &str) {
 ///   bpf_l4_csum_replace(BPF_F_MARK_ENFORCE) sets csum_start correctly.
 /// - `has_ip6_csum` = `NETIF_F_IPV6_CSUM` (bit 4): same for IPv6.
 /// Check if NIC TX checksum offload is still active (any csum bit set).
+///
 /// Used after `link_disable_offloads` to detect if the disable was ignored
 /// (e.g. old QEMU virtio where ETHTOOL_STXCSUM/SFEATURES is a no-op).
+///
 /// Tries sysfs first (Linux ≥ 2.6.39), falls back to ETHTOOL_GTXCSUM ioctl.
 pub fn probe_tx_csum_active(name: &str) -> bool {
     // Try sysfs features file (Linux ≥ 2.6.39, not always present)
@@ -512,7 +514,7 @@ pub fn probe_tx_csum_active(name: &str) -> bool {
 /// False positives (flagging QEMU 3.x that actually works) are harmless:
 /// ENCAP + HW offload path computes correct outer UDP checksum regardless.
 pub fn is_qemu_legacy_cpu() -> bool {
-    std::fs::read_to_string("/proc/cpuinfo").map_or(false, |cpuinfo| {
+    std::fs::read_to_string("/proc/cpuinfo").is_ok_and(|cpuinfo| {
         cpuinfo.lines().any(|l| {
             if !l.starts_with("model name") || !l.contains("QEMU Virtual CPU version ") {
                 return false;
