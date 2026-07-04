@@ -1663,7 +1663,7 @@ static __attribute__((noinline)) void gcm_ghash_tag_128(
 
 #endif /* __GUT_COMMON_H__ */
 
-static __always_inline void write_gut_header(__u8 *quic, void *data_end, __u32 ppn, __u32 enc_ports, __u32 pad_len, __u8 noise_byte)
+static __always_inline void write_gut_header(__u8 *quic, void *data_end, __u32 ppn, __u32 enc_ports, __u32 pad_len, __u8 noise_byte, __u8 noise9)
 {
     if ((__u8 *)quic + GUT_HEADER_SIZE > (__u8 *)data_end)
         return;
@@ -1672,8 +1672,9 @@ static __always_inline void write_gut_header(__u8 *quic, void *data_end, __u32 p
     quic[8] = noise_byte; /* random ChaCha-derived byte; prevents static 0x00 pattern at WG nonce offset */
     /* byte 9: ballast length encoding (same as SIP/Syslog/QUIC):
      *   0x40 | (pad_len-1)  — has ballast, length = (byte9 & 0x3F) + 1 ∈ [1..64]
-     *   0x00                — no ballast (large packet) */
-    quic[9] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : 0x00;
+     *   0x80 | random       — no ballast; bit7=1 signals non-zero to avoid WG nonce 0x00
+     *                         fingerprinting; XDP checks only bit6 so this is wire-compatible. */
+    quic[9] = (pad_len > 0) ? (0x40 | ((__u8)(pad_len - 1) & 0x3F)) : (0x80 | (noise9 & 0x3F));
 }
 
 /* ── Base64 encode/decode for Syslog / SIP BPF modes ──────────────────
