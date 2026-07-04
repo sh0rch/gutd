@@ -254,7 +254,7 @@ int gut_egress(struct __sk_buff *skb)
     __u32 pad_len = 0;
 #if defined(GUT_MODE_GUT)
     /* GUT: random ballast [1..63] bytes for small packets.
-     * Encoded in GUT header byte 9 as 0x40|(pad_len-1); XDP strips exactly pad_len bytes.
+     * Encoded in GUT header byte 9 directly as pad_len (1..63); XDP strips exactly pad_len bytes.
      * On hardware where csum_start is corrected (ENCAP flags active), byte 9 is
      * preserved intact and XDP can read it reliably. */
     if (wg_len < BALLAST_THRESHOLD)
@@ -437,7 +437,7 @@ int gut_egress(struct __sk_buff *skb)
         __builtin_memcpy(inner, &ppn, 4);
         __builtin_memcpy(inner + 4, &enc_ports, 4);
         inner[8] = 0x00;
-        inner[9] = (pad_len > 0 && pad_len < 64) ? (__u8)pad_len : 0x00;
+        inner[9] = (pad_len > 0 && pad_len < 64) ? (__u8)pad_len : (pad_block[0] | 0x40);
 
         {
             __u32 load_len;
@@ -597,7 +597,7 @@ int gut_egress(struct __sk_buff *skb)
         __builtin_memcpy(rtp_gut + 12, &ppn, 4);
         __builtin_memcpy(rtp_gut + 16, &enc_ports, 4);
         rtp_gut[20] = 0x00;
-        rtp_gut[21] = (pad_len > 0 && pad_len < 64) ? (__u8)pad_len : 0x00;
+        rtp_gut[21] = (pad_len > 0 && pad_len < 64) ? (__u8)pad_len : (pad_block[0] | 0x40);
 
         /* Write updated WG headers (XOR'd) and mac2 to RTP payload */
         /* RTP payload starts at new_quic_off + 22.
@@ -912,7 +912,7 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
         __builtin_memcpy(inner, &ppn, 4);
         __builtin_memcpy(inner + 4, &enc_ports, 4);
         inner[8] = 0x00;
-        inner[9] = (pad_len > 0 && pad_len < 64) ? (__u8)pad_len : 0x00;
+        inner[9] = (pad_len > 0 && pad_len < 64) ? (__u8)pad_len : (((__u8 *)&ppn)[0] | 0x40);
 
         /* Load already-XOR'd WG+ballast from the packet into scratch */
         {
