@@ -727,8 +727,10 @@ int gut_egress(struct __sk_buff *skb)
             udph->check = 0;
             if (cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM)
             {
-                /* csum_fold(pseudo) = ~fold(pseudo): the HW seed for CHECKSUM_PARTIAL */
-                bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, csum_fold(csum),
+                /* ~csum_fold(pseudo) = fold(pseudo): correct seed for NETIF_F_HW_CSUM.
+                 * HW computes ~fold(seed + udp_hdr + payload); seed must be fold(pseudo)
+                 * so that result equals ~fold(pseudo + udp_hdr + payload). */
+                bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, ~csum_fold(csum),
                                     BPF_F_MARK_ENFORCE | 2);
             }
             else
@@ -810,7 +812,7 @@ int gut_egress(struct __sk_buff *skb)
             udph->check = 0;
             if (cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM)
             {
-                bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, csum_fold(csum),
+                bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, ~csum_fold(csum),
                                     BPF_F_MARK_ENFORCE | 2);
             }
             else
@@ -1071,7 +1073,7 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
             udph->check = 0;
             if (cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM)
             {
-                bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, csum_fold(csum),
+                bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, ~csum_fold(csum),
                                     BPF_F_MARK_ENFORCE | 2);
             }
             else
@@ -1132,7 +1134,7 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
             udph->check = 0;
             if (cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM)
             {
-                bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, csum_fold(csum),
+                bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, ~csum_fold(csum),
                                     BPF_F_MARK_ENFORCE | 2);
             }
             else
@@ -1290,7 +1292,7 @@ int gut_egress_quic_long(struct __sk_buff *skb)
             udph->check = 0;
             if (cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM)
             {
-                bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, csum_fold(csum),
+                bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, ~csum_fold(csum),
                                     BPF_F_MARK_ENFORCE | 2);
             }
             else
@@ -1351,7 +1353,7 @@ int gut_egress_quic_long(struct __sk_buff *skb)
             udph->check = 0;
             if (cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM)
             {
-                bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, csum_fold(csum),
+                bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, ~csum_fold(csum),
                                     BPF_F_MARK_ENFORCE | 2);
             }
             else
