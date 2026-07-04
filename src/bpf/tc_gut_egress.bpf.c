@@ -479,11 +479,11 @@ int gut_egress(struct __sk_buff *skb)
     __u32 room = outer_hdr_len;
 #endif
 
-    /* ENCAP flags: tell the kernel this is a new encapsulation (L3+L4), fixing
-     * csum_start/offsets for the outer UDP, and pin GSO size (FIXED_GSO). */
-    __u64 adj_flags = BPF_F_ADJ_ROOM_ENCAP_L4_UDP | BPF_F_ADJ_ROOM_FIXED_GSO;
-    adj_flags |= (ipver == 6) ? BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 : BPF_F_ADJ_ROOM_ENCAP_L3_IPV4;
-    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, adj_flags) < 0)
+    /* ENCAP-aware adjust_room causes skb->encapsulation=1 side-effects that
+     * break Type-4 data forwarding on some hypervisors (e.g. BlueVPS virtio).
+     * Use plain flags=0: bpf_l4_csum_replace(BPF_F_MARK_ENFORCE) on the HW
+     * offload path provides correct csum_start independently. */
+    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, 0) < 0)
         return TC_ACT_OK;
 
     if (bpf_skb_pull_data(skb, skb->len) < 0)
@@ -938,9 +938,7 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
     }
 
     /* ── Adjust packet size and shift IP/UDP headers ── */
-    __u64 adj_flags2 = BPF_F_ADJ_ROOM_ENCAP_L4_UDP | BPF_F_ADJ_ROOM_FIXED_GSO;
-    adj_flags2 |= (ipver == 6) ? BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 : BPF_F_ADJ_ROOM_ENCAP_L3_IPV4;
-    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, adj_flags2) < 0)
+    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, 0) < 0)
         return TC_ACT_OK;
 
     if (bpf_skb_pull_data(skb, skb->len) < 0)

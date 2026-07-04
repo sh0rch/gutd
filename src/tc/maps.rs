@@ -196,8 +196,9 @@ pub struct GutStats {
 
 /// Offload capability flags — mirrors GUT_FLAG_* in gut_common.h
 pub const GUT_FLAG_NEED_L4_CSUM: u16 = 1 << 0;
-/// NETIF_F_IP_CSUM: physical NIC can complete UDP/TCP checksum for IPv4
-/// from IP header fields (ignores stale csum_start after adjust_room_mac).
+/// NETIF_F_IP_CSUM or NETIF_F_HW_CSUM: physical NIC can complete UDP/TCP
+/// checksum. IP_CSUM derives from IP header; HW_CSUM uses csum_start set by
+/// bpf_l4_csum_replace(BPF_F_MARK_ENFORCE) which corrects the stale offset.
 pub const GUT_FLAG_HW_IP4_CSUM: u16 = 1 << 1;
 /// NETIF_F_IPV6_CSUM: same capability for IPv6.
 pub const GUT_FLAG_HW_IP6_CSUM: u16 = 1 << 2;
