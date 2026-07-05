@@ -535,7 +535,11 @@ pub fn is_qemu_legacy_cpu() -> bool {
 }
 
 pub fn probe_tx_csum_features(name: &str) -> (bool, bool) {
-    const IP4_BIT: u64 = (1 << 1) | (1 << 3); /* NETIF_F_IP_CSUM | NETIF_F_HW_CSUM */
+    /* NETIF_F_IP_CSUM (bit 1): protocol-aware hardware NIC — derives pseudo-header
+     * from IP header itself, safe to use with BPF ENCAP + MARK_ENFORCE seed.
+     * NETIF_F_HW_CSUM (bit 3): generic raw sum (virtio-net, etc.) — needs correct
+     * csum_start which bpf_l4_csum_replace does not set; use software path instead. */
+    const IP4_BIT: u64 = 1 << 1; /* NETIF_F_IP_CSUM only */
     const IP6_BIT: u64 = 1 << 4; /* NETIF_F_IPV6_CSUM */
     let path = format!("/sys/class/net/{name}/features");
     let Ok(content) = std::fs::read_to_string(&path) else {

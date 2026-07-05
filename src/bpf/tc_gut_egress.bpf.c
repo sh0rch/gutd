@@ -479,18 +479,10 @@ int gut_egress(struct __sk_buff *skb)
     __u32 room = outer_hdr_len;
 #endif
 
-    /* ENCAP flags: used when hardware ignores ip_summed=CHECKSUM_NONE and insists
-     * on computing checksum using csum_start (e.g. old QEMU 2.5+ virtio).
-     * With ENCAP_L4_UDP, csum_start is set to the outer UDP position so hardware
-     * writes checksum to the correct field instead of GUT header bytes 8-9.
-     * Only needed when HW offload path is active (GUT_FLAG_HW_IP4/6_CSUM set). */
-    __u64 adj_flags = 0;
-    if (cfg->offload_flags & GUT_FLAG_ENCAP_CSUM)
-    {
-        adj_flags = BPF_F_ADJ_ROOM_ENCAP_L4_UDP | BPF_F_ADJ_ROOM_FIXED_GSO;
-        adj_flags |= (ipver == 6) ? BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 : BPF_F_ADJ_ROOM_ENCAP_L3_IPV4;
-    }
-    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, adj_flags) < 0)
+    /* No ENCAP flags: physical NICs (NETIF_F_IP_CSUM) parse the IP/UDP headers
+     * themselves and don't need csum_start.  VMs use the software path.
+     * QEMU uses CHECKSUM_NONE (zero-check), so it never recomputes. */
+    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, 0) < 0)
         return TC_ACT_OK;
 
     if (bpf_skb_pull_data(skb, skb->len) < 0)
@@ -727,29 +719,25 @@ int gut_egress(struct __sk_buff *skb)
             udph->check = 0;
             if (cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM)
             {
-                if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
-                {
-                    /* ~csum_fold(pseudo) = fold(pseudo): correct seed for NETIF_F_HW_CSUM.
-                     * HW computes ~fold(seed + udp_hdr + payload); seed = fold(pseudo)
-                     * so result = ~fold(pseudo + udp_hdr + payload). */
-                    bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, ~csum_fold(csum),
-                                        BPF_F_MARK_ENFORCE | 2);
-                }
-                /* ENCAP_CSUM (old QEMU): leave udph->check=0.  virtio shifts csum_start
-                 * by +10 so QEMU writes to GUT byte 8 (noise_byte); outer UDP cksum=0
-                 * is valid per RFC 768 and ignored by relay XDP. */
+                /* Physical NIC (NETIF_F_IP_CSUM): ENCAP flags set csum_start to outer UDP;
+                 * NIC derives pseudo-header from IP header, writes correct checksum. */
+                bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, ~csum_fold(csum),
+                                    BPF_F_MARK_ENFORCE | 2);
             }
-            else
+            else if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
             {
+                /* VM non-QEMU (HW_CSUM bit3) or no offload: BPF software checksum. */
                 csum = gut_csum_range(skb, scratch + 320, 14 + 20, ulen, csum);
-                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0); /* ip_summed = CHECKSUM_NONE (also clears PARTIAL) */
+                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0); /* CHECKSUM_NONE */
             }
+            /* QEMU (ENCAP_CSUM, no HW_IP4_CSUM): udph->check=0, CHECKSUM_NONE */
             data = (void *)(long)skb->data;
             data_end = (void *)(long)skb->data_end;
             udph = (void *)((__u8 *)data + 14 + 20);
             if ((void *)(udph + 1) > data_end)
                 return TC_ACT_OK;
-            if (!(cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM))
+            if (!(cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM) &&
+                !(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
                 udph->check = csum_fold(csum);
         }
     }
@@ -817,23 +805,20 @@ int gut_egress(struct __sk_buff *skb)
             csum = bpf_csum_diff(0, 0, &ph, 4, csum);
             udph->check = 0;
             if (cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM)
-            {
-                if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
-                    bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, ~csum_fold(csum),
-                                        BPF_F_MARK_ENFORCE | 2);
-                /* ENCAP_CSUM: leave check=0 */
-            }
-            else
+                bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, ~csum_fold(csum),
+                                    BPF_F_MARK_ENFORCE | 2);
+            else if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
             {
                 csum = gut_csum_range(skb, scratch + 320, 14 + 40, ulen, csum);
-                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0); /* ip_summed = CHECKSUM_NONE (works for PARTIAL too, unlike bpf_csum_level) */
+                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0);
             }
             data = (void *)(long)skb->data;
             data_end = (void *)(long)skb->data_end;
             udph = (void *)((__u8 *)data + 14 + 40);
             if ((void *)(udph + 1) > data_end)
                 return TC_ACT_OK;
-            if (!(cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM))
+            if (!(cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM) &&
+                !(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
                 udph->check = csum_fold(csum);
         }
     }
@@ -956,11 +941,6 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
 
     /* ── Adjust packet size and shift IP/UDP headers ── */
     __u64 adj_flags2 = 0;
-    if (cfg->offload_flags & GUT_FLAG_ENCAP_CSUM)
-    {
-        adj_flags2 = BPF_F_ADJ_ROOM_ENCAP_L4_UDP | BPF_F_ADJ_ROOM_FIXED_GSO;
-        adj_flags2 |= (ipver == 6) ? BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 : BPF_F_ADJ_ROOM_ENCAP_L3_IPV4;
-    }
     if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, adj_flags2) < 0)
         return TC_ACT_OK;
 
@@ -1080,23 +1060,20 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
             csum = bpf_csum_diff(0, 0, &ph, 4, csum);
             udph->check = 0;
             if (cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM)
-            {
-                if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
-                    bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, ~csum_fold(csum),
-                                        BPF_F_MARK_ENFORCE | 2);
-                /* ENCAP_CSUM: leave check=0 */
-            }
-            else
+                bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, ~csum_fold(csum),
+                                    BPF_F_MARK_ENFORCE | 2);
+            else if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
             {
                 csum = gut_csum_range(skb, scratch + 320, 14 + 20, ulen, csum);
-                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0); /* ip_summed = CHECKSUM_NONE (works for PARTIAL too, unlike bpf_csum_level) */
+                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0);
             }
             data = (void *)(long)skb->data;
             data_end = (void *)(long)skb->data_end;
             udph = (void *)((__u8 *)data + 14 + 20);
             if ((void *)(udph + 1) > data_end)
                 return TC_ACT_OK;
-            if (!(cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM))
+            if (!(cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM) &&
+                !(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
                 udph->check = csum_fold(csum);
         }
     }
@@ -1143,23 +1120,20 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
             csum = bpf_csum_diff(0, 0, &ph, 4, csum);
             udph->check = 0;
             if (cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM)
-            {
-                if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
-                    bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, ~csum_fold(csum),
-                                        BPF_F_MARK_ENFORCE | 2);
-                /* ENCAP_CSUM: leave check=0 */
-            }
-            else
+                bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, ~csum_fold(csum),
+                                    BPF_F_MARK_ENFORCE | 2);
+            else if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
             {
                 csum = gut_csum_range(skb, scratch + 320, 14 + 40, ulen, csum);
-                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0); /* ip_summed = CHECKSUM_NONE (works for PARTIAL too, unlike bpf_csum_level) */
+                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0);
             }
             data = (void *)(long)skb->data;
             data_end = (void *)(long)skb->data_end;
             udph = (void *)((__u8 *)data + 14 + 40);
             if ((void *)(udph + 1) > data_end)
                 return TC_ACT_OK;
-            if (!(cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM))
+            if (!(cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM) &&
+                !(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
                 udph->check = csum_fold(csum);
         }
     }
@@ -1303,23 +1277,20 @@ int gut_egress_quic_long(struct __sk_buff *skb)
             csum = bpf_csum_diff(0, 0, &ph, 4, csum);
             udph->check = 0;
             if (cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM)
-            {
-                if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
-                    bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, ~csum_fold(csum),
-                                        BPF_F_MARK_ENFORCE | 2);
-                /* ENCAP_CSUM: leave check=0 */
-            }
-            else
+                bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, ~csum_fold(csum),
+                                    BPF_F_MARK_ENFORCE | 2);
+            else if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
             {
                 csum = gut_csum_range(skb, scratch + 320, 14 + 20, ulen, csum);
-                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0); /* ip_summed = CHECKSUM_NONE (works for PARTIAL too, unlike bpf_csum_level) */
+                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0);
             }
             data = (void *)(long)skb->data;
             data_end = (void *)(long)skb->data_end;
             udph = (void *)((__u8 *)data + 14 + 20);
             if ((void *)(udph + 1) > data_end)
                 return TC_ACT_OK;
-            if (!(cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM))
+            if (!(cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM) &&
+                !(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
                 udph->check = csum_fold(csum);
         }
     }
@@ -1366,23 +1337,20 @@ int gut_egress_quic_long(struct __sk_buff *skb)
             csum = bpf_csum_diff(0, 0, &ph, 4, csum);
             udph->check = 0;
             if (cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM)
-            {
-                if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
-                    bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, ~csum_fold(csum),
-                                        BPF_F_MARK_ENFORCE | 2);
-                /* ENCAP_CSUM: leave check=0 */
-            }
-            else
+                bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, ~csum_fold(csum),
+                                    BPF_F_MARK_ENFORCE | 2);
+            else if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
             {
                 csum = gut_csum_range(skb, scratch + 320, 14 + 40, ulen, csum);
-                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0); /* ip_summed = CHECKSUM_NONE (works for PARTIAL too, unlike bpf_csum_level) */
+                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0);
             }
             data = (void *)(long)skb->data;
             data_end = (void *)(long)skb->data_end;
             udph = (void *)((__u8 *)data + 14 + 40);
             if ((void *)(udph + 1) > data_end)
                 return TC_ACT_OK;
-            if (!(cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM))
+            if (!(cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM) &&
+                !(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
                 udph->check = csum_fold(csum);
         }
     }
