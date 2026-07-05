@@ -488,14 +488,17 @@ int gut_egress(struct __sk_buff *skb)
     __u32 room = outer_hdr_len;
 #endif
 
-    /* No ENCAP flags (v3.0.16 proven).  ENCAP sets encapsulation=1 which makes the guest
-     * virtio backend shift csum_start into the GUT header, so QEMU writes the checksum at
-     * data[50..51] = GUT bytes 8-9, corrupting the ballast indicator.  Instead:
-     *  - Default (physical NIC / veth / non-QEMU): CHECKSUM_PARTIAL + pseudo-only write;
-     *    NIC/kernel finalizes payload from csum_start.
-     *  - Old QEMU (GUT_FLAG_ENCAP_CSUM): full software checksum + bpf_skb_adjust_room(0,NET,0)
-     *    forces CHECKSUM_NONE so QEMU never recomputes and never touches bytes 8-9. */
-    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, 0) < 0)
+    /* ENCAP flags for old QEMU (ENCAP_CSUM) and ballast=align (BALLAST_ALIGN):
+     *  ENCAP_CSUM only: full software checksum + CHECKSUM_NONE; QEMU never recomputes.
+     *  BALLAST_ALIGN: byte 9 is noise; QEMU writes its checksum to bytes 8-9 (harmless).
+     *    udph->check is left 0 (RFC 768 valid); relay XDP ignores checksums on decap. */
+    __u64 adj_flags = 0;
+    if (cfg->offload_flags & (GUT_FLAG_ENCAP_CSUM | GUT_FLAG_BALLAST_ALIGN))
+    {
+        adj_flags = BPF_F_ADJ_ROOM_ENCAP_L4_UDP | BPF_F_ADJ_ROOM_FIXED_GSO;
+        adj_flags |= (ipver == 6) ? BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 : BPF_F_ADJ_ROOM_ENCAP_L3_IPV4;
+    }
+    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, adj_flags) < 0)
         return TC_ACT_OK;
 
     if (bpf_skb_pull_data(skb, skb->len) < 0)
@@ -733,7 +736,7 @@ int gut_egress(struct __sk_buff *skb)
             __u32 pseudo = bpf_csum_diff(0, 0, &iph->saddr, 8, 0); /* saddr+daddr contiguous */
             __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
             pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
-            if (cfg->offload_flags & GUT_FLAG_ENCAP_CSUM)
+            if ((cfg->offload_flags & GUT_FLAG_ENCAP_CSUM) && !(cfg->offload_flags & GUT_FLAG_BALLAST_ALIGN))
             {
                 /* Old QEMU: full software checksum + CHECKSUM_NONE.  ENCAP pinned
                  * csum_start to outer UDP so QEMU writes only at data[40], never 8-9. */
@@ -814,7 +817,7 @@ int gut_egress(struct __sk_buff *skb)
             __u32 pseudo = bpf_csum_diff(0, 0, (__be32 *)&ip6h->saddr, 32, 0); /* saddr+daddr contiguous */
             __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
             pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
-            if (cfg->offload_flags & GUT_FLAG_ENCAP_CSUM)
+            if ((cfg->offload_flags & GUT_FLAG_ENCAP_CSUM) && !(cfg->offload_flags & GUT_FLAG_BALLAST_ALIGN))
             {
                 __u32 ulen = bpf_ntohs(udph->len);
                 __u64 full = gut_csum_range(skb, scratch + 320, 14 + 40, ulen, pseudo);
@@ -950,10 +953,16 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
     }
 
     /* ── Adjust packet size and shift IP/UDP headers ── */
-    /* No ENCAP flags — see main gut_egress() comment (encapsulation=1 corrupts GUT bytes 8-9
-     * on old QEMU).  QEMU path uses full software checksum + CHECKSUM_NONE instead. */
-    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, 0) < 0)
-        return TC_ACT_OK;
+    {
+        __u64 af2 = 0;
+        if (cfg->offload_flags & (GUT_FLAG_ENCAP_CSUM | GUT_FLAG_BALLAST_ALIGN))
+        {
+            af2 = BPF_F_ADJ_ROOM_ENCAP_L4_UDP | BPF_F_ADJ_ROOM_FIXED_GSO;
+            af2 |= (ipver == 6) ? BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 : BPF_F_ADJ_ROOM_ENCAP_L3_IPV4;
+        }
+        if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, af2) < 0)
+            return TC_ACT_OK;
+    }
 
     if (bpf_skb_pull_data(skb, skb->len) < 0)
         return TC_ACT_OK;
@@ -1069,7 +1078,7 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
             __u32 pseudo = bpf_csum_diff(0, 0, &iph->saddr, 8, 0); /* saddr+daddr contiguous */
             __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
             pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
-            if (cfg->offload_flags & GUT_FLAG_ENCAP_CSUM)
+            if ((cfg->offload_flags & GUT_FLAG_ENCAP_CSUM) && !(cfg->offload_flags & GUT_FLAG_BALLAST_ALIGN))
             {
                 __u32 ulen = bpf_ntohs(udph->len);
                 __u64 full = gut_csum_range(skb, scratch + 320, 14 + 20, ulen, pseudo);
@@ -1127,7 +1136,7 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
             __u32 pseudo = bpf_csum_diff(0, 0, (__be32 *)&ip6h->saddr, 32, 0); /* saddr+daddr contiguous */
             __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
             pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
-            if (cfg->offload_flags & GUT_FLAG_ENCAP_CSUM)
+            if ((cfg->offload_flags & GUT_FLAG_ENCAP_CSUM) && !(cfg->offload_flags & GUT_FLAG_BALLAST_ALIGN))
             {
                 __u32 ulen = bpf_ntohs(udph->len);
                 __u64 full = gut_csum_range(skb, scratch + 320, 14 + 40, ulen, pseudo);
@@ -1282,7 +1291,7 @@ int gut_egress_quic_long(struct __sk_buff *skb)
             __u32 pseudo = bpf_csum_diff(0, 0, &iph->saddr, 8, 0); /* saddr+daddr contiguous */
             __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
             pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
-            if (cfg->offload_flags & GUT_FLAG_ENCAP_CSUM)
+            if ((cfg->offload_flags & GUT_FLAG_ENCAP_CSUM) && !(cfg->offload_flags & GUT_FLAG_BALLAST_ALIGN))
             {
                 __u32 ulen = bpf_ntohs(udph->len);
                 __u64 full = gut_csum_range(skb, scratch + 320, 14 + 20, ulen, pseudo);
@@ -1340,7 +1349,7 @@ int gut_egress_quic_long(struct __sk_buff *skb)
             __u32 pseudo = bpf_csum_diff(0, 0, (__be32 *)&ip6h->saddr, 32, 0); /* saddr+daddr contiguous */
             __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
             pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
-            if (cfg->offload_flags & GUT_FLAG_ENCAP_CSUM)
+            if ((cfg->offload_flags & GUT_FLAG_ENCAP_CSUM) && !(cfg->offload_flags & GUT_FLAG_BALLAST_ALIGN))
             {
                 __u32 ulen = bpf_ntohs(udph->len);
                 __u64 full = gut_csum_range(skb, scratch + 320, 14 + 40, ulen, pseudo);
