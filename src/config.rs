@@ -58,6 +58,19 @@ pub enum ObfsMode {
     Sip,
 }
 
+/// Ballast-length encoding on the wire (per-peer).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BallastMode {
+    /// Default: ballast length stored in GUT header byte 9 (1..63 bytes).
+    /// Requires the hypervisor NOT to corrupt outer UDP payload bytes 8-9.
+    Byte9,
+    /// Ballast length recovered from wire geometry.  WireGuard type-4 payloads
+    /// are 16-byte aligned, so ballast = wg_len & 0x0F (0..15).  Immune to
+    /// byte 8-9 corruption by old QEMU virtio.  GUT mode only; both peers must
+    /// set the same mode.
+    Align,
+}
+
 #[derive(Clone)]
 pub struct PeerConfig {
     pub name: String,
@@ -80,6 +93,7 @@ pub struct PeerConfig {
     pub wg_host: String,
     pub sip_domain: String,
     pub obfs: ObfsMode,
+    pub ballast: BallastMode,
     pub bind_port: u16,
 }
 
@@ -282,6 +296,17 @@ pub fn load_config_from_env() -> Result<Config> {
             .into())
         }
     };
+    let ballast = match std::env::var("GUTD_BALLAST").as_deref() {
+        Ok("align") | Ok("geometry") => BallastMode::Align,
+        _ => BallastMode::Byte9,
+    };
+    if ballast == BallastMode::Align && obfs != ObfsMode::Gut {
+        return Err(
+            "GUTD_BALLAST=align requires GUTD_OBFS=gut (QUIC alignment is a detectable \
+             pattern and Base64 modes cannot survive byte 8-9 corruption)"
+                .into(),
+        );
+    }
     if obfs == ObfsMode::Sip && peer_ports.len() < 2 {
         return Err(
             "GUTD_OBFS=sip requires at least 2 ports in GUTD_PEER_PORTS (or GUTD_PORTS): \
@@ -329,6 +354,7 @@ pub fn load_config_from_env() -> Result<Config> {
                 .or_else(|_| std::env::var("GUTD_SERVICE_NAME"))
                 .unwrap_or_else(|_| "nginx".to_string()),
             obfs,
+            ballast,
             bind_port: std::env::var("GUTD_BIND_PORT")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -358,6 +384,7 @@ struct PeerBuilder {
     wg_host: Option<String>,
     sip_domain: Option<String>,
     obfs: ObfsMode,
+    ballast: BallastMode,
     bind_port: Option<u16>,
 }
 
@@ -382,6 +409,7 @@ impl Default for PeerBuilder {
             wg_host: None,
             obfs: ObfsMode::Gut,
             sip_domain: None,
+            ballast: BallastMode::Byte9,
             bind_port: None,
         }
     }
@@ -437,6 +465,14 @@ impl PeerBuilder {
             )
             .into());
         }
+        if self.ballast == BallastMode::Align && self.obfs != ObfsMode::Gut {
+            return Err(format!(
+                "ballast = align requires obfs = gut (peer '{}'): QUIC alignment is a \
+                 detectable pattern and Base64 (sip/syslog) cannot survive byte 8-9 corruption",
+                self.name
+            )
+            .into());
+        }
         let key = match (self.key, self.passphrase) {
             (Some(k), _) => k,
             (None, Some(p)) => {
@@ -475,6 +511,7 @@ impl PeerBuilder {
                 .wg_host
                 .unwrap_or_else(|| "127.0.0.1:51820".to_string()),
             obfs: self.obfs,
+            ballast: self.ballast,
             sip_domain: self.sip_domain.unwrap_or_else(|| "127.0.0.1".to_string()),
             bind_port: self.bind_port.unwrap_or(0),
         })
@@ -642,6 +679,18 @@ fn parse_config(content: &str) -> Result<Config> {
                                 _ => {
                                     return Err(format!(
                                         "Invalid obfs value: {value} (expected quic|gut|gost|noise|syslog|sip)"
+                                    )
+                                    .into())
+                                }
+                            };
+                        }
+                        "ballast" => {
+                            b.ballast = match value {
+                                "byte9" | "default" => BallastMode::Byte9,
+                                "align" | "geometry" => BallastMode::Align,
+                                _ => {
+                                    return Err(format!(
+                                        "Invalid ballast value: {value} (expected byte9|align)"
                                     )
                                     .into())
                                 }

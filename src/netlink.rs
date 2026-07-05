@@ -534,6 +534,29 @@ pub fn is_qemu_legacy_cpu() -> bool {
     })
 }
 
+/// Returns true when running inside a container (Docker, Podman, LXC, etc.).
+/// In containers the packet exits via a veth pair.  The host kernel's ip_forward
+/// path calls skb_checksum_help() before the packet reaches virtio-net, so
+/// ip_summed is already CHECKSUM_NONE at the virtio TX side.  Old QEMU virtio
+/// therefore never gets a NEEDS_CSUM descriptor and cannot corrupt GUT bytes 8-9.
+pub fn is_container() -> bool {
+    // /.dockerenv is created by Docker and Podman
+    if std::path::Path::new("/.dockerenv").exists() {
+        return true;
+    }
+    // /run/.containerenv is created by Podman
+    if std::path::Path::new("/run/.containerenv").exists() {
+        return true;
+    }
+    // cgroup v1: container ID in /proc/1/cgroup
+    if let Ok(cg) = std::fs::read_to_string("/proc/1/cgroup") {
+        if cg.contains("/docker/") || cg.contains("/kubepods/") || cg.contains("/lxc/") {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn probe_tx_csum_features(name: &str) -> (bool, bool) {
     /* NETIF_F_IP_CSUM (bit 1): protocol-aware hardware NIC — derives pseudo-header
      * from IP header itself, safe to use with BPF ENCAP + MARK_ENFORCE seed.

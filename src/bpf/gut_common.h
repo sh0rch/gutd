@@ -103,8 +103,10 @@
  *   WG inner payloads are 16-byte-aligned → ballast = (wg_len-WG_MIN_PACKET)&0xF (0..15)
  * TC egress caps GUT ballast at 15 bytes.  Required when hypervisor XOR-obfuscates
  * UDP payload bytes 8-9 (BlueVPS etc.), corrupting byte 9 and breaking all data. */
-#define GUT_FLAG_ENCAP_CSUM (1U << 3) /* adjust_room_mac with ENCAP_L3/L4 flags; needed when \
-                                       * hw ignores ip_summed=CHECKSUM_NONE (old QEMU virtio) */
+#define GUT_FLAG_ENCAP_CSUM (1U << 3)    /* adjust_room_mac with ENCAP_L3/L4 flags; needed when \
+                                          * hw ignores ip_summed=CHECKSUM_NONE (old QEMU virtio) */
+#define GUT_FLAG_BALLAST_ALIGN (1U << 4) /* GUT type-4 ballast recovered from wire geometry \
+                                          * (wg_len & 0x0F); immune to byte 8-9 corruption */
 
 /* GUT protocol configuration (shared between Rust loader and eBPF) */
 struct gut_config

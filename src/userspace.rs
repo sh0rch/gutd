@@ -391,6 +391,7 @@ pub fn obfs_encap(
     wg_dport: u16,
     obfs: crate::config::ObfsMode,
     sip_domain: &str,
+    ballast_align: bool,
 ) -> Option<(usize, u32)> {
     if orig_len < 16 {
         return None;
@@ -452,15 +453,19 @@ pub fn obfs_encap(
 
     let mut pad_len = 0;
     if obfs == crate::config::ObfsMode::Gut {
-        // GUT: random padding [1..63] bytes, 16-byte-aligned, for small packets.
-        // Structure: align_base (1..16) + extra_groups * 16, where extra_groups ∈ [0..3].
-        // Encoded in byte 9 of GUT header so the receiver strips exactly pad_len bytes.
+        // GUT: random padding for small packets.
+        //  - byte9 (default): 16-byte-aligned 1..63, stored in GUT header byte 9.
+        //  - align: 0..15, recovered by the receiver as wg_len & 0x0F (byte 9 unused).
         if orig_len < 220 {
-            let base_udp_size = 8 + quic_hdr_len + orig_len;
-            let remainder = base_udp_size % 16;
-            let align_base = if remainder == 0 { 16 } else { 16 - remainder };
-            let extra_groups = (pad_block[63] & 0x03) as usize;
-            pad_len = (align_base + extra_groups * 16).min(63);
+            if ballast_align {
+                pad_len = (pad_block[63] & 0x0F) as usize; // 0..15
+            } else {
+                let base_udp_size = 8 + quic_hdr_len + orig_len;
+                let remainder = base_udp_size % 16;
+                let align_base = if remainder == 0 { 16 } else { 16 - remainder };
+                let extra_groups = (pad_block[63] & 0x03) as usize;
+                pad_len = (align_base + extra_groups * 16).min(63);
+            }
         }
     } else if obfs == crate::config::ObfsMode::Quic && orig_len >= 220 {
         // QUIC large packets: no padding — real QUIC has uniform MTU-sized data
@@ -495,8 +500,11 @@ pub fn obfs_encap(
 
     if quic_hdr_len == GUT_HEADER_SIZE {
         write_gut_header(buf, ppn, enc_ports, pad_len, pad_block[0]);
-        // All modes: byte 9 = pad_len directly (1..63), or noise|0x40 if no padding.
-        buf[9] = if pad_len > 0 {
+        // byte 9: align mode = pure noise (length recovered from wg_len & 0x0F);
+        // byte9 mode = pad_len directly (1..63), or noise|0x40 if no padding.
+        buf[9] = if ballast_align {
+            pad_block[1]
+        } else if pad_len > 0 {
             (pad_len as u8).min(63)
         } else {
             pad_block[0] | 0x40
@@ -774,6 +782,7 @@ pub fn obfs_verify(
     key: &[u32; 12],
     rounds: u8,
     obfs: crate::config::ObfsMode,
+    ballast_align: bool,
 ) -> bool {
     if orig_len == 0 {
         return false;
@@ -801,9 +810,12 @@ pub fn obfs_verify(
 
     let wg_off = hdr_len;
     let wg_len = orig_len - hdr_len;
-    // All modes encode ballast in buf[hdr_len-1] (GUT byte 9, QUIC pad byte, etc.).
+    // Ballast recovery.  GUT align mode: wg_len & 0x0F (type-4 is 16-aligned).
+    // Otherwise: GUT byte 9 / QUIC pad byte.
     let pad_byte = buf[hdr_len - 1];
-    let ballast_len = if pad_byte != 0 && (pad_byte & 0xC0) == 0 {
+    let ballast_len = if ballast_align && obfs == crate::config::ObfsMode::Gut {
+        wg_len & 0x0F
+    } else if pad_byte != 0 && (pad_byte & 0xC0) == 0 {
         pad_byte as usize
     } else {
         0
@@ -863,6 +875,7 @@ pub fn obfs_decap(
     key: &[u32; 12],
     rounds: u8,
     obfs: crate::config::ObfsMode,
+    ballast_align: bool,
 ) -> Option<(usize, u16, u16)> {
     if orig_len == 0 {
         return None;
@@ -886,9 +899,12 @@ pub fn obfs_decap(
 
     let wg_off = hdr_len;
     let wg_len = orig_len - hdr_len;
-    // All modes encode ballast in buf[hdr_len-1] (GUT byte 9, QUIC pad byte, etc.).
+    // Ballast recovery.  GUT align mode: wg_len & 0x0F (type-4 is 16-aligned).
+    // Otherwise: GUT byte 9 / QUIC pad byte.
     let pad_byte = buf[hdr_len - 1];
-    let ballast_len = if pad_byte != 0 && (pad_byte & 0xC0) == 0 {
+    let ballast_len = if ballast_align && obfs == crate::config::ObfsMode::Gut {
+        wg_len & 0x0F
+    } else if pad_byte != 0 && (pad_byte & 0xC0) == 0 {
         pad_byte as usize
     } else {
         0
@@ -1455,6 +1471,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                         wg_port,
                         encap_obfs,
                         sip_domain,
+                        peer.ballast == crate::config::BallastMode::Align,
                     ) {
                         let mut final_dest = dest;
                         let mut sock_idx = 0;
@@ -1564,6 +1581,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
         let ingress_client_obfs = Arc::clone(&client_obfs);
         let ingress_peer_ext = Arc::clone(&shared_peer_ext);
         let ingress_peer = peer.clone();
+        let ingress_ballast_align = ingress_peer.ballast == crate::config::BallastMode::Align;
 
         let ingress_handle = std::thread::Builder::new()
             .name(format!("gutd-ingress-{}", port_idx))
@@ -1678,6 +1696,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 &key_init,
                                 rounds,
                                 crate::config::ObfsMode::Quic,
+                                ingress_ballast_align,
                             )
                         {
                             (true, crate::config::ObfsMode::Quic)
@@ -1690,6 +1709,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 &key_init,
                                 rounds,
                                 crate::config::ObfsMode::Gut,
+                                ingress_ballast_align,
                             ) {
                                 (
                                     true,
@@ -1707,6 +1727,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 &key_init,
                                 rounds,
                                 crate::config::ObfsMode::Gut,
+                                ingress_ballast_align,
                             );
                         (ok, obfs)
                     } else {
@@ -1718,6 +1739,7 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                                 &key_init,
                                 rounds,
                                 crate::config::ObfsMode::Quic,
+                                ingress_ballast_align,
                             );
                         (ok, crate::config::ObfsMode::Quic)
                     };
@@ -1768,9 +1790,14 @@ pub fn run(config: &crate::config::Config) -> crate::Result<()> {
                             .insert(src, detected_obfs);
                     }
 
-                    if let Some((new_size, _wg_sport, _wg_dport)) =
-                        obfs_decap(buf, size, &key_init, rounds, detected_obfs)
-                    {
+                    if let Some((new_size, _wg_sport, _wg_dport)) = obfs_decap(
+                        buf,
+                        size,
+                        &key_init,
+                        rounds,
+                        detected_obfs,
+                        ingress_ballast_align,
+                    ) {
                         // Endpoint roaming: remember the actual source of every
                         // authenticated packet so the egress thread can respond
                         // to the peer's real (possibly ephemeral) port.

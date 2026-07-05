@@ -253,19 +253,28 @@ int gut_egress(struct __sk_buff *skb)
      * tnum loses umin; explicit re-check restores [1,64] before the store. */
     __u32 pad_len = 0;
 #if defined(GUT_MODE_GUT)
-    /* GUT: random ballast [1..63] bytes for small packets.
-     * Encoded in GUT header byte 9 directly as pad_len (1..63); XDP strips exactly pad_len bytes.
-     * On hardware where csum_start is corrected (ENCAP flags active), byte 9 is
-     * preserved intact and XDP can read it reliably. */
+    /* GUT ballast.  Two encodings (per-peer, GUT_FLAG_BALLAST_ALIGN):
+     *  - byte9 (default): pad_len 1..63 stored in GUT header byte 9.
+     *  - align: pad_len 0..15; recovered on ingress as (wg_len & 0x0F) because
+     *    WG type-4 payloads are 16-byte aligned.  Byte 9 is NOT used (pure noise),
+     *    so hypervisors that corrupt outer UDP payload bytes 8-9 (old QEMU virtio)
+     *    cannot break length recovery. */
     if (wg_len < BALLAST_THRESHOLD)
     {
-        __u32 base_udp = 8 + outer_hdr_len + wg_len;
-        __u32 remainder = base_udp & 0x0F;
-        __u32 align_base = (remainder == 0) ? 16 : (16 - remainder); /* 1..16 */
-        __u32 extra_groups = pad_block[63] & 0x03;                   /* 0..3  */
-        pad_len = align_base + extra_groups * 16;                    /* 1..64 */
-        if (pad_len > 63)
-            pad_len = 63; /* cap: fits in 6-bit field */
+        if (cfg->offload_flags & GUT_FLAG_BALLAST_ALIGN)
+        {
+            pad_len = pad_block[63] & 0x0F; /* 0..15 */
+        }
+        else
+        {
+            __u32 base_udp = 8 + outer_hdr_len + wg_len;
+            __u32 remainder = base_udp & 0x0F;
+            __u32 align_base = (remainder == 0) ? 16 : (16 - remainder); /* 1..16 */
+            __u32 extra_groups = pad_block[63] & 0x03;                   /* 0..3  */
+            pad_len = align_base + extra_groups * 16;                    /* 1..64 */
+            if (pad_len > 63)
+                pad_len = 63; /* cap: fits in 6-bit field */
+        }
     }
 #else
     if (wg_len < BALLAST_THRESHOLD)
@@ -479,24 +488,14 @@ int gut_egress(struct __sk_buff *skb)
     __u32 room = outer_hdr_len;
 #endif
 
-    /* Default (v3.0.13): no ENCAP flags.  WG packet enters gut0 as CHECKSUM_PARTIAL;
-     * adjust_room shifts csum_start to track the moved outer UDP.  We write pseudo-only
-     * and NIC/kernel finalizes the payload sum.
-     *
-     * Old QEMU virtio (GUT_FLAG_ENCAP_CSUM): QEMU recomputes the checksum regardless of
-     * ip_summed, using csum_start.  Without ENCAP, csum_start ends up inside the GUT
-     * header after the manual header shift, so QEMU writes at data[50..51] = GUT bytes
-     * 8-9, corrupting the ballast indicator.  ENCAP_L4_UDP pins csum_start to the outer
-     * UDP header (data[34]) so QEMU writes only at data[40] (UDP checksum field) and
-     * never touches bytes 8-9.  The checksum body is then computed in software and
-     * ip_summed forced to CHECKSUM_NONE in the checksum block below. */
-    __u64 adj_flags = 0;
-    if (cfg->offload_flags & GUT_FLAG_ENCAP_CSUM)
-    {
-        adj_flags = BPF_F_ADJ_ROOM_ENCAP_L4_UDP | BPF_F_ADJ_ROOM_FIXED_GSO;
-        adj_flags |= (ipver == 6) ? BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 : BPF_F_ADJ_ROOM_ENCAP_L3_IPV4;
-    }
-    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, adj_flags) < 0)
+    /* No ENCAP flags (v3.0.16 proven).  ENCAP sets encapsulation=1 which makes the guest
+     * virtio backend shift csum_start into the GUT header, so QEMU writes the checksum at
+     * data[50..51] = GUT bytes 8-9, corrupting the ballast indicator.  Instead:
+     *  - Default (physical NIC / veth / non-QEMU): CHECKSUM_PARTIAL + pseudo-only write;
+     *    NIC/kernel finalizes payload from csum_start.
+     *  - Old QEMU (GUT_FLAG_ENCAP_CSUM): full software checksum + bpf_skb_adjust_room(0,NET,0)
+     *    forces CHECKSUM_NONE so QEMU never recomputes and never touches bytes 8-9. */
+    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, 0) < 0)
         return TC_ACT_OK;
 
     if (bpf_skb_pull_data(skb, skb->len) < 0)
@@ -618,6 +617,13 @@ int gut_egress(struct __sk_buff *skb)
 #elif defined(GUT_MODE_GUT)
     __u8 *quic = (__u8 *)data + new_quic_off;
     write_gut_header(quic, data_end, ppn, enc_ports, pad_len, pad_block[0]);
+    if (cfg->offload_flags & GUT_FLAG_BALLAST_ALIGN)
+    {
+        /* Align mode: byte 9 carries no length (recovered from wg_len & 0x0F).
+         * Overwrite with noise so it never mirrors the packet length low nibble. */
+        if ((__u8 *)quic + GUT_HEADER_SIZE <= (__u8 *)data_end)
+            quic[9] = pad_block[1];
+    }
 #else  /* GUT_MODE_QUIC */
     __u8 *quic = (__u8 *)data + new_quic_off;
     if (outer_hdr_len == GUT_QUIC_SHORT_HEADER_SIZE)
@@ -941,15 +947,9 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
     }
 
     /* ── Adjust packet size and shift IP/UDP headers ── */
-    /* ENCAP flags only for old QEMU (GUT_FLAG_ENCAP_CSUM) — see main gut_egress() comment:
-     * pins csum_start to outer UDP so QEMU never corrupts GUT bytes 8-9. */
-    __u64 adj_flags2 = 0;
-    if (cfg->offload_flags & GUT_FLAG_ENCAP_CSUM)
-    {
-        adj_flags2 = BPF_F_ADJ_ROOM_ENCAP_L4_UDP | BPF_F_ADJ_ROOM_FIXED_GSO;
-        adj_flags2 |= (ipver == 6) ? BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 : BPF_F_ADJ_ROOM_ENCAP_L3_IPV4;
-    }
-    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, adj_flags2) < 0)
+    /* No ENCAP flags — see main gut_egress() comment (encapsulation=1 corrupts GUT bytes 8-9
+     * on old QEMU).  QEMU path uses full software checksum + CHECKSUM_NONE instead. */
+    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, 0) < 0)
         return TC_ACT_OK;
 
     if (bpf_skb_pull_data(skb, skb->len) < 0)

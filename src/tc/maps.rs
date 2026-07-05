@@ -209,6 +209,13 @@ pub const GUT_FLAG_HW_IP6_CSUM: u16 = 1 << 2;
 /// fails to turn off gut0 TX csum, the hardware will misbehave without ENCAP.
 pub const GUT_FLAG_ENCAP_CSUM: u16 = 1 << 3;
 
+/// BALLAST_ALIGN: recover GUT type-4 ballast length from wire geometry instead
+/// of GUT header byte 9.  WireGuard type-4 payloads are 16-byte aligned, so
+/// ballast = wg_len & 0x0F (0..15).  Immune to hypervisors that corrupt outer
+/// UDP payload bytes 8-9 (old QEMU virtio).  GUT mode only; set per-peer via
+/// `ballast = align`.  Both peers must agree.
+pub const GUT_FLAG_BALLAST_ALIGN: u16 = 1 << 4;
+
 fn compute_chacha_init(key: &[u8; 32]) -> [u32; 12] {
     let mut init = [0u32; 12];
     // "expand 32-byte k" constants

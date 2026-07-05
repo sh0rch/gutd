@@ -33,6 +33,9 @@ ports = 41000,41001         # UDP ports (must match WG listen/endpoint ports)
 # keepalive_drop_percent = 30
 # own_http3 = true          # XDP active-probe deflection (quic+sip only)
 # obfs = quic               # obfuscation mode: quic (default) | gut | sip | syslog
+# ballast = byte9           # ballast length encoding: byte9 (default) | align
+#                           #   align: GUT-only, ballast recovered from wire geometry;
+#                           #   immune to old QEMU virtio corrupting UDP payload bytes 8-9
 key = 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 # passphrase = my-secret     # alternative to key (HKDF-SHA256 derived)
 ```
@@ -69,6 +72,39 @@ obfs  = sip
 ports = 5060, 10000          # [0]=signaling, [1]=RTP
 sni   = sip.example.com
 mtu   = 1400                 # required — see MTU section below
+```
+
+### Ballast encoding (`ballast`)
+
+Small packets get random "ballast" padding to break fixed-size fingerprints.
+The receiver must recover the exact ballast length to restore the WireGuard
+payload. Two encodings exist:
+
+| `ballast=` | How length is recovered | Max ballast | Modes | Both peers |
+|---|---|---|---|---|
+| **`byte9`** *(default)* | Stored in GUT header byte 9 | 63 bytes | all | must match |
+| **`align`** | Inferred from wire length (`wg_len & 0x0F`) | 15 bytes | **`gut` only** | must match |
+
+**When to use `align`:** some hypervisors (notably **old QEMU virtio**, ≤ 3.x)
+corrupt outer UDP payload bytes 8-9 during TX checksum offload. In `gut` mode
+those are GUT header bytes 8-9 — byte 9 is the ballast indicator, so its
+corruption breaks all WireGuard data packets (handshakes still work because
+they use fixed sizes). `align` mode ignores byte 9 entirely and recovers the
+ballast length from packet geometry (WireGuard type-4 payloads are 16-byte
+aligned), making it **immune to byte 8-9 corruption**.
+
+- `align` is **GUT mode only** — QUIC alignment would be a detectable pattern,
+  and Base64 modes (sip/syslog) cannot survive byte 8-9 corruption. gutd refuses
+  to start with `ballast = align` and a non-GUT mode.
+- **Both peers must set the same `ballast` value.** gutd prints a startup warning
+  reminding you to configure the relay/other side identically.
+- Works in both BPF (TC/XDP) and `userspace_only` mode, so a userspace responder
+  can talk to a BPF peer on a broken hypervisor.
+
+```ini
+# On BOTH the QEMU-hosted peer AND the relay/other peer:
+obfs    = gut
+ballast = align
 ```
 
 ### Responder role

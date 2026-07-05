@@ -31,8 +31,9 @@ use crate::netlink::{
     probe_neighbor_udp, read_gso_max_size, read_mac, read_mtu,
 };
 use crate::tc::maps::{
-    GutConfig, GutStats, DEFAULT_INNER_MTU, GUT_FLAG_ENCAP_CSUM, GUT_FLAG_HW_IP4_CSUM,
-    GUT_FLAG_HW_IP6_CSUM, GUT_FLAG_NEED_L4_CSUM, OUTER_OVERHEAD_IPV4, OUTER_OVERHEAD_IPV6,
+    GutConfig, GutStats, DEFAULT_INNER_MTU, GUT_FLAG_BALLAST_ALIGN, GUT_FLAG_ENCAP_CSUM,
+    GUT_FLAG_HW_IP4_CSUM, GUT_FLAG_HW_IP6_CSUM, GUT_FLAG_NEED_L4_CSUM, OUTER_OVERHEAD_IPV4,
+    OUTER_OVERHEAD_IPV6,
 };
 use crate::Result;
 use std::sync::atomic::Ordering;
@@ -1860,6 +1861,47 @@ impl TcBpfManager {
 
         gut_config.offload_flags = Self::probe_offload_flags(tun_ifname, ingress_ifname);
 
+        // Per-peer ballast encoding: `ballast = align` recovers GUT type-4 ballast
+        // from wire geometry (wg_len & 0x0F), immune to hypervisors that corrupt
+        // outer UDP payload bytes 8-9 (old QEMU virtio).  GUT mode only (validated
+        // in config parse).  Both peers MUST set the same mode.
+        if config.peer().ballast == crate::config::BallastMode::Align {
+            gut_config.offload_flags |= GUT_FLAG_BALLAST_ALIGN;
+            eprintln!(
+                "  ballast: ALIGN (wire-geometry, \u{2264}15 bytes) \u{2014} \
+                 the peer on the OTHER side (relay/server) MUST also set `ballast = align`"
+            );
+        }
+
+        // Old QEMU virtio corrupts outer UDP payload bytes 8-9.
+        // Exception: inside a container the veth->ip_forward path completes
+        // checksums in software before virtio, so no corruption occurs.
+        // Only warn when running bare-metal on the QEMU host.
+        if (gut_config.offload_flags & GUT_FLAG_ENCAP_CSUM) != 0 && !crate::netlink::is_container()
+        {
+            match config.peer().obfs {
+                crate::config::ObfsMode::Gut => {
+                    if config.peer().ballast != crate::config::BallastMode::Align {
+                        eprintln!(
+                            "  WARNING: old QEMU virtio detected + obfs=gut without \
+                             `ballast = align`: hypervisor corrupts GUT header byte 9, \
+                             type-4 data will break. Set `ballast = align` on BOTH peers. \
+                             Alternatively, run gutd inside a Docker/Podman container."
+                        );
+                    }
+                }
+                _ => {
+                    eprintln!(
+                        "  WARNING: old QEMU virtio detected with obfs={:?}: hypervisor corrupts \
+                         outer UDP payload bytes 8-9, which breaks QUIC/SIP/SYSLOG decoding. \
+                         Only `obfs = gut` with `ballast = align` is reliable on this host \
+                         (or run gutd inside a Docker/Podman container).",
+                        config.peer().obfs
+                    );
+                }
+            }
+        }
+
         // Partial IP checksum only meaningful for outer IPv4
         if config.peer().peer_ip.is_ipv4() {
             gut_config.compute_partial_ip_csum();
@@ -1970,7 +2012,7 @@ impl TcBpfManager {
 
     #[cfg(target_os = "linux")]
     fn probe_offload_flags(ifname: &str, egress_ifname: &str) -> u16 {
-        use crate::netlink::{is_qemu_legacy_cpu, probe_tx_csum_features};
+        use crate::netlink::{is_container, is_qemu_legacy_cpu, probe_tx_csum_features};
 
         let disable_l4_csum = std::env::var("GUTD_FORCE_L4_CSUM")
             .ok()
@@ -1996,20 +2038,25 @@ impl TcBpfManager {
 
         // Detect old QEMU 2.x virtual CPU: ignores ip_summed=CHECKSUM_NONE, always
         // computes checksum with stale csum_start, corrupting GUT/QUIC header bytes 8-9.
-        // Detection: "QEMU Virtual CPU" in /proc/cpuinfo model name (old QEMU 2.x default).
-        // Modern QEMU uses host CPU or named CPU types — no "QEMU Virtual CPU".
+        // Exception: inside a container (Docker/Podman/LXC), packets exit via a veth pair.
+        // The host kernel's ip_forward calls skb_checksum_help() before virtio-net, so
+        // ip_summed is already CHECKSUM_NONE at the virtio TX side -- no corruption occurs.
         let encap_needed = is_qemu_legacy_cpu();
+        let in_container = encap_needed && is_container();
         if encap_needed {
             flags |= GUT_FLAG_ENCAP_CSUM;
-            // HW_IP4/6_CSUM stays set.  In the BPF egress path, when both
-            // ENCAP_CSUM and HW_*_CSUM are set we skip bpf_l4_csum_replace
-            // and leave udph->check = 0 (valid for IPv4/IPv6 per RFC 768/8200).
-            // The virtio csum_start adjustment for encapsulation shifts the
-            // write position to GUT byte 8 (noise_byte), which XDP ignores.
-            eprintln!(
-                "  offloads: detected old QEMU Virtual CPU \
-                 \u{2014} enabling ENCAP_CSUM, zero outer UDP checksum (RFC 768)"
-            );
+            if in_container {
+                eprintln!(
+                    "  offloads: old QEMU Virtual CPU detected, but running inside a container \
+                     (veth path); host ip_forward completes checksum before virtio-net, \
+                     so byte 8-9 corruption is avoided. ENCAP_CSUM set for safety."
+                );
+            } else {
+                eprintln!(
+                    "  offloads: detected old QEMU Virtual CPU \
+                     -- enabling ENCAP_CSUM, zero outer UDP checksum (RFC 768)"
+                );
+            }
         }
 
         eprintln!(

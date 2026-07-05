@@ -812,16 +812,20 @@ static __always_inline int gut_xdp_core(struct xdp_md *ctx, struct gut_config *c
 #if defined(GUT_MODE_GUT)
     else if (wg_type == 4)
     {
-        /* GUT_MODE_GUT: ballast length is encoded in byte 9 of the GUT header
-         * (0x40|(pad_len-1) scheme). Byte 8 is a random anti-fingerprint byte
-         * (ChaCha-derived) and is intentionally ignored here. */
-        if (ballast_len > 63 || ballast_len > wg_len)
+        /* GUT_MODE_GUT type-4 ballast recovery.  Two schemes (GUT_FLAG_BALLAST_ALIGN):
+         *  - byte9 (default): ballast_len read from GUT header byte 9 above.
+         *  - align: WG type-4 payload is 16-byte aligned, so ballast = wg_len & 0x0F.
+         *    Byte 9 is ignored → immune to hypervisor byte 8-9 corruption (old QEMU). */
+        __u32 b_len = ballast_len;
+        if (cfg->offload_flags & GUT_FLAG_BALLAST_ALIGN)
+            b_len = wg_len & 0x0F;
+        if (b_len > 63 || b_len > wg_len)
             return -2;
         if (wg_len < WG_MIN_PACKET)
             return -2;
-        if (wg_len - ballast_len < WG_MIN_PACKET)
+        if (wg_len - b_len < WG_MIN_PACKET)
             return -2;
-        restored_wg_len = wg_len - ballast_len;
+        restored_wg_len = wg_len - b_len;
     }
     else
     {
