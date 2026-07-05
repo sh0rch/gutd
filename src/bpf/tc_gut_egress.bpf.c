@@ -747,8 +747,9 @@ int gut_egress(struct __sk_buff *skb)
                     return TC_ACT_OK;
                 udph->check = csum_fold(full);
             }
-            else
+            else if (!(cfg->offload_flags & GUT_FLAG_BALLAST_ALIGN))
                 udph->check = (__u16)~csum_fold(pseudo); /* pseudo-only; NIC/kernel adds payload */
+            /* BALLAST_ALIGN: udph->check stays 0, CHECKSUM_NONE, valid per RFC 768 */
         }
     }
     else if (ipver == 6)
@@ -825,8 +826,10 @@ int gut_egress(struct __sk_buff *skb)
                     return TC_ACT_OK;
                 udph->check = csum_fold(full);
             }
-            else
+            else if (!(cfg->offload_flags & GUT_FLAG_BALLAST_ALIGN))
                 udph->check = (__u16)~csum_fold(pseudo); /* pseudo-only; NIC/kernel adds payload */
+            /* BALLAST_ALIGN: udph->check stays 0, ip_summed=CHECKSUM_NONE from adjust_room_mac.
+             * Hardware never recomputes; relay XDP ignores checksums. Valid per RFC 768. */
         }
     }
 
@@ -1078,8 +1081,9 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
                     return TC_ACT_OK;
                 udph->check = csum_fold(full);
             }
-            else
+            else if (!(cfg->offload_flags & GUT_FLAG_BALLAST_ALIGN))
                 udph->check = (__u16)~csum_fold(pseudo);
+            /* BALLAST_ALIGN: udph->check stays 0 */
         }
     }
     else if (ipver == 6)
@@ -1135,8 +1139,9 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
                     return TC_ACT_OK;
                 udph->check = csum_fold(full);
             }
-            else
+            else if (!(cfg->offload_flags & GUT_FLAG_BALLAST_ALIGN))
                 udph->check = (__u16)~csum_fold(pseudo);
+            /* BALLAST_ALIGN: udph->check stays 0 */
         }
     }
     else
@@ -1289,8 +1294,9 @@ int gut_egress_quic_long(struct __sk_buff *skb)
                     return TC_ACT_OK;
                 udph->check = csum_fold(full);
             }
-            else
+            else if (!(cfg->offload_flags & GUT_FLAG_BALLAST_ALIGN))
                 udph->check = (__u16)~csum_fold(pseudo);
+            /* BALLAST_ALIGN: udph->check stays 0 */
         }
     }
     else if (ipver == 6)
@@ -1346,8 +1352,9 @@ int gut_egress_quic_long(struct __sk_buff *skb)
                     return TC_ACT_OK;
                 udph->check = csum_fold(full);
             }
-            else
+            else if (!(cfg->offload_flags & GUT_FLAG_BALLAST_ALIGN))
                 udph->check = (__u16)~csum_fold(pseudo);
+            /* BALLAST_ALIGN: udph->check stays 0 */
         }
     }
     else
