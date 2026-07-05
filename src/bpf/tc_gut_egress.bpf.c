@@ -479,9 +479,14 @@ int gut_egress(struct __sk_buff *skb)
     __u32 room = outer_hdr_len;
 #endif
 
-    /* No ENCAP flags: physical NICs (NETIF_F_IP_CSUM) parse the IP/UDP headers
-     * themselves and don't need csum_start.  VMs use the software path.
-     * QEMU uses CHECKSUM_NONE (zero-check), so it never recomputes. */
+    /* No ENCAP flags (v3.0.13 proven approach): the WG packet enters gut0 as
+     * CHECKSUM_PARTIAL (udp_set_csum).  bpf_skb_adjust_room shifts csum_start to
+     * track the moved outer UDP header, keeping ip_summed=CHECKSUM_PARTIAL.
+     * We then write only the pseudo-header into udph->check and the NIC offload /
+     * skb_checksum_help / QEMU virtio finalizes the payload sum from csum_start,
+     * writing to data[40] (outer UDP checksum) — GUT bytes 8-9 stay intact.
+     * ENCAP flags set encapsulation=1 which shifts csum_start into the GUT header,
+     * corrupting bytes 8-9 on old QEMU virtio — do NOT use them. */
     if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, 0) < 0)
         return TC_ACT_OK;
 
@@ -703,42 +708,17 @@ int gut_egress(struct __sk_buff *skb)
         __u64 ip_csum = bpf_csum_diff(0, 0, (__be32 *)iph, sizeof(struct iphdr), 0);
         iph->check = csum_fold(ip_csum);
 
-        /* UDP checksum: NIC hardware offload if NETIF_F_IP_CSUM, else full BPF.
-         * GUT_FLAG_HW_IP4_CSUM: NIC derives L4 from IP header — safe after
-         *   adjust_room_mac (ignores stale csum_start).  bpf_l4_csum_replace
-         *   writes ~fold(pseudo) as seed and sets CHECKSUM_PARTIAL.
-         * Fallback: gut_csum_range + bpf_skb_adjust_room(0,NET,0) for all other NICs.
-         *   bpf_skb_adjust_room(0,NET,0) unconditionally sets ip_summed=CHECKSUM_NONE
-         *   even for CHECKSUM_PARTIAL (unlike bpf_csum_level(RESET) which only resets
-         *   CHECKSUM_UNNECESSARY).  Required when gut0 TX offload disable is skipped. */
+        /* UDP checksum (v3.0.13 proven): the WG packet is CHECKSUM_PARTIAL; adjust_room
+         * kept csum_start pointing at the outer UDP header.  Write ONLY the pseudo-header
+         * fold into udph->check; the NIC offload / skb_checksum_help() / QEMU virtio
+         * finalizes the payload sum from csum_start, writing to the outer UDP checksum
+         * field (data[40]).  GUT header bytes 8-9 (ballast) are never touched. */
         {
-            __u32 ulen = bpf_ntohs(udph->len);
-            __u64 csum = bpf_csum_diff(0, 0, &iph->saddr, 8, 0);
-            __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | ulen);
-            csum = bpf_csum_diff(0, 0, &ph, 4, csum);
             udph->check = 0;
-            if (cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM)
-            {
-                /* Physical NIC (NETIF_F_IP_CSUM): ENCAP flags set csum_start to outer UDP;
-                 * NIC derives pseudo-header from IP header, writes correct checksum. */
-                bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, ~csum_fold(csum),
-                                    BPF_F_MARK_ENFORCE | 2);
-            }
-            else if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
-            {
-                /* VM non-QEMU (HW_CSUM bit3) or no offload: BPF software checksum. */
-                csum = gut_csum_range(skb, scratch + 320, 14 + 20, ulen, csum);
-                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0); /* CHECKSUM_NONE */
-            }
-            /* QEMU (ENCAP_CSUM, no HW_IP4_CSUM): udph->check=0, CHECKSUM_NONE */
-            data = (void *)(long)skb->data;
-            data_end = (void *)(long)skb->data_end;
-            udph = (void *)((__u8 *)data + 14 + 20);
-            if ((void *)(udph + 1) > data_end)
-                return TC_ACT_OK;
-            if (!(cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM) &&
-                !(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
-                udph->check = csum_fold(csum);
+            __u32 pseudo = bpf_csum_diff(0, 0, &iph->saddr, 8, 0); /* saddr+daddr contiguous */
+            __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
+            pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
+            udph->check = (__u16)~csum_fold(pseudo); /* pseudo-only; NIC/kernel/QEMU adds payload */
         }
     }
     else if (ipver == 6)
@@ -797,29 +777,13 @@ int gut_egress(struct __sk_buff *skb)
             __builtin_memcpy(&ip6h->daddr, cfg->peer_ip6, 16);
         }
 
-        /* UDP checksum — see IPv4 branch. GUT_FLAG_HW_IP6_CSUM → NETIF_F_IPV6_CSUM. */
+        /* UDP checksum — see IPv4 branch: pseudo-only, NIC/kernel/QEMU adds payload. */
         {
-            __u32 ulen = bpf_ntohs(udph->len);
-            __u64 csum = bpf_csum_diff(0, 0, (__be32 *)&ip6h->saddr, 32, 0);
-            __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | ulen);
-            csum = bpf_csum_diff(0, 0, &ph, 4, csum);
             udph->check = 0;
-            if (cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM)
-                bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, ~csum_fold(csum),
-                                    BPF_F_MARK_ENFORCE | 2);
-            else if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
-            {
-                csum = gut_csum_range(skb, scratch + 320, 14 + 40, ulen, csum);
-                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0);
-            }
-            data = (void *)(long)skb->data;
-            data_end = (void *)(long)skb->data_end;
-            udph = (void *)((__u8 *)data + 14 + 40);
-            if ((void *)(udph + 1) > data_end)
-                return TC_ACT_OK;
-            if (!(cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM) &&
-                !(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
-                udph->check = csum_fold(csum);
+            __u32 pseudo = bpf_csum_diff(0, 0, (__be32 *)&ip6h->saddr, 32, 0); /* saddr+daddr contiguous */
+            __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
+            pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
+            udph->check = (__u16)~csum_fold(pseudo); /* pseudo-only; NIC/kernel/QEMU adds payload */
         }
     }
 
@@ -940,8 +904,9 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
     }
 
     /* ── Adjust packet size and shift IP/UDP headers ── */
-    __u64 adj_flags2 = 0;
-    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, adj_flags2) < 0)
+    /* No ENCAP flags — see main gut_egress() comment: keep CHECKSUM_PARTIAL, write
+     * pseudo-only, let NIC/kernel/QEMU finalize payload from the shifted csum_start. */
+    if (bpf_skb_adjust_room(skb, room, BPF_ADJ_ROOM_MAC, 0) < 0)
         return TC_ACT_OK;
 
     if (bpf_skb_pull_data(skb, skb->len) < 0)
@@ -1052,29 +1017,13 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
         __u64 ip_csum = bpf_csum_diff(0, 0, (__be32 *)iph, sizeof(struct iphdr), 0);
         iph->check = csum_fold(ip_csum);
 
-        /* UDP checksum — see gut_egress() IPv4 branch. HW_IP4_CSUM or BPF fallback. */
+        /* UDP checksum — see gut_egress() IPv4 branch: pseudo-only, payload added by NIC/QEMU. */
         {
-            __u32 ulen = bpf_ntohs(udph->len);
-            __u64 csum = bpf_csum_diff(0, 0, &iph->saddr, 8, 0);
-            __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | ulen);
-            csum = bpf_csum_diff(0, 0, &ph, 4, csum);
             udph->check = 0;
-            if (cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM)
-                bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, ~csum_fold(csum),
-                                    BPF_F_MARK_ENFORCE | 2);
-            else if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
-            {
-                csum = gut_csum_range(skb, scratch + 320, 14 + 20, ulen, csum);
-                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0);
-            }
-            data = (void *)(long)skb->data;
-            data_end = (void *)(long)skb->data_end;
-            udph = (void *)((__u8 *)data + 14 + 20);
-            if ((void *)(udph + 1) > data_end)
-                return TC_ACT_OK;
-            if (!(cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM) &&
-                !(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
-                udph->check = csum_fold(csum);
+            __u32 pseudo = bpf_csum_diff(0, 0, &iph->saddr, 8, 0); /* saddr+daddr contiguous */
+            __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
+            pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
+            udph->check = (__u16)~csum_fold(pseudo);
         }
     }
     else if (ipver == 6)
@@ -1112,29 +1061,13 @@ int gut_egress_sip_signal(struct __sk_buff *skb)
             __builtin_memcpy(&ip6h->daddr, cfg->peer_ip6, 16);
         }
 
-        /* UDP checksum — see IPv4 branch. GUT_FLAG_HW_IP6_CSUM → NETIF_F_IPV6_CSUM. */
+        /* UDP checksum — see IPv4 branch: pseudo-only, payload added by NIC/QEMU. */
         {
-            __u32 ulen = bpf_ntohs(udph->len);
-            __u64 csum = bpf_csum_diff(0, 0, (__be32 *)&ip6h->saddr, 32, 0);
-            __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | ulen);
-            csum = bpf_csum_diff(0, 0, &ph, 4, csum);
             udph->check = 0;
-            if (cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM)
-                bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, ~csum_fold(csum),
-                                    BPF_F_MARK_ENFORCE | 2);
-            else if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
-            {
-                csum = gut_csum_range(skb, scratch + 320, 14 + 40, ulen, csum);
-                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0);
-            }
-            data = (void *)(long)skb->data;
-            data_end = (void *)(long)skb->data_end;
-            udph = (void *)((__u8 *)data + 14 + 40);
-            if ((void *)(udph + 1) > data_end)
-                return TC_ACT_OK;
-            if (!(cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM) &&
-                !(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
-                udph->check = csum_fold(csum);
+            __u32 pseudo = bpf_csum_diff(0, 0, (__be32 *)&ip6h->saddr, 32, 0); /* saddr+daddr contiguous */
+            __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
+            pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
+            udph->check = (__u16)~csum_fold(pseudo);
         }
     }
     else
@@ -1269,29 +1202,13 @@ int gut_egress_quic_long(struct __sk_buff *skb)
         __u64 ip_csum = bpf_csum_diff(0, 0, (__be32 *)iph, sizeof(struct iphdr), 0);
         iph->check = csum_fold(ip_csum);
 
-        /* UDP checksum — see gut_egress() IPv4 branch. HW_IP4_CSUM or BPF fallback. */
+        /* UDP checksum — see gut_egress() IPv4 branch: pseudo-only, payload added by NIC/QEMU. */
         {
-            __u32 ulen = bpf_ntohs(udph->len);
-            __u64 csum = bpf_csum_diff(0, 0, &iph->saddr, 8, 0);
-            __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | ulen);
-            csum = bpf_csum_diff(0, 0, &ph, 4, csum);
             udph->check = 0;
-            if (cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM)
-                bpf_l4_csum_replace(skb, 14 + 20 + 6, 0, ~csum_fold(csum),
-                                    BPF_F_MARK_ENFORCE | 2);
-            else if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
-            {
-                csum = gut_csum_range(skb, scratch + 320, 14 + 20, ulen, csum);
-                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0);
-            }
-            data = (void *)(long)skb->data;
-            data_end = (void *)(long)skb->data_end;
-            udph = (void *)((__u8 *)data + 14 + 20);
-            if ((void *)(udph + 1) > data_end)
-                return TC_ACT_OK;
-            if (!(cfg->offload_flags & GUT_FLAG_HW_IP4_CSUM) &&
-                !(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
-                udph->check = csum_fold(csum);
+            __u32 pseudo = bpf_csum_diff(0, 0, &iph->saddr, 8, 0); /* saddr+daddr contiguous */
+            __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
+            pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
+            udph->check = (__u16)~csum_fold(pseudo);
         }
     }
     else if (ipver == 6)
@@ -1329,29 +1246,13 @@ int gut_egress_quic_long(struct __sk_buff *skb)
             __builtin_memcpy(&ip6h->daddr, cfg->peer_ip6, 16);
         }
 
-        /* UDP checksum — see IPv4 branch. GUT_FLAG_HW_IP6_CSUM → NETIF_F_IPV6_CSUM. */
+        /* UDP checksum — see IPv4 branch: pseudo-only, payload added by NIC/QEMU. */
         {
-            __u32 ulen = bpf_ntohs(udph->len);
-            __u64 csum = bpf_csum_diff(0, 0, (__be32 *)&ip6h->saddr, 32, 0);
-            __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | ulen);
-            csum = bpf_csum_diff(0, 0, &ph, 4, csum);
             udph->check = 0;
-            if (cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM)
-                bpf_l4_csum_replace(skb, 14 + 40 + 6, 0, ~csum_fold(csum),
-                                    BPF_F_MARK_ENFORCE | 2);
-            else if (!(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
-            {
-                csum = gut_csum_range(skb, scratch + 320, 14 + 40, ulen, csum);
-                bpf_skb_adjust_room(skb, 0, BPF_ADJ_ROOM_NET, 0);
-            }
-            data = (void *)(long)skb->data;
-            data_end = (void *)(long)skb->data_end;
-            udph = (void *)((__u8 *)data + 14 + 40);
-            if ((void *)(udph + 1) > data_end)
-                return TC_ACT_OK;
-            if (!(cfg->offload_flags & GUT_FLAG_HW_IP6_CSUM) &&
-                !(cfg->offload_flags & GUT_FLAG_ENCAP_CSUM))
-                udph->check = csum_fold(csum);
+            __u32 pseudo = bpf_csum_diff(0, 0, (__be32 *)&ip6h->saddr, 32, 0); /* saddr+daddr contiguous */
+            __u32 ph = bpf_htonl((IPPROTO_UDP << 16) | bpf_ntohs(udph->len));
+            pseudo = bpf_csum_diff(0, 0, &ph, 4, pseudo);
+            udph->check = (__u16)~csum_fold(pseudo);
         }
     }
     else
